@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import collections
+import itertools
 import logging
 import socket
 import threading
@@ -141,6 +142,7 @@ class _Connection:
 
     def __init__(self, server: TcpRemoteServer, sock: socket.socket, source: str):
         self.server, self.sock, self.source = server, sock, source
+        self.extension_id = next(server._connection_ids)
         self.auth = ConnectionAuth(server._key)
         self.started = time.monotonic()
         self.hello: HelloRequest | None = None
@@ -284,6 +286,11 @@ class TcpRemoteServer(RemoteServer):
         ops: RemoteOps,
         boot: str = "",
         op_window: int = 4096,
+        check_memory: Callable[[], bool] = lambda: True,
+        hint_actions: list[str] | None = None,
+        extension_hint: Callable | None = None,
+        extension_reserve_hint: Callable | None = None,
+        connection_closed: Callable[[int], None] | None = None,
     ):
         if not key:
             raise ValueError("a remote server requires a key")
@@ -296,12 +303,18 @@ class TcpRemoteServer(RemoteServer):
         self.serializer = Serializer(REMOTE_MESSAGE_CLASSES)
         self.ledger = OpLedger(op_window)
         self.boot = boot
+        self.check_memory = check_memory
+        self.hint_actions = hint_actions or []
+        self.extension_hint = extension_hint
+        self.extension_reserve_hint = extension_reserve_hint
+        self.connection_closed = connection_closed
         self._cv = threading.Condition(threading.RLock())
         self._stopped = threading.Event()
         self._sock: socket.socket | None = None
         self.address: tuple[str, int] | None = None
         self._accept_thread: threading.Thread | None = None
         self._connections: set[_Connection] = set()
+        self._connection_ids = itertools.count(1)
         self._peers: dict[str, _Peer] = {}
         self._retired: set[tuple[str, str]] = set()
         self._server_epoch: str | None = None
@@ -393,14 +406,15 @@ class TcpRemoteServer(RemoteServer):
     def _connection_closed(self, conn: _Connection) -> None:
         with self._cv:
             self._connections.discard(conn)
-            if conn.hello is None:
-                return
-            self.ledger.forget_waiter(conn.origin, conn)
-            peer = self._peers.get(conn.hello.node_id)
-            if peer is not None and peer.connection is conn:
-                peer.connection = None
-                logger.info("remote peer lost: %s", peer.origin)
-                self.ops.peer_lost(peer.origin)
+            if conn.hello is not None:
+                self.ledger.forget_waiter(conn.origin, conn)
+                peer = self._peers.get(conn.hello.node_id)
+                if peer is not None and peer.connection is conn:
+                    peer.connection = None
+                    logger.info("remote peer lost: %s", peer.origin)
+                    self.ops.peer_lost(peer.origin)
+        if conn.auth.proved and self.connection_closed is not None:
+            self.connection_closed(conn.extension_id)
 
     def _retire(self, node_id: str, peer: _Peer, *, goodbye: bool = False) -> None:
         self._retired.add((node_id, peer.epoch))
@@ -461,6 +475,7 @@ class TcpRemoteServer(RemoteServer):
                     room=room,
                     limit=limit,
                     boot=self.boot,
+                    hint_actions=self.hint_actions,
                 ),
             )
             logger.info("remote HELLO accepted: %s", origin)
@@ -478,6 +493,39 @@ class TcpRemoteServer(RemoteServer):
     def _dispatch(self, conn: _Connection, decoded: DecodedRequest) -> None:
         code, header = decoded.header.msg_type, decoded.header
         response_cls = REMOTE_MESSAGE_CLASSES[RemoteMessageType(code)][1]
+        invoke = None
+        with self._cv:
+            if self._stopped.is_set() or conn.closed.is_set():
+                return
+        if not self.check_memory():
+            fields = {"boot": self.boot} if code == RemoteMessageType.HELLO else {}
+            conn.post_response(
+                header,
+                response_cls(
+                    status=Status.BUSY,
+                    error="memory generation changed or unknown",
+                    **fields,
+                ),
+                close=True,
+            )
+            return
+        if (
+            code == RemoteMessageType.HINT
+            and conn.hello is not None
+            and self.extension_hint is not None
+        ):
+            self._invoke(
+                self.extension_hint,
+                (
+                    conn.extension_id,
+                    decoded.request,
+                    lambda reply: conn.post_response(header, reply),
+                    conn.closed.is_set,
+                ),
+                RemoteHintResponse,
+                lambda reply: conn.post_response(header, reply),
+            )
+            return
         with self._cv:
             if self._stopped.is_set() or conn.closed.is_set():
                 return
@@ -532,9 +580,11 @@ class TcpRemoteServer(RemoteServer):
                     lambda reply: conn.post_response(header, reply),
                 )
             elif code in LEDGER_CODES:
-                self._op(conn, decoded)
+                invoke = self._op(conn, decoded)
+        if invoke is not None:
+            self._invoke(*invoke)
 
-    def _op(self, conn: _Connection, decoded: DecodedRequest) -> None:
+    def _op(self, conn: _Connection, decoded: DecodedRequest) -> tuple | None:
         code, req, header = decoded.header.msg_type, decoded.request, decoded.header
         response_cls = REMOTE_MESSAGE_CLASSES[RemoteMessageType(code)][1]
         origin, op = conn.origin, req.op
@@ -582,8 +632,21 @@ class TcpRemoteServer(RemoteServer):
         if verdict == Verdict.REPLAY:
             return
         done = self._completion(origin, entry)
+        if (
+            code == RemoteMessageType.RESERVE
+            and self.extension_reserve_hint is not None
+        ):
+            finish = done
+
+            def done(response):
+                if response.credits:
+                    self.extension_reserve_hint(
+                        conn.extension_id, req, response.credits, conn.closed.is_set
+                    )
+                finish(response)
+
         method = getattr(self.ops, RemoteMessageType(code).name.lower())
-        self._invoke(method, (origin, req, done), response_cls, done)
+        return method, (origin, req, done), response_cls, done
 
     def _completion(self, origin: str, entry: LedgerEntry) -> Callable[[Any], None]:
         lock = threading.Lock()

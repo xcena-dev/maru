@@ -24,6 +24,7 @@ from .config import (
     load_node_config,
 )
 from .drivers.registry import TIERS
+from .region_extension import RegionExtensionError
 
 EXIT_CONFIG = 2
 EXIT_NOT_SERVING = 3
@@ -183,6 +184,7 @@ def serve(config: NodeConfig, log_level: str = "INFO") -> int:
             if node.run():
                 return 0
         except (
+            RegionExtensionError,
             CxlTierError,
             KeyFileError,
             UncheckedTransportError,

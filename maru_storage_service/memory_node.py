@@ -208,20 +208,29 @@ class RemoteParts:
 
     def close(self) -> None:
         with self._lock:
-            self._closed = True
-            for entry in self._writers.values():
-                entry.progress.close()
-                for pool_id in self._maps:
-                    entry.exporter.detach(pool_id)
-                entry.transport.close()
-            self.progress.close()
-            for pool_id in self._maps:
-                self.exporter.detach(pool_id)
-            self.transport.close()
+            self._revoke()
             for memory in self._maps.values():
                 memory.close()
             self._maps.clear()
             self._writers.clear()
+
+    def revoke(self) -> None:
+        """Fence every registration, keeping mappings and RM holds alive."""
+        with self._lock:
+            self._revoke()
+
+    def _revoke(self) -> None:
+        self._closed = True
+        for entry in self._writers.values():
+            for pool_id in self._maps:
+                entry.exporter.detach(pool_id)
+            entry.progress.close()
+            entry.transport.close()
+        self._writers.clear()
+        for pool_id in self._maps:
+            self.exporter.detach(pool_id)
+        self.progress.close()
+        self.transport.close()
 
 
 def make_remote_parts(run) -> RemoteParts:
@@ -249,5 +258,10 @@ def make_remote_parts(run) -> RemoteParts:
         agent_name=parts.name,
         progress=parts.progress,
         ops=run.role.remote_ops,
+        check_memory=run.role.check_generation,
+        hint_actions=run.role.hint_actions,
+        extension_hint=run.role.hint,
+        extension_reserve_hint=run.role.reserve_hint,
+        connection_closed=run.role.connection_closed,
     )
     return parts

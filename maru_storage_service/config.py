@@ -57,7 +57,7 @@ _TOP_KEYS = {
     "budgets",
 }
 GPU_KEYS = {"socket", "socket_group", "local_pin"}
-MEMORY_KEYS = {"remote_server"}
+MEMORY_KEYS = {"remote_server", "region_extension"}
 WORKER_BUDGET_KEYS = {
     "credit_max_bytes",
     "credit_refill_low",
@@ -110,6 +110,15 @@ class RemoteServerConfig:
 
 
 @dataclass(frozen=True)
+class RegionExtensionConfig:
+    name: str
+    config: str = ""
+    generation_poll_s: float = 0.1
+    generation_grace_s: float = 2.0
+    hint_requests_max: int = 4096
+
+
+@dataclass(frozen=True)
 class NodeConfig:
     node_id: str
     role: str
@@ -121,6 +130,7 @@ class NodeConfig:
     budgets: Budgets
     state_dir: str = DEFAULT_STATE_DIR
     remote_server: RemoteServerConfig | None = None
+    region_extension: RegionExtensionConfig | None = None
     # Group the socket is given to (mode 0660); None keeps the service's group
     socket_group: str | None = None
     source: str = field(default="", compare=False)
@@ -347,6 +357,31 @@ def _parse_remote_server(raw: Any, budgets: Budgets) -> RemoteServerConfig:
     )
 
 
+def _parse_region_extension(raw: Any) -> RegionExtensionConfig:
+    what = "config.region_extension"
+    keys = {
+        "name",
+        "config",
+        "generation_poll_s",
+        "generation_grace_s",
+        "hint_requests_max",
+    }
+    raw = _require_keys(raw, keys, what)
+    name = _str(raw, "name", what)
+    config = raw.get("config", "")
+    if not isinstance(config, str):
+        raise NodeConfigError(f"{what}.config: expected a string")
+    poll = _number(raw, "generation_poll_s", what, 0.1)
+    grace = _number(raw, "generation_grace_s", what, 2.0)
+    for key, value in (("generation_poll_s", poll), ("generation_grace_s", grace)):
+        if value <= 0:
+            raise NodeConfigError(f"{what}.{key}: must be positive")
+    limit = raw.get("hint_requests_max", 4096)
+    if type(limit) is not int or limit <= 0:
+        raise NodeConfigError(f"{what}.hint_requests_max: must be a positive integer")
+    return RegionExtensionConfig(name, config, poll, grace, limit)
+
+
 def parse_node_config(raw: Any, source: str = "", *, role: str = "gpu") -> NodeConfig:
     """Check a decoded node config and fill its defaults."""
     if role not in ROLES:
@@ -401,6 +436,11 @@ def parse_node_config(raw: Any, source: str = "", *, role: str = "gpu") -> NodeC
     remote_server = None
     if raw.get("remote_server") is not None:
         remote_server = _parse_remote_server(raw["remote_server"], budgets)
+    extension = None
+    if raw.get("region_extension") is not None:
+        if tiers[0].store != "local_cxl":
+            raise NodeConfigError("config.region_extension: requires local_cxl")
+        extension = _parse_region_extension(raw["region_extension"])
     return NodeConfig(
         node_id=node_id,
         role=role,
@@ -413,6 +453,7 @@ def parse_node_config(raw: Any, source: str = "", *, role: str = "gpu") -> NodeC
         budgets=budgets,
         state_dir=state_dir,
         remote_server=remote_server,
+        region_extension=extension,
         source=source,
     )
 

@@ -84,6 +84,7 @@ class PeerOps:
         peer_quarantine_max: int,
         quarantine_max: int,
         clock: Callable[[], float] = time.monotonic,
+        check_memory: Callable[[], bool] = lambda: True,
     ):
         self.manager, self.registrations = manager, registrations
         self.pools = manager.pools
@@ -94,6 +95,7 @@ class PeerOps:
             quarantine_max,
         )
         self._clock = clock
+        self.check_memory = check_memory
         self._lock = threading.Lock()
         self.quarantined: collections.Counter[str] = collections.Counter()
         self._domains: dict[WriteDomain, _Domain] = {}
@@ -150,6 +152,13 @@ class PeerOps:
         request: ReserveRequest,
         done: Callable[[ReserveResponse], None],
     ) -> None:
+        if not self.check_memory():
+            done(
+                ReserveResponse(
+                    Status.BUSY, error="memory generation changed or unknown"
+                )
+            )
+            return
         with self._lock:
             answer = self._reserve(origin, request)
         done(answer)
@@ -194,6 +203,13 @@ class PeerOps:
         request: RemoteWriteDoneRequest,
         done: Callable[[RemoteWriteDoneResponse], None],
     ) -> None:
+        if not self.check_memory():
+            done(
+                RemoteWriteDoneResponse(
+                    Status.BUSY, error="memory generation changed or unknown"
+                )
+            )
+            return
         outcomes: list[ItemOutcome | None] = [ItemOutcome(ItemResult.REJECTED)] * len(
             request.items
         )
@@ -377,6 +393,8 @@ class PeerOps:
         self.pools.forget_holder(origin)
 
     def sweep(self) -> int:
+        if not self.check_memory():
+            return 0
         now = self._clock()
         with self._lock:
             expired = [
