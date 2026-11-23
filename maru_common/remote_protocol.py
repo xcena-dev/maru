@@ -164,6 +164,7 @@ class HelloResponse:
     limit: RoomLimit | None = None
     boot: str = ""
     hint_actions: list[str] = field(default_factory=list)
+    agent_metadata: bytes = b""
 
 
 @dataclass

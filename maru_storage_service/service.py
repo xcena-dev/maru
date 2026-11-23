@@ -49,7 +49,7 @@ class StorageService(NodeRun):
         else:
             from .gpu.service import GpuNode
 
-            role = GpuNode()
+            role = GpuNode(remote=config.top.store == "remote")
         super().__init__(
             config,
             role=role,

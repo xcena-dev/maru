@@ -15,6 +15,7 @@ import time
 from collections.abc import Callable
 
 from maru_common.ms_rpc import PLACEHOLDER_OP, MsRpcClient, OpOrigin, RpcUnknownError
+from maru_common.node_protocol import process_identity
 from maru_common.protocol import (
     MESSAGE_CLASSES,
     MS_MESSAGE_CLASSES,
@@ -29,6 +30,7 @@ from maru_common.protocol import (
     NodeHeartbeatResponse,
     NodeOpenRequest,
     NodeOpenResponse,
+    NodeOrphansRequest,
     NodeRecoverListRequest,
     RecoverItem,
     RetireRequest,
@@ -40,6 +42,7 @@ from maru_common.storage_types import (
     EPOCH_SEQ_MAX,
     MAX_BATCH,
     MS_PROTOCOL,
+    WORKER_RDMA_CAPABILITY,
     CloseMode,
     ExitCause,
     KeyLocation,
@@ -123,6 +126,9 @@ class ServerClient:
             capabilities=list(capabilities or []),
             pools=list(pools),
             rm_domains=list(rm_domains or []),
+            pid_ns=process_identity()[3]
+            if WORKER_RDMA_CAPABILITY in (capabilities or [])
+            else 0,
         )
         self._open_request = request
         response = self._open_until_answered(request)
@@ -136,6 +142,20 @@ class ServerClient:
             self.server_epoch,
         )
         return response
+
+    def orphans(self, opened):
+        items = list(opened.orphans)
+        cursor = opened.next_cursor
+        while cursor is not None:
+            session, epoch = self._ids()
+            answer = self._rpc.call(
+                MessageType.NODE_ORPHANS, NodeOrphansRequest(session, epoch, cursor)
+            )
+            if answer.status != Status.OK:
+                raise NodeOpenError("NODE_ORPHANS refused")
+            items.extend(answer.orphans)
+            cursor = answer.next_cursor
+        return items
 
     def _open_until_answered(self, request: NodeOpenRequest) -> NodeOpenResponse:
         pause = RESEND_PAUSE_S

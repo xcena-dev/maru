@@ -150,6 +150,14 @@ class AttachRequest:
 
 
 @dataclass
+class WorkerStaging:
+    size: int
+    rdma_device: str
+    timeout_s: float
+    quarantine_max: int
+
+
+@dataclass
 class AttachResponse:
     """A probe's reply has no pools and no budgets. ``capabilities``: those
     of the request this node serves."""
@@ -169,6 +177,7 @@ class AttachResponse:
     pid_start: int = 0
     capabilities: list[str] = field(default_factory=list)
     peers: list[ReadPeer] = field(default_factory=list)
+    staging: WorkerStaging | None = None
 
 
 @dataclass

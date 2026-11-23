@@ -118,7 +118,15 @@ def _transport(config, name):
 
 
 class WorkerRdma:
-    def __init__(self, config, page_size, *, transport_factory=None, progress=True):
+    def __init__(
+        self,
+        config,
+        page_size,
+        *,
+        transport_factory=None,
+        progress=True,
+        quarantine_max=None,
+    ):
         self.config = config
         self.gate = threading.Lock()
         self.generation = 0
@@ -128,6 +136,14 @@ class WorkerRdma:
         self.name = f"maru-direct-{uuid.uuid4().hex}"
         self.staging = StagingBuffer(
             config.rdma_staging_size or max(1 << 30, 64 * page_size), page_size
+        )
+        self.kept_limit = max(
+            1,
+            min(
+                self.staging.count // 2,
+                (quarantine_max if quarantine_max is not None else self.staging.nbytes)
+                // page_size,
+            ),
         )
         self._free = deque(range(self.staging.count))
         self._flights: set[Flight] = set()
@@ -178,9 +194,7 @@ class WorkerRdma:
         try:
             if self.stopped.is_set() or self.closed:
                 return 0
-            if sum(f.state == "kept" for f in self._flights) >= max(
-                1, self.slot_count // 2
-            ):
+            if sum(f.state == "kept" for f in self._flights) >= self.kept_limit:
                 return 0
             return len(self._free)
         finally:
@@ -366,10 +380,8 @@ class WorkerRdma:
                 flight.waiters.append(request)
                 return request
             kept = sum(f.state == "kept" for f in self._flights)
-            if kept >= max(1, self.slot_count // 2) or not self._free:
-                request.reason = (
-                    "kept_limit" if kept >= max(1, self.slot_count // 2) else "no_slot"
-                )
+            if kept >= self.kept_limit or not self._free:
+                request.reason = "kept_limit" if kept >= self.kept_limit else "no_slot"
                 self.stats[request.reason] += 1
                 if request.reason == "kept_limit" and self.stats[request.reason] == 1:
                     logger.error("RDMA kept slot limit reached")

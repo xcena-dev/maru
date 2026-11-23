@@ -285,6 +285,7 @@ class TcpRemoteServer(RemoteServer):
         progress: ConnectProgress,
         ops: RemoteOps,
         boot: str = "",
+        agent_metadata: Callable[[], bytes] = lambda: b"",
         op_window: int = 4096,
         check_memory: Callable[[], bool] = lambda: True,
         hint_actions: list[str] | None = None,
@@ -308,6 +309,7 @@ class TcpRemoteServer(RemoteServer):
         self.extension_hint = extension_hint
         self.extension_reserve_hint = extension_reserve_hint
         self.connection_closed = connection_closed
+        self.agent_metadata = agent_metadata
         self._cv = threading.Condition(threading.RLock())
         self._stopped = threading.Event()
         self._sock: socket.socket | None = None
@@ -471,6 +473,7 @@ class TcpRemoteServer(RemoteServer):
                     server_epoch=self._server_epoch,
                     capabilities=self.capabilities,
                     agent_name=self.agent_name,
+                    agent_metadata=self.agent_metadata(),
                     pools=self._pools,
                     room=room,
                     limit=limit,

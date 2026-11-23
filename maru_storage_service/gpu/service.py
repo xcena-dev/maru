@@ -7,7 +7,12 @@ from __future__ import annotations
 from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
-from maru_common.storage_types import CloseMode, PoolDescriptor
+from maru_common.storage_types import (
+    REMOTE_CAPABILITY,
+    WORKER_RDMA_CAPABILITY,
+    CloseMode,
+    PoolDescriptor,
+)
 
 from ..config import TierTraits
 from ..placement import PlacementPolicy
@@ -26,16 +31,22 @@ class GpuNode:
 
     name = "gpu"
 
-    def __init__(self):
+    def __init__(self, remote=False):
+        self.remote = remote
+        self.orphans = None
         self.local: LocalServer | None = None
 
     def capabilities(self) -> list[str]:
-        return []
+        return [REMOTE_CAPABILITY, WORKER_RDMA_CAPABILITY] if self.remote else []
 
     def make_store(
         self, run: NodeRun, placement: PlacementPolicy, traits: dict[str, TierTraits]
     ) -> WorkerOps:
-        return WorkerOps(
+        from .remote import RemoteWorkerOps
+
+        cls = RemoteWorkerOps if self.remote else WorkerOps
+        return cls(
+            **({"run": run} if self.remote else {}),
             node_epoch=run.node_epoch,
             pool_manager=run.pools,
             placement=placement,
@@ -64,7 +75,9 @@ class GpuNode:
             pools=[],
             transfer_defaults=config.transfer_defaults(),
             socket_group=config.socket_group,
-            capabilities=frozenset(),
+            capabilities=frozenset([WORKER_RDMA_CAPABILITY])
+            if self.remote
+            else frozenset(),
             ownership=run._ownership,
         )
         self.local.claim()
@@ -73,6 +86,13 @@ class GpuNode:
         """Workers attach from now: they map the L1 pools."""
         assert self.local is not None and run.store is not None
         self.local.manager = run.store
+        if self.remote:
+            from .orphans import OrphanWatch
+
+            self.orphans = OrphanWatch(run.store, run.server.host_boot_id)
+            run.store.orphans = self.orphans
+            self.orphans.start(run.server.orphans(run.opened))
+            run.store.remote.open()
         # memfd indexes the fds sent with ATTACH
         attach: list[tuple[PoolDescriptor, int | None]] = []
         for tier in run._tiers.values():
@@ -122,6 +142,8 @@ class GpuNode:
     def stop_workers(self) -> None:
         if self.local is not None:
             self.local.stop()
+        if self.orphans is not None:
+            self.orphans.stop()
 
     def close_exports(self) -> None:
         pass

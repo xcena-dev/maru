@@ -256,6 +256,7 @@ def make_remote_parts(run) -> RemoteParts:
         capabilities=run.capabilities(),
         page_size=config.page_size,
         agent_name=parts.name,
+        agent_metadata=parts.transport.metadata,
         progress=parts.progress,
         ops=run.role.remote_ops,
         check_memory=run.role.check_generation,

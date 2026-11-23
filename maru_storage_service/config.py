@@ -237,7 +237,9 @@ def _parse_budgets(
     sized = [t for t in credit_tiers if t.size is not None]
     credit_total = size_or(
         "credit_total_max_bytes",
-        None
+        2 * page_size
+        if top.store == "remote"
+        else None
         if top.size is None
         else int(sum(t.size or 0 for t in sized) * CREDIT_TOTAL_FRACTION),
         no_size,

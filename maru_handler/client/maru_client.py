@@ -380,6 +380,8 @@ class MaruClient:
         if self._server is not None:
             self._server.freeze()
         self.credits.close()
+        if self._storage is not None:
+            self._storage.close()
 
     # ------------------------------------------------------------- lifecycle
 
@@ -592,9 +594,7 @@ class MaruClient:
                 )
             ],
             protocol=MS_PROTOCOL,
-            capabilities=[HINT_CAPABILITY]
-            if self.role == SessionRole.PROBE
-            else [WORKER_RDMA_CAPABILITY, HINT_CAPABILITY],
+            capabilities=[WORKER_RDMA_CAPABILITY, HINT_CAPABILITY],
             instance=self.config.instance_id,
             role=self.role,
             step_objects=self.config.step_objects if self._writes else 0,
@@ -673,8 +673,24 @@ class MaruClient:
                 self.role == SessionRole.WORKER
                 and WORKER_RDMA_CAPABILITY in response.capabilities
             ):
+                if response.staging is not None:
+                    settings = response.staging
+                    if self._rdma is not None and (
+                        self._rdma.staging.nbytes != settings.size
+                        or self.config.rdma_device != settings.rdma_device
+                    ):
+                        raise AttachRefusedError("worker staging settings changed")
+                    self.config.rdma_staging_size = settings.size
+                    self.config.rdma_device = settings.rdma_device
+                    self.config.rdma_timeout_s = settings.timeout_s
                 if self._rdma is None:
-                    self._rdma = WorkerRdma(self.config, response.page_size)
+                    self._rdma = WorkerRdma(
+                        self.config,
+                        response.page_size,
+                        quarantine_max=response.staging.quarantine_max
+                        if response.staging
+                        else None,
+                    )
                 elif self._rdma.staging.slot_bytes != response.page_size:
                     raise AttachRefusedError("RDMA page size changed")
                 self._rdma.notify_peers(response.peers)

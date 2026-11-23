@@ -145,8 +145,8 @@ class ProcessWatcher(Protocol):
 
     def stop(self) -> None: ...
 
-    def watch(self, key: str, pid: int, pid_start: int) -> bool:
-        """False if the process already ended."""
+    def watch(self, key: str, pid: int, pid_start: int) -> bool | None:
+        """True: watched; False: ended; None: unknown."""
         ...
 
     def unwatch(self, key: str) -> None: ...
