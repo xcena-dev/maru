@@ -50,6 +50,7 @@ from maru_vllm.connector import (
     _LoadMissError,
     _node_engine_config,
     _node_transfer_defaults,
+    _req_chunk_keys,
     _UnconfirmedCopyError,
     _validate_storage_config,
 )
@@ -94,11 +95,13 @@ from tests.unit.test_vllm_tp import (
 from tests.unit.vllm_connector_helpers import (
     FailingSyncStream,
     cuda_error,
+    engine_config,
     fake_scheduler_output,
     holds,
     kept_by,
     make_flash_attn_metadata,
     make_scheduler,
+    make_vllm_scheduler,
     make_worker,
     model_vllm_config,
 )
@@ -347,14 +350,86 @@ def test_a_failed_load_must_be_recomputed():
         _node_engine_config(config.kv_transfer_config.kv_connector_extra_config, config)
 
 
-def test_the_namespace_is_bound_to_the_geometry_and_the_path():
-    from tests.unit.vllm_connector_helpers import engine_config
-
+def test_namespace_tracks_tp_size():
     config = engine_config()
     tp1 = _node_engine_config(node_extra(), config)["maru_cache_namespace"]
     assert tp1 == _node_engine_config(node_extra(), config)["maru_cache_namespace"]
     config.parallel_config.tensor_parallel_size = 2
     assert _node_engine_config(node_extra(), config)["maru_cache_namespace"] != tp1
+
+
+def test_namespace_tracks_revision_and_kv_dtype():
+    config = engine_config()
+    a = _node_engine_config(node_extra(), config)["maru_cache_namespace"]
+    config.model_config.revision = "other-commit"
+    assert a != _node_engine_config(node_extra(), config)["maru_cache_namespace"]
+    config = engine_config()
+    config.cache_config.cache_dtype = "float32"
+    assert a != _node_engine_config(node_extra(), config)["maru_cache_namespace"]
+
+
+def test_namespace_tracks_quantization():
+    config = engine_config()
+    plain = _node_engine_config(node_extra(), config)["maru_cache_namespace"]
+    config.model_config.quantization = None
+    assert _node_engine_config(node_extra(), config)["maru_cache_namespace"] == plain
+    config.model_config.quantization = "fp8"
+    fp8 = _node_engine_config(node_extra(), config)["maru_cache_namespace"]
+    assert fp8 != plain
+    config.model_config.quantization = "mxfp4"
+    assert _node_engine_config(node_extra(), config)["maru_cache_namespace"] not in (
+        plain,
+        fp8,
+    )
+
+
+def test_namespace_tracks_quantization_settings():
+    @dataclasses.dataclass
+    class Spec:
+        linear: str | None = None
+        ignore: tuple[str, ...] = ()
+
+    config = engine_config()
+    config.model_config.quantization = "fp8"
+
+    def namespace(settings):
+        config.model_config.quantization_config = settings
+        return _node_engine_config(node_extra(), config)["maru_cache_namespace"]
+
+    plain = namespace(None)
+    assert namespace({"ignore": ["lm_head"]}) not in (plain, namespace({}))
+    assert namespace(Spec("fp8")) == namespace(Spec("fp8"))
+    assert namespace(Spec("fp8")) != namespace(Spec("fp8", ("lm_head",)))
+
+
+def test_namespace_ignores_weight_path_and_transformers_version():
+    def node(path, transformers_version):
+        config = engine_config()
+        config.model_config.model = path
+        config.model_config.hf_config = SimpleNamespace(
+            to_dict=lambda: {
+                "heads": 4,
+                "_name_or_path": path,
+                "transformers_version": transformers_version,
+                "_commit_hash": None,
+            }
+        )
+        return config
+
+    a = _node_engine_config(node_extra(), node("org/model", "5.11.0"))[
+        "maru_cache_namespace"
+    ]
+    b = _node_engine_config(node_extra(), node("/models/model", "5.12.0"))[
+        "maru_cache_namespace"
+    ]
+    assert a == b
+    other = {**node_extra(), "maru_cache_namespace": "other-weights"}
+    assert (
+        a
+        != _node_engine_config(other, node("org/model", "5.11.0"))[
+            "maru_cache_namespace"
+        ]
+    )
 
 
 # =============================================================================
@@ -1518,6 +1593,169 @@ def assert_only_external_blocks(dst, kv) -> None:
     for got, want in zip(dst, kv, strict=True):
         assert torch.equal(got[1:3], want[1:3])
         assert bool((got[0] == SENTINEL).all()) and bool((got[3] == SENTINEL).all())
+
+
+@pytest.mark.parametrize("start,end", [(4, 12), (8, 12), (0, 12)])
+@pytest.mark.parametrize(
+    "failure", [None, "miss", "retrieve", "copy", "handler", "truncated", "no_layers"]
+)
+def test_partial_load_failures_preserve_prefix(start, end, failure):
+    worker = make_worker(4, 8, node_extra(), num_kv_heads=1, head_size=1)
+    cache = torch.full((8, 2, 4, 1, 1), -1.0)
+    worker._kv_layout = worker._resolve_kv_layout({"layer": cache})
+    worker._ensure_handler = lambda: None
+    worker._handler = Mock() if failure != "handler" else None
+    if worker._handler is not None:
+        worker._handler.retrieve_capacity.return_value = None
+        worker._handler.last_retrieve_misses.return_value = {}
+        worker._handler.storage_gpu_accessible.return_value = False
+    meta = MaruReqMeta(
+        "load",
+        list(range(16)),
+        [3, 1, 5, 7],
+        False,
+        num_matched_chunks=2,
+        load_start_token=start,
+        load_end_token=end,
+    )
+    keys = _req_chunk_keys(meta, 8, "")
+    slabs = [
+        torch.arange(16, dtype=torch.float32).reshape(2, 1, 8, 1) + i * 100
+        for i in range(2)
+    ]
+    reads = []
+
+    def retrieve(requested, route_key=None):
+        reads.append((requested, route_key))
+        if failure == "retrieve":
+            raise RuntimeError("retrieve failed")
+        if failure == "truncated":
+            return []
+        if failure == "miss":
+            return [None] * len(requested)
+        return [
+            SimpleNamespace(view=bytearray(slabs[keys.index(key)].numpy().tobytes()))
+            for key in requested
+        ]
+
+    worker._batch_retrieve_all = retrieve
+    if failure == "copy":
+        worker._inject_kv_into_layer = Mock(side_effect=RuntimeError("copy failed"))
+    context = SimpleNamespace(
+        attn_metadata=make_flash_attn_metadata(),
+        no_compile_layers={"layer": SimpleNamespace(kv_cache=cache)},
+    )
+    if failure == "no_layers":
+        context.no_compile_layers = {}
+    worker.start_load_kv(context, MaruConnectorMetadata(requests=[meta]))
+    assert reads == (
+        [] if failure in ("handler", "no_layers") else [(keys[start // 8 : 2], None)]
+    )
+    assert worker.take_failed_load_blocks() == (
+        set(meta.block_ids[start // 4 : end // 4]) if failure else set()
+    )
+    assert worker._stopped is None
+    for token in range(16):
+        value = cache[meta.block_ids[token // 4], :, token % 4, 0, 0]
+        expected = (
+            slabs[token // 8][:, 0, token % 8, 0]
+            if failure is None and start <= token < end
+            else torch.full((2,), -1.0)
+        )
+        torch.testing.assert_close(value, expected)
+
+
+def test_scheduler_load_range_preserves_prefix():
+    scheduler = make_scheduler(4, 8, node_extra())
+    scheduler._count_matched_chunks = lambda tokens, keys=None: 2
+    request = SimpleNamespace(request_id="load", prompt_token_ids=list(range(16)))
+    # Keep one compute block after the external hit.
+    assert scheduler.get_num_new_matched_tokens(request, 4) == (8, False)
+    scheduler.update_state_after_alloc(request, None, 4)
+    output = SimpleNamespace(
+        scheduled_new_reqs=[
+            SimpleNamespace(
+                req_id="load",
+                prompt_token_ids=request.prompt_token_ids,
+                block_ids=([3, 1, 5, 7],),
+            )
+        ],
+        scheduled_cached_reqs=SimpleNamespace(req_ids=[]),
+        num_scheduled_tokens={"load": 8},
+        finished_req_ids=set(),
+        preempted_req_ids=set(),
+    )
+    meta = scheduler.build_connector_meta(output).requests[0]
+    assert (meta.load_start_token, meta.load_end_token) == (4, 8)
+
+
+@pytest.mark.parametrize("other_running", [False, True])
+def test_failed_load_preserves_shared_prefix(tmp_path, other_running, monkeypatch):
+    from vllm.sampling_params import SamplingParams
+    from vllm.utils.hashing import sha256
+    from vllm.v1.core.kv_cache_utils import get_request_block_hasher, init_none_hash
+    from vllm.v1.request import Request
+
+    monkeypatch.setattr(
+        "maru_vllm.connector.MaruSchedulerConnector.connect_node", lambda *a, **kw: None
+    )
+    config = node_extra(maru_async_load=False, maru_async_store=False)
+    engine = make_vllm_scheduler(tmp_path, 4, 8, config, enable_prefix_caching=True)
+    init_none_hash(sha256)
+    hasher = get_request_block_hasher(4, sha256)
+    shared = list(range(4))
+    decoding = Request(
+        "decoding",
+        shared + list(range(50, 63)),
+        SamplingParams(max_tokens=8),
+        None,
+        block_hasher=hasher,
+    )
+    loading = Request(
+        "loading",
+        list(range(16)),
+        SamplingParams(max_tokens=8),
+        None,
+        block_hasher=hasher,
+    )
+    manager = engine.kv_cache_manager
+    assert manager.allocate_slots(decoding, 17) is not None
+    decoding.num_computed_tokens = 17
+    manager.cache_blocks(decoding, 16)
+    blocks, hit = manager.get_computed_blocks(loading)[:2]
+    assert hit == 4
+    assert (
+        manager.allocate_slots(
+            loading,
+            4,
+            num_new_computed_tokens=hit,
+            new_computed_blocks=blocks,
+            num_external_computed_tokens=8,
+        )
+        is not None
+    )
+    loading.num_computed_tokens = 16
+    ids = manager.get_block_ids(loading.request_id)[0]
+    assert ids[0] == manager.get_block_ids(decoding.request_id)[0][0]
+    worker = make_worker(4, 8, config)
+    meta = MaruReqMeta(
+        "loading",
+        list(range(16)),
+        ids,
+        False,
+        num_matched_chunks=2,
+        load_start_token=4,
+        load_end_token=12,
+    )
+    worker._fail_deferred_load(meta)
+    affected, _, _ = engine._update_requests_with_invalid_blocks(
+        [decoding, loading] if other_running else [loading],
+        worker.take_failed_load_blocks(),
+        {"loading": 4},
+    )
+    assert affected == {"loading"}
+    assert loading.num_computed_tokens == 4
+    assert decoding.num_computed_tokens == 17
 
 
 @pytest.mark.parametrize("layerwise", [False, True])

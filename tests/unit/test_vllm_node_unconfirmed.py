@@ -10,6 +10,8 @@ credit) on fake handlers and streams; CPU only."""
 
 import contextlib
 import dataclasses
+import gc
+import weakref
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -22,6 +24,7 @@ import torch
 import maru_vllm.connector as connector_module
 from maru_vllm.connector import (
     MaruConnectorMetadata,
+    MaruReqMeta,
     _QueuedCopyError,
     _UnconfirmedCopyError,
 )
@@ -31,12 +34,14 @@ from tests.unit.test_vllm_node import (
     Done,
     FailedWait,
     Pending,
+    behind_meta,
     external_meta,
     fetching_loader,
     forward_of,
     group_loader,
     is_kept,
     lease,
+    node_store_worker,
     page,
     park,
     park_group,
@@ -51,7 +56,14 @@ from tests.unit.test_vllm_node import (
     wait_on,
     write_behind_worker,
 )
-from tests.unit.vllm_connector_helpers import cuda_error, holds
+from tests.unit.vllm_connector_helpers import (
+    _slab,
+    _view,
+    cuda_error,
+    holds,
+    kept_by,
+    make_flash_attn_metadata,
+)
 
 
 def inline_reader(reads: list):
@@ -67,9 +79,93 @@ def stop(worker) -> None:
     worker._stop_if_unconfirmed(cuda_error(), req_id="r0")
 
 
+def packed_reader(monkeypatch):
+    worker, kernel, _, _ = node_store_worker(monkeypatch)
+    cache = next(iter(worker._kv_caches.values()))
+    worker._ensure_handler = lambda: None
+    worker._handler.retrieve_capacity.return_value = 3
+    worker._handler.storage_gpu_accessible.return_value = True
+    worker._handler.start_retrieve.side_effect = lambda keys: SimpleNamespace(
+        done=lambda: True, result=lambda: worker._batch_retrieve_all(keys)
+    )
+    worker._batch_retrieve_all = lambda keys, **_: [_view(_slab()) for _ in keys]
+    kernel[0].TransferDirection.H2D = "H2D"
+    worker._packed_load_kernel_ctx = lambda *args: kernel
+    worker._pin_slot_mapping_for_async_h2d = lambda slots: slots
+    worker._last_attn_metadata = make_flash_attn_metadata()
+    meta = MaruReqMeta(
+        "r1",
+        list(range(24)),
+        list(range(6)),
+        False,
+        num_matched_chunks=3,
+        load_end_token=24,
+    )
+    return worker, cache, meta
+
+
 # =============================================================================
 # Loads
 # =============================================================================
+
+
+def test_cxl_load_wait_cuda_error_stops_worker(monkeypatch):
+    worker, cache, meta = packed_reader(monkeypatch)
+    worker._node_mode = False
+    stream = torch.cuda.current_stream()
+    stream.synchronize = MagicMock(side_effect=cuda_error())
+    with pytest.raises(_UnconfirmedCopyError, match="req r1"):
+        worker.start_load_kv(
+            SimpleNamespace(
+                attn_metadata=worker._last_attn_metadata,
+                no_compile_layers={"layer": SimpleNamespace(kv_cache=cache)},
+            ),
+            MaruConnectorMetadata(requests=[meta]),
+        )
+    assert not worker._failed_load_blocks
+    assert stopped(worker, "req r1")
+
+
+def test_copy_ahead_wait_cuda_error_keeps_all_batches(monkeypatch):
+    worker, cache, meta = packed_reader(monkeypatch)
+    monkeypatch.setattr(connector_module, "_LOAD_PIPELINE_CHUNKS", 1)
+    monkeypatch.setattr(torch.cuda, "stream", lambda stream: contextlib.nullcontext())
+    alive = []
+
+    class Lease:
+        def __init__(self):
+            self.view = _view(_slab()).view
+
+    def retrieve(keys, **kwargs):
+        reads = [Lease() for _ in keys]
+        alive.extend(weakref.ref(read) for read in reads)
+        return reads
+
+    copies = []
+
+    def inject(*args, copied_ahead=None, **kwargs):
+        copies.append(True)
+        if len(copies) == 2:
+            copied_ahead.add(FailedWait())
+            raise RuntimeError("stage failed")
+        return False
+
+    worker._batch_retrieve_all = retrieve
+    worker._loader_kernel_ctx = lambda *args: None
+    worker._inject_slab_layers = inject
+    stream = torch.cuda.current_stream()
+    stream.record_event = lambda: Pending()
+    worker._load_leased_request(
+        [("layer", cache, 0)],
+        meta,
+        worker._last_attn_metadata,
+        stream=stream,
+    )
+    gc.collect()
+    assert len(alive) == 2 and all(ref() is not None for ref in alive)
+    worker._handler.release_retrieved.assert_not_called()
+    assert not worker._failed_load_blocks and not worker._deferred_done
+    assert stopped(worker, "req r1")
 
 
 def test_an_inline_node_copy_cuda_error_stops_and_keeps_its_reads():
@@ -271,6 +367,71 @@ def test_read_leases_are_kept_once_stopped():
 # =============================================================================
 # Stores
 # =============================================================================
+
+
+def kept_pages(worker):
+    return {id(ref) for ref in kept_by(worker) if hasattr(ref, "buf")}
+
+
+def test_store_event_cuda_error_keeps_pages_and_blocks(monkeypatch):
+    worker, kernel, _, published = node_store_worker(monkeypatch)
+
+    class BadEvent:
+        def record(self, stream=None):
+            raise cuda_error()
+
+    monkeypatch.setattr(torch.cuda, "Event", BadEvent)
+    worker._store_packed_slabs_write_behind(kernel, behind_meta("r1"))
+    assert not published
+    worker._handler.free.assert_not_called()
+    assert len(kept_pages(worker)) == 2
+    assert holds(worker, worker._store_staging)
+    assert "r1" in worker._request_pending_store_keys
+    assert stopped(worker, UNCONFIRMED)
+
+
+def test_store_stream_wait_cuda_error_prevents_copy(monkeypatch):
+    worker, kernel, _, published = node_store_worker(monkeypatch)
+    stream = torch.cuda.current_stream()
+    stream.wait_stream = MagicMock(side_effect=cuda_error())
+    with pytest.raises(_UnconfirmedCopyError, match=UNCONFIRMED):
+        worker._store_packed_slabs_write_behind(kernel, behind_meta("r1"))
+    kernel[0].multi_layer_kv_transfer.assert_not_called()
+    worker._handler.alloc.assert_not_called()
+    assert not published
+    assert stopped(worker, UNCONFIRMED)
+
+
+@pytest.mark.parametrize("cuda_wait_error", [False, True])
+def test_store_submit_failure_drains_before_free(monkeypatch, cuda_wait_error):
+    worker, kernel, _, published = node_store_worker(monkeypatch)
+    event = MagicMock()
+    order = []
+
+    def synchronize():
+        order.append("wait")
+        if cuda_wait_error:
+            raise cuda_error()
+
+    event.synchronize.side_effect = synchronize
+    monkeypatch.setattr(torch.cuda, "Event", lambda: event)
+    worker._store_executor = MagicMock()
+    worker._store_executor.submit.side_effect = RuntimeError("executor closed")
+    worker._handler.free.side_effect = lambda handle: order.append("free")
+    worker._store_packed_slabs_write_behind(kernel, behind_meta("r1"))
+    event.synchronize.assert_called_once_with()
+    assert order == (["wait"] if cuda_wait_error else ["wait", "free", "free"])
+    assert not published
+    if not cuda_wait_error:
+        assert worker._handler.free.call_count == 2
+        assert worker.get_finished_saving({"r1"}) == {"r1"}
+        assert worker._stopped is None
+        return
+    worker._handler.free.assert_not_called()
+    assert len(kept_pages(worker)) == 2
+    assert holds(worker, worker._store_staging)
+    assert "r1" in worker._request_pending_store_keys
+    assert stopped(worker, UNCONFIRMED)
 
 
 def test_a_publish_once_stopped_keeps_its_pages():
