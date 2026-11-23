@@ -504,6 +504,31 @@ def test_gate_wait_respects_the_request_deadline(
     env.reader.progress()
 
 
+@pytest.mark.parametrize("remaining", [0.0005, 0, -1])
+def test_batch_post_gate_wait_respects_the_earliest_deadline(
+    env, monkeypatch, remaining
+):
+    batch = []
+    requests = [env.start(env.outcome(offset), batch=batch) for offset in (0, PAGE)]
+    requests[0].deadline = 100 + remaining
+    requests[1].deadline = 100 + remaining + 1
+    timeouts = []
+
+    class BusyGate:
+        def acquire(self, *, timeout):
+            timeouts.append(timeout)
+            return False
+
+    with monkeypatch.context() as patch:
+        patch.setattr(time, "monotonic", lambda: 100)
+        patch.setattr(env.reader, "gate", BusyGate())
+        env.reader.post_reads(batch)
+    assert timeouts == [pytest.approx(max(0, remaining))]
+    assert [r.reason for r in requests] == ["gate_busy", "gate_busy"]
+    assert [r.result() for r in requests] == [None, None]
+    env.reader.progress()
+
+
 def test_idle_progress_does_not_acquire_the_gate(env, monkeypatch):
     class IdleGate:
         def acquire(self, *args, **kwargs):

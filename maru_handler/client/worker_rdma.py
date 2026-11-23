@@ -433,7 +433,8 @@ class WorkerRdma:
         """Post reserved reads by peer, with ownership and checks under the gate."""
         if not batch:
             return
-        if not self._acquire_gate():
+        deadline = min(r.deadline for flight in batch for r in flight.waiters)
+        if not self._acquire_gate(deadline):
             for flight in batch:
                 for request in flight.waiters:
                     request.reason = "gate_busy"
