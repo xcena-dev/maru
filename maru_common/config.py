@@ -206,9 +206,17 @@ class MaruConfig:
                 raise ValueError("credit_wait_s must be a number >= 0")
             if not 0 <= self.node_connect_timeout_s < float("inf"):
                 raise ValueError("node_connect_timeout_s must be a number >= 0")
-        if self.read_hints and self.storage_backend not in _HINT_BACKENDS:
+        if (
+            self.read_hints
+            and not self.maru_node
+            and self.storage_backend not in _HINT_BACKENDS
+        ):
             raise ValueError(
                 "read_hints is supported by the remote_cxl and cxl backends"
+            )
+        if self.maru_node and (self.write_hints or self.write_wait_ms != 50):
+            raise ValueError(
+                "set write_hints and write_wait_ms in the remote node config"
             )
         if self.write_hints and self.storage_backend != "remote_cxl":
             raise ValueError("write_hints is supported by the remote_cxl backend")
@@ -219,7 +227,11 @@ class MaruConfig:
             raise ValueError(
                 f"write_wait_ms must be an integer from 0 to {MAX_WRITE_WAIT_MS}"
             )
-        if self.read_promotes and self.storage_backend not in _HINT_BACKENDS:
+        if (
+            self.read_promotes
+            and not self.maru_node
+            and self.storage_backend not in _HINT_BACKENDS
+        ):
             raise ValueError(
                 "read_promotes is supported by the remote_cxl and cxl backends"
             )

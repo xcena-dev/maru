@@ -403,6 +403,8 @@ REMOTE_NODE = {
 def test_remote_uses_worker_staging_and_no_local_pool():
     config = parse_node_config(REMOTE_NODE)
     check_servable(config)
+    assert config.top.options["write_hints"] is False
+    assert config.top.options["write_wait_ms"] == 50
     assert config.top.size is None
     assert config.top.options["staging_size"] == max(1 << 30, 64 * config.page_size)
     assert config.budgets.credit_total_max_bytes == 2 * config.page_size
@@ -425,7 +427,9 @@ def test_remote_uses_worker_staging_and_no_local_pool():
         ("hugepage", True),
         ("size", "1G"),
         ("high_watermark", 0.9),
-        ("write_hints", True),
+        ("write_hints", "true"),
+        ("write_wait_ms", True),
+        ("write_wait_ms", 10001),
     ],
 )
 def test_remote_rejects_invalid_staging_and_removed_buffer_keys(key, value):
@@ -511,3 +515,13 @@ def test_a_registered_store_is_parsed_by_its_spec(monkeypatch):
     assert config.traits()["fake"].kind is PoolKind.CXL
     assert config_to_dict(config)["tiers"][0]["depth"] == 3
     rejects(with_tier(raw, 0, wrong=True), "unknown keys")
+
+
+def test_remote_write_hints_round_trip():
+    from maru_storage_service.cli import config_to_dict
+
+    raw = with_tier(REMOTE_NODE, 0, write_hints=True, write_wait_ms=10000)
+    config = parse_node_config(raw)
+    assert config.top.options["write_hints"] is True
+    assert config.top.options["write_wait_ms"] == 10000
+    assert parse_node_config(config_to_dict(config)) == config

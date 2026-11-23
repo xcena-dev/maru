@@ -589,7 +589,9 @@ class ServerConn:
         with self._lock:
             return len(self._unresolved)
 
-    def probe(self, keys: list[Key]) -> list[ItemOutcome] | None:
+    def probe(
+        self, keys: list[Key], *, with_locations: bool = False
+    ) -> list[ItemOutcome] | None:
         """PROBE (no pins); None when unavailable. One RPC at most: never
         resent, never waits for a reopen."""
         if not 0 < len(keys) <= MAX_BATCH:
@@ -600,7 +602,12 @@ class ServerConn:
             session, epoch = self._ids()
             response: ProbeResponse = self._rpc.call(
                 MessageType.PROBE,
-                ProbeRequest(session=session, server_epoch=epoch, items=list(keys)),
+                ProbeRequest(
+                    session=session,
+                    server_epoch=epoch,
+                    items=list(keys),
+                    with_locations=with_locations,
+                ),
                 timeout_s=self._lookup_timeout_s,
             )
         except RpcUnknownError as e:

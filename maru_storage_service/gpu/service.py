@@ -8,6 +8,7 @@ from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
 from maru_common.storage_types import (
+    HINT_CAPABILITY,
     REMOTE_CAPABILITY,
     WORKER_RDMA_CAPABILITY,
     CloseMode,
@@ -75,7 +76,7 @@ class GpuNode:
             pools=[],
             transfer_defaults=config.transfer_defaults(),
             socket_group=config.socket_group,
-            capabilities=frozenset([WORKER_RDMA_CAPABILITY])
+            capabilities=frozenset([WORKER_RDMA_CAPABILITY, HINT_CAPABILITY])
             if self.remote
             else frozenset(),
             ownership=run._ownership,

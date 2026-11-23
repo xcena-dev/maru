@@ -38,6 +38,7 @@ from maru_common.node_protocol import (
     CreditReturnRequest,
     DetachRequest,
     GroupLayout,
+    HintRequest,
     NodeMessageType,
     Notify,
     Peers,
@@ -53,6 +54,7 @@ from maru_common.storage_types import (
     MAX_BATCH,
     MS_PROTOCOL,
     WORKER_RDMA_CAPABILITY,
+    HintAction,
     ItemOutcome,
     ItemResult,
     Key,
@@ -242,16 +244,23 @@ class PendingRetrieve:
         self._client = client
         self.misses = collections.Counter()
         self._chunks = []
+        self.hint_id = ""
 
     def done(self):
         return all(r.done() for c in self._chunks for r in c.remote.values())
 
     def result(self):
-        return self._client._finish_retrieve(self)
+        try:
+            return self._client._finish_retrieve(self)
+        finally:
+            if self.hint_id:
+                self._client.end_read_hint(self.hint_id)
 
     def cancel(self):
         chunks, self._chunks = self._chunks, []
         self._client._drop_chunks(chunks)
+        if self.hint_id:
+            self._client.end_read_hint(self.hint_id)
 
 
 class _Throttle:
@@ -366,6 +375,9 @@ class MaruClient:
         # Outcomes by class: unavailable, not_found and fetch apart
         self.stats: collections.Counter[str] = collections.Counter()
         self._stats_lock = threading.Lock()
+        from maru_handler.hints import MemoryHints
+
+        self._hints = MemoryHints(self._hint_locate, self._hint_send)
 
     def stop(self):
         """Freeze ownership after a CUDA error."""
@@ -782,6 +794,7 @@ class MaruClient:
 
             _KEPT_UNTIL_EXIT.append(self)
             return
+        self._hints.close(timeout_s=1, end_open=True)
         with self._lock:
             if self._closing.is_set():
                 return
@@ -1588,6 +1601,61 @@ class MaruClient:
 
     # ------------------------------------------------------------------ reads
 
+    @property
+    def read_hints_enabled(self):
+        info = self.attach_info
+        return bool(
+            self.config.read_hints and info and HINT_CAPABILITY in info.capabilities
+        )
+
+    def hint_read(self, request_id, keys, route_key=None):
+        if self.read_hints_enabled and not self._stopped.is_set():
+            self._hints.hint(request_id, keys)
+
+    def end_read_hint(self, request_id):
+        if self.config.read_hints and not self._stopped.is_set():
+            self._hints.end(request_id)
+
+    def promote_read(self, request_id, route_key=None):
+        if self.config.read_promotes and not self._stopped.is_set():
+            self._hints.promote(request_id, ["node"])
+
+    def _hint_locate(self, keys):
+        server = self._server
+        if server is None or self._stopped.is_set() or not self.storage_connected:
+            return []
+        ranges = []
+        for i in range(0, len(keys), MAX_BATCH):
+            outcomes = server.probe(
+                [Key(self.identity.namespace, k) for k in keys[i : i + MAX_BATCH]],
+                with_locations=True,
+            )
+            for outcome in outcomes or []:
+                if outcome.result != ItemResult.HIT or outcome.location is None:
+                    return [("node", ranges)] if ranges else []
+                ranges.append(outcome.location)
+            if outcomes is None:
+                break
+        return [("node", ranges)] if ranges else []
+
+    def _hint_send(self, target, message):
+        storage, info = self._storage, self.attach_info
+        if (
+            self._stopped.is_set()
+            or storage is None
+            or info is None
+            or HINT_CAPABILITY not in info.capabilities
+        ):
+            return False
+        reply = storage.submit(
+            NodeMessageType.HINT,
+            HintRequest(
+                HintAction(message["action"]), message["request"], message["ranges"]
+            ),
+            deadline=time.monotonic() + self.rpc_timeout_s,
+        ).result(timeout=self.rpc_timeout_s)
+        return reply.status == Status.OK
+
     def prepare_read_thread(self) -> None:
         server = self._server
         if server is not None:
@@ -1617,6 +1685,9 @@ class MaruClient:
             pending.misses["unavailable"] += len(keys)
             return pending
         self._ensure()
+        if self.read_hints_enabled and self.role == SessionRole.WORKER:
+            pending.hint_id = f"maru-load-{uuid.uuid4().hex}"
+            self.hint_read(pending.hint_id, keys)
         try:
             for i in range(0, len(keys), MAX_BATCH):
                 pending._chunks.append(
@@ -1624,6 +1695,8 @@ class MaruClient:
                 )
         except BaseException:
             self._drop_chunks(pending._chunks)
+            if pending.hint_id:
+                self.end_read_hint(pending.hint_id)
             raise
         return pending
 

@@ -4,6 +4,7 @@
 import logging
 import os
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 
 from maru_common.ms_rpc import PLACEHOLDER_OP, OpOrigin
@@ -11,6 +12,7 @@ from maru_common.node_protocol import (
     AbortResponse,
     CreditResponse,
     CreditReturnResponse,
+    HintResponse,
     Peers,
     ReadJoinResponse,
     WorkerStaging,
@@ -25,6 +27,7 @@ from maru_common.remote_protocol import (
     FenceResult,
     HelloRequest,
     PingRequest,
+    RemoteHintRequest,
     RemoteWriteDoneRequest,
     ReserveRequest,
     TransferEnd,
@@ -37,12 +40,14 @@ from maru_common.remote_protocol import (
 from maru_common.storage_types import (
     MAX_BATCH,
     MEMORY_CAPABILITY,
+    HintAction,
     ItemOutcome,
     ItemResult,
     ReadPeer,
     Status,
     WriteDomain,
 )
+from maru_handler.hints import MAX_HINT_RANGES, MemoryHints
 from maru_remote.auth import load_key
 
 from ..op_ledger import LedgerEntry
@@ -64,6 +69,8 @@ class RemoteControl:
         )
         self.origin = OpOrigin(peer_origin(run.config.node_id, run.node_epoch))
         self.peers = []
+        self.hint_actions = []
+        self._wait_retry_at = 0.0
         self.connection = None
         self.lock = threading.RLock()
         self.stopping = threading.Event()
@@ -102,6 +109,7 @@ class RemoteControl:
             conn.close()
             raise ConnectionError("memory node HELLO refused or incomplete")
         # Full agent metadata includes every registered pool.
+        self.hint_actions = hello.hint_actions
         self.peers = [
             ReadPeer(
                 hello.node_id,
@@ -122,6 +130,7 @@ class RemoteControl:
 
     def lost(self):
         self.peers = []
+        self.hint_actions = []
         self.notify(Peers([]))
         if not self.stopping.is_set():
             self.run.store.end_run("memory node control connection lost")
@@ -132,7 +141,10 @@ class RemoteControl:
         if op:
             request = self.origin.stamp(request)
         try:
-            answer = self.connection.call(code, request, self.options["timeout_s"])
+            timeout = self.options["timeout_s"]
+            if code == Code.RESERVE and request.hint == HintAction.WRITE_WAIT:
+                timeout = max(timeout, request.wait_ms / 1000 + 3)
+            answer = self.connection.call(code, request, timeout)
         except (ConnectionError, TimeoutError):
             # A lost RESERVE reply never makes its pages available to a worker.
             if code == Code.RESERVE and not self.connection.closed:
@@ -160,6 +172,17 @@ class RemoteControl:
             except (ConnectionError, TimeoutError):
                 return
 
+    def reserve_hint(self):
+        if not self.options["write_hints"]:
+            return None
+        if (
+            self.options["write_wait_ms"]
+            and "write_wait" in self.hint_actions
+            and time.monotonic() >= self._wait_retry_at
+        ):
+            return HintAction.WRITE_WAIT
+        return HintAction.WRITE_HINT if "write_hint" in self.hint_actions else None
+
     def close(self):
         self.stopping.set()
         if self.connection is not None:
@@ -177,6 +200,7 @@ class RemoteWorkerOps(WorkerOps):
             on_worker_lost=self._worker_lost,
         )
         self.remote = RemoteControl(run, self._notify)
+        self._hints = MemoryHints(lambda keys: [], self._hint_send)
         self._admitted = {}
         self._agents = {}
         self._domains = {}
@@ -189,6 +213,45 @@ class RemoteWorkerOps(WorkerOps):
         self._control_tasks = ThreadPoolExecutor(
             max_workers=1, thread_name_prefix="maru-remote-control"
         )
+
+    def hint(self, rec, request):
+        if request.action not in (
+            HintAction.READ_HINT,
+            HintAction.READ_HINT_END,
+            HintAction.READ_PROMOTE,
+        ):
+            return HintResponse(Status.REJECTED, error="read hints only")
+        if not request.request or len(request.ranges) > MAX_HINT_RANGES:
+            return HintResponse(Status.REJECTED, error="invalid hint request")
+        if request.action != HintAction.READ_HINT and request.ranges:
+            return HintResponse(Status.REJECTED, error="unexpected hint ranges")
+        engine = rec.ident.engine_id
+        token = f"{len(engine)}:{engine}:{rec.ident.dp_index}:{request.request}"
+        if request.action == HintAction.READ_HINT:
+            self._hints.hint_ranges(token, [("memory", request.ranges)], append=True)
+        elif request.action == HintAction.READ_HINT_END:
+            self._hints.end(token)
+        else:
+            self._hints.promote(token, ["memory"])
+        return HintResponse(Status.OK)
+
+    def _hint_send(self, target, message):
+        action = message["action"]
+        remote = self.remote
+        if action not in remote.hint_actions or remote.stopping.is_set():
+            return False
+        pools = {p.pool_id for peer in remote.peers for p in peer.pools}
+        ranges = [r for r in message["ranges"] if r.pool_id in pools]
+        if action == "read_hint" and not ranges:
+            return False
+        if remote.connection is None:
+            return False
+        answer = remote.connection.call(
+            Code.HINT,
+            RemoteHintRequest(HintAction(action), message["request"], ranges),
+            remote.options["timeout_s"],
+        )
+        return answer.status == Status.OK
 
     def admit(self, ident):
         with self.remote.lock:
@@ -288,8 +351,17 @@ class RemoteWorkerOps(WorkerOps):
                     else:
                         domain = self._domain(rec)
                         # Keep the worker op paired with the RESERVE sequence before sending.
+                        hint = self.remote.reserve_hint()
                         request = self.remote.origin.stamp(
-                            ReserveRequest(PLACEHOLDER_OP, pages, domain=domain)
+                            ReserveRequest(
+                                PLACEHOLDER_OP,
+                                pages,
+                                hint=hint,
+                                wait_ms=self.remote.options["write_wait_ms"]
+                                if hint == HintAction.WRITE_WAIT
+                                else 0,
+                                domain=domain,
+                            )
                         )
                         locations = []
                         self._reserves[rec.incarnation, req.op.seq] = (
@@ -297,7 +369,15 @@ class RemoteWorkerOps(WorkerOps):
                             domain,
                             locations,
                         )
-                        got = self.remote.call(Code.RESERVE, request)
+                        started = time.monotonic()
+                        try:
+                            got = self.remote.call(Code.RESERVE, request)
+                        finally:
+                            if (
+                                hint == HintAction.WRITE_WAIT
+                                and time.monotonic() - started >= request.wait_ms / 1000
+                            ):
+                                self.remote._wait_retry_at = time.monotonic() + 5.0
                         self.remote.origin.resolved(request.op.seq)
                         locations.extend(got.credits)
                         if got.status == Status.OK and got.credits:
@@ -491,5 +571,6 @@ class RemoteWorkerOps(WorkerOps):
 
     def stop(self):
         self.remote.close()
+        self._hints.close(timeout_s=1, end_open=False)
         self._control_tasks.shutdown(wait=True)
         super().stop()

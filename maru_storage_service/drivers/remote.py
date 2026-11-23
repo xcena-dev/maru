@@ -7,6 +7,7 @@ from ..config_fields import (
     NodeConfigError,
     TierContext,
     TierSpec,
+    _bool,
     _number,
     _str,
     parse_size,
@@ -25,6 +26,12 @@ def parse(raw: dict, ctx: TierContext) -> dict:
     timeout = _number(raw, "timeout_s", ctx.what, 30)
     if timeout <= 0:
         raise NodeConfigError(f"{ctx.what}.timeout_s: must be positive")
+    write_hints = _bool(raw, "write_hints", ctx.what, False)
+    wait_ms = raw.get("write_wait_ms", 50)
+    if type(wait_ms) is not int or not 0 <= wait_ms <= 10_000:
+        raise NodeConfigError(
+            f"{ctx.what}.write_wait_ms: expected an integer from 0 to 10000"
+        )
     staging = parse_size(
         raw.get("staging_size", max(1 << 30, 64 * ctx.page_size)),
         f"{ctx.what}.staging_size",
@@ -43,6 +50,8 @@ def parse(raw: dict, ctx: TierContext) -> dict:
             "rdma_device": device,
             "key_file": os.path.expanduser(_str(raw, "key_file", ctx.what)),
             "timeout_s": timeout,
+            "write_hints": write_hints,
+            "write_wait_ms": wait_ms,
             "staging_size": staging,
             "staging_max_bytes": total,
             "quarantine_max": kept,
@@ -73,6 +82,8 @@ SPEC = TierSpec(
             "rdma_device",
             "key_file",
             "timeout_s",
+            "write_hints",
+            "write_wait_ms",
             "staging_size",
             "staging_max_bytes",
             "quarantine_max",

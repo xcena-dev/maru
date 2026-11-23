@@ -38,6 +38,7 @@ from maru_common.node_protocol import (
 from maru_common.protocol import MessageHeader
 from maru_common.serializer import DecodedRequest, MessageDecodeError, Serializer
 from maru_common.storage_types import (
+    HINT_CAPABILITY,
     MS_PROTOCOL,
     WORKER_RDMA_CAPABILITY,
     PoolDescriptor,
@@ -55,7 +56,6 @@ _LISTEN_BACKLOG = 128
 _DISABLED = {
     NodeMessageType.LOCAL_PIN: "local pins are not supported",
     NodeMessageType.LOCAL_UNPIN: "local pins are not supported",
-    NodeMessageType.HINT: "hints are not served",
 }
 
 
@@ -450,13 +450,27 @@ class LocalServer:
             return
         request = decoded.request
         manager = self._manager()
-        if rec.role == SessionRole.PROBE and code != NodeMessageType.DETACH:
+        if rec.role == SessionRole.PROBE and code not in (
+            NodeMessageType.DETACH,
+            NodeMessageType.HINT,
+        ):
             conn.respond(
                 header,
                 response_cls(status=Status.REJECTED, error="a probe only detaches"),
             )
             return
-        if code == NodeMessageType.CREDIT:
+        if code == NodeMessageType.HINT:
+            hint = getattr(manager, "hint", None)
+            if hint is None or HINT_CAPABILITY not in self.capabilities:
+                conn.respond(header, response_cls(status=Status.DISABLED))
+            elif HINT_CAPABILITY not in rec.capabilities:
+                conn.respond(
+                    header,
+                    response_cls(status=Status.REJECTED, error="hint_v1 required"),
+                )
+            else:
+                conn.respond(header, hint(rec, request))
+        elif code == NodeMessageType.CREDIT:
             conn.respond(header, manager.credit(rec, decoded))
         elif code == NodeMessageType.CREDIT_RETURN:
             conn.respond(header, manager.credit_return(rec, request))

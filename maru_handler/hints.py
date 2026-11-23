@@ -51,6 +51,7 @@ import threading
 from collections import OrderedDict
 from collections.abc import Callable
 
+from maru_common.storage_types import Location
 from maru_remote import region_map
 
 logger = logging.getLogger(__name__)
@@ -76,7 +77,7 @@ class MemoryHints:
     Args:
         locate: ``keys -> [(agent, ranges)]``: the leading hit keys, per
             target (agent) that holds their regions, each range a
-            ``{"handle", "offset", "length"}`` map in key order. Called on
+            ``{"handle", "offset", "length"}`` map or node Location in key order. Called on
             the hint thread (it may ask MaruServer).
         send: ``(agent, message) -> bool`` to that target (on
             ``remote_cxl``, over a connection of this process to the agent);
@@ -86,7 +87,7 @@ class MemoryHints:
 
     def __init__(
         self,
-        locate: Callable[[list[str]], list[tuple[str, list[dict]]]],
+        locate: Callable[[list[str]], list[tuple[str, list[dict | Location]]]],
         send: Callable[[str, dict], bool],
     ) -> None:
         self._locate = locate
@@ -118,13 +119,21 @@ class MemoryHints:
             self._queue_hint(("hint", request_id, list(keys)))
 
     def hint_ranges(
-        self, request_id: str, groups: list[tuple[str, list[dict]]]
+        self,
+        request_id: str,
+        groups: list[tuple[str, list[dict | Location]]],
+        *,
+        append: bool = False,
     ) -> None:
-        """Queue a hint whose ranges are known already (``locate``'s form)."""
+        """Queue known ranges; append retains chunks of a relayed hint."""
         if request_id and groups:
-            self._queue_hint(("ranges", request_id, groups))
+            self._queue_hint(
+                ("append_ranges" if append else "ranges", request_id, groups)
+            )
 
-    def write_hint(self, token: str, groups: list[tuple[str, list[dict]]]) -> None:
+    def write_hint(
+        self, token: str, groups: list[tuple[str, list[dict | Location]]]
+    ) -> None:
         """Queue a write hint: the pages in ``groups`` (``locate``'s form, in
         write order) are about to be written. ``token`` names the store; a
         write hint has no end. Dropped as a read hint is."""
@@ -241,6 +250,8 @@ class MemoryHints:
                     self._give(request_id, self._locate(payload))
                 elif kind == "ranges":
                     self._give(request_id, payload)
+                elif kind == "append_ranges":
+                    self._give(request_id, payload, append=True)
                 elif kind == "write":
                     self._send_all("write_hint", request_id, payload)
                 elif kind == "promote":
@@ -256,16 +267,27 @@ class MemoryHints:
                 # Advice only: the load reads the bytes either way.
                 logger.debug("hint %s for %s failed", kind, request_id, exc_info=True)
 
-    def _give(self, request_id: str, groups: list[tuple[str, list[dict]]]) -> None:
-        if request_id in self._agents:
+    def _give(
+        self,
+        request_id: str,
+        groups: list[tuple[str, list[dict | Location]]],
+        *,
+        append: bool = False,
+    ) -> None:
+        if request_id in self._agents and not append:
             return  # hinted already
-        self._agents[request_id] = self._send_all("read_hint", request_id, groups)
+        reached = self._send_all("read_hint", request_id, groups)
+        agents = self._agents.setdefault(request_id, [])
+        agents.extend(agent for agent in reached if agent not in agents)
         while len(self._agents) > MAX_OPEN_HINTS:
             # Its end never came (or comes later): end it now.
             self._finish(next(iter(self._agents)))
 
     def _send_all(
-        self, action: str, request_id: str, groups: list[tuple[str, list[dict]]]
+        self,
+        action: str,
+        request_id: str,
+        groups: list[tuple[str, list[dict | Location]]],
     ) -> list[str]:
         """Send ``action`` with each agent's ranges, in messages of at most
         :data:`MAX_HINT_RANGES` (one message if there are none); the agents

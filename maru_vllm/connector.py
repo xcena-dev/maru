@@ -1179,10 +1179,6 @@ def _node_engine_config(
         )
     # No key names a pipeline stage's layers or a context-parallel rank's tokens
     _validate_cxl_parallelism(getattr(config, "parallel_config", None))
-    if extra.get("maru_read_hints") or extra.get("maru_read_hint_on_arrival"):
-        logger.warning(
-            "Maru: read hints have no effect on maru_node: the node does not carry them"
-        )
     digest = _namespace_digest(extra, config, kv_groups, "maru_node")
     return {
         **extra,
@@ -1696,6 +1692,10 @@ def _create_node_handler(
         rdma_load_reserve=_RDMA_ASYNC_LOAD_RESERVE
         if _get_knob(extra_config, "maru_async_load")
         else 0,
+        read_hints=metadata_only and bool(extra_config.get("maru_read_hints", False)),
+        read_promotes=not metadata_only
+        and bool(extra_config.get("maru_read_hints", False))
+        and bool(_get_knob(extra_config, "maru_async_load")),
     )
     handler = MaruHandler(cfg)
     handler.connect(wait=False)
@@ -1755,6 +1755,15 @@ def _wait_node_handler(
 
 def _check_node_modes(handler: Any, extra_config: dict[str, Any]) -> None:
     info = getattr(getattr(handler, "_cpu", None), "attach_info", None)
+    if (
+        info is not None
+        and "worker_rdma_v1" not in info.capabilities
+        and (
+            extra_config.get("maru_read_hints")
+            or extra_config.get("maru_read_hint_on_arrival")
+        )
+    ):
+        logger.warning("Maru: read hints have no effect on this non-remote maru_node")
     if info is not None and "worker_rdma_v1" in info.capabilities:
         if _get_knob(extra_config, "maru_use_layerwise") or _get_knob(
             extra_config, "maru_overlap_load_with_compute"
@@ -7232,8 +7241,18 @@ class MaruWorkerConnector:
                         return
                 if b > 0:
                     capacity = handler.retrieve_capacity(n)
-                    if capacity == 0:
+                    if capacity == 0 and pipelined:
                         capacity = self._leased_batch_size(handler, n, True)
+                    elif capacity == 0:
+                        self._fail_leased(
+                            load,
+                            replace(
+                                req_meta,
+                                load_start_token=max(start, (first + b) * ct),
+                                load_end_token=end,
+                            ),
+                        )
+                        return
                     if capacity is not None and 0 < capacity < n:
                         n = capacity  # another load holds the rest
                 batch = _LeasedBatch(

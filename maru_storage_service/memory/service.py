@@ -272,9 +272,15 @@ class MemoryNode:
         ranges = []
         for location in locations:
             pool = self._regions.get(location.pool_id)
-            if pool is None or self.run.pools.find(location) is None:
+            page = self.run.pools.find(location)
+            if pool is None or page is None or location.kind != pool.info().kind:
                 raise ValueError("hint range is not current")
-            if not 0 < location.length <= pool.page_size:
+            if not (
+                0 < location.length
+                and page.index * pool.page_size <= location.offset
+                and location.offset + location.length
+                <= (page.index + 1) * pool.page_size
+            ):
                 raise ValueError("hint range is outside its page")
             ranges.append(
                 {
@@ -295,7 +301,12 @@ class MemoryNode:
         ):
             done(RemoteHintResponse(Status.REJECTED, error="hint action unsupported"))
             return
+        added = False
         try:
+            if not self.check_generation():
+                raise ValueError("memory generation unavailable")
+            if not request.request:
+                raise ValueError("hint request is empty")
             if len(request.ranges) > MAX_HINT_RANGES:
                 raise ValueError("too many hint ranges")
             with self._extension_lock:
@@ -310,6 +321,7 @@ class MemoryNode:
                         >= self.run.config.region_extension.hint_requests_max
                     ):
                         raise ValueError("too many hint requests")
+                    added = request.request not in opened
                     opened.add(request.request)
                 elif action == "read_hint_end":
                     opened.discard(request.request)
@@ -323,6 +335,9 @@ class MemoryNode:
                 ranges,
             )
         except Exception as exc:
+            if added:
+                with self._extension_lock:
+                    self._hint_requests.get(conn, set()).discard(request.request)
             done(RemoteHintResponse(Status.REJECTED, error=str(exc)))
         else:
             done(RemoteHintResponse(Status.OK))
