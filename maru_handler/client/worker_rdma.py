@@ -331,7 +331,16 @@ class WorkerRdma:
             and self._ready_peers.get(flight.location.pool_id) is flight.peer
         )
 
-    def start(self, outcome, generation, unpin, *, deadline=None, current=lambda: True):
+    def start(
+        self,
+        outcome,
+        generation,
+        unpin,
+        *,
+        deadline=None,
+        current=lambda: True,
+        batch=None,
+    ):
         request = ReadRequest(
             self,
             outcome,
@@ -409,37 +418,10 @@ class WorkerRdma:
             self._flights.add(flight)
             self._joining[join_key] = flight
             # Ownership is visible before the transport can post.
-            if not self._valid(flight):
-                flight.state = "done"
-                request.reason = "generation"
+            if batch is not None:
+                batch.append(flight)
             else:
-                try:
-                    flight.pending = self.transport.post_nowait(
-                        "READ",
-                        peer.agent_name,
-                        [
-                            (
-                                self.staging.addr(flight.slot),
-                                peer.base + loc.offset,
-                                loc.length,
-                            )
-                        ],
-                    )
-                    if flight.pending is None:
-                        flight.state = "done"
-                        request.reason = "transport_busy"
-                    else:
-                        flight.state = "reading"
-                except BaseException as exc:
-                    flight.pending = getattr(exc, "pending_transfer", None)
-                    flight.state = "kept" if flight.pending is not None else "done"
-                    request.reason = "io_error"
-                    if not isinstance(exc, Exception):
-                        raise
-            if not self._valid(flight):
-                request.reason = "generation"
-            if request.reason:
-                request.ready.set()
+                self._post_reads([flight])
         finally:
             self.gate.release()
             if log_kept_limit:
@@ -447,20 +429,96 @@ class WorkerRdma:
         self._wake.set()
         return request
 
-    def progress(self):
-        if (
-            self.stopped.is_set()
-            or not (self._flights or self._releases or self._write_pending)
-            or not self.gate.acquire(False)
-        ):
+    def post_reads(self, batch):
+        """Post reserved reads by peer, with ownership and checks under the gate."""
+        if not batch:
+            return
+        if not self._acquire_gate():
+            for flight in batch:
+                for request in flight.waiters:
+                    request.reason = "gate_busy"
+                    request.ready.set()
             return
         try:
+            by_peer = {}
+            for flight in batch:
+                by_peer.setdefault(flight.peer.agent_name, []).append(flight)
+            for flights in by_peer.values():
+                self._post_reads(flights)
+        finally:
+            self.gate.release()
+        self._wake.set()
+
+    def _post_reads(self, flights):
+        valid = []
+        for flight in flights:
+            if flight.state != "reserved":
+                continue
+            if self._valid(flight):
+                valid.append(flight)
+            else:
+                flight.state = "done"
+                for request in flight.waiters:
+                    request.reason = "generation"
+                    request.ready.set()
+        if not valid:
+            return
+        pending = None
+        state, reason = "done", "transport_busy"
+        try:
+            pending = self.transport.post_nowait(
+                "READ",
+                valid[0].peer.agent_name,
+                [
+                    (
+                        self.staging.addr(f.slot),
+                        f.peer.base + f.location.offset,
+                        f.location.length,
+                    )
+                    for f in valid
+                ],
+            )
+            if pending is not None:
+                state, reason = "reading", ""
+        except BaseException as exc:
+            pending = getattr(exc, "pending_transfer", None)
+            state, reason = "kept" if pending is not None else "done", "io_error"
+            if not isinstance(exc, Exception):
+                raise
+        finally:
+            for flight in valid:
+                flight.pending, flight.state = pending, state
+                for request in flight.waiters:
+                    if not self._valid(flight):
+                        request.reason = "generation"
+                    elif reason:
+                        request.reason = reason
+                    if request.reason:
+                        request.ready.set()
+
+    def progress(self):
+        if self.stopped.is_set() or not (
+            self._flights or self._releases or self._write_pending
+        ):
+            return False
+        if not self.gate.acquire(False):
+            return True
+        active = False
+        try:
+            polled = set()
             for _ in range(len(self._releases)):
                 self._release_read(self._releases.popleft())
             for flight in list(self._flights):
-                if flight.pending is not None and not flight.pending.finished:
-                    self.transport.poll_nowait(flight.pending)
+                if flight.consumers:
+                    continue
                 pending = flight.pending
+                if (
+                    pending is not None
+                    and not pending.finished
+                    and id(pending) not in polled
+                ):
+                    self.transport.poll_nowait(pending)
+                    polled.add(id(pending))
                 if pending is not None and pending.finished:
                     flight.state = "done" if pending.completed else "kept"
                 if flight.state != "reading":
@@ -477,9 +535,11 @@ class WorkerRdma:
                     if request.reason or flight.state == "done":
                         request.ready.set()
                 self._reclaim(flight)
+                active = active or (pending is not None and not pending.finished)
             for pending in list(self._write_pending):
                 if self.transport.poll_nowait(pending):
                     self._write_pending.remove(pending)
+            return active or bool(self._write_pending)
         finally:
             self.gate.release()
 
@@ -511,6 +571,7 @@ class WorkerRdma:
         if not self._acquire_gate(request.deadline):
             request.reason = request._decision.setdefault("reason", "gate_busy")
             request.decided = True
+            self._wake.set()
         else:
             try:
                 flight = request.flight
@@ -716,6 +777,7 @@ class WorkerRdma:
                 return TransferEnd.UNKNOWN
             if not pending.finished:
                 self._write_pending.append(pending)
+                self._wake.set()
             self._credit_agents.pop(buffer.location, None)
             end = TransferEnd.DONE if pending.completed else TransferEnd.UNKNOWN
             if end == TransferEnd.UNKNOWN:
@@ -755,6 +817,6 @@ class WorkerRdma:
 
     def _run(self):
         while not self.closed:
-            self.progress()
-            self._wake.wait(0.001)
+            active = self.progress()
+            self._wake.wait(0.0002 if active else None)
             self._wake.clear()

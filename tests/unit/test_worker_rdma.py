@@ -123,6 +123,168 @@ def test_slot_stays_until_the_gpu_copy_ends(env):
     assert env.reader.capacity() == 4
 
 
+def test_progress_polls_reads_quickly_and_idles_while_the_gpu_owns_a_slot(env):
+    env.agent.stall = True
+    request = env.start(deadline=time.monotonic() + 1)
+    waits, reads = [], []
+
+    class Wake:
+        def wait(self, timeout=None):
+            waits.append(timeout)
+            if len(waits) == 1:
+                assert not request.ready.is_set()
+                env.agent.finish_stalled()
+            else:
+                assert request.ready.is_set()
+                reads.append(request.result())
+                assert reads[0] is not None
+                assert env.reader.capacity() == 3
+                env.reader.closed = True
+
+        def clear(self):
+            pass
+
+    wake = env.reader._wake
+    env.reader._wake = Wake()
+    try:
+        env.reader._run()
+    finally:
+        env.reader._wake = wake
+        env.reader.closed = False
+        for read in reads:
+            read.release()
+    assert waits[0] > 0 and waits[1] is None
+    assert env.reader.capacity() == 4
+
+
+def test_batched_reads_share_a_transfer_and_keep_each_gpu_slot(env, monkeypatch):
+    batch, posts, polls = [], [], []
+    env.agent.stall = True
+    requests = [env.start(env.outcome(offset), batch=batch) for offset in (0, PAGE)]
+    assert all(r.flight.pending is None for r in requests)
+    post = env.reader.transport.post_nowait
+    poll = env.reader.transport.poll_nowait
+
+    def posted(op, peer, pairs):
+        assert env.reader.gate.locked()
+        assert all(r.flight in env.reader._flights for r in requests)
+        assert len(env.reader._free) == 2
+        posts.append(pairs)
+        return post(op, peer, pairs)
+
+    def polled(pending):
+        polls.append(pending)
+        return poll(pending)
+
+    monkeypatch.setattr(env.reader.transport, "post_nowait", posted)
+    monkeypatch.setattr(env.reader.transport, "poll_nowait", polled)
+    env.reader.post_reads(batch)
+    assert len(posts) == 1 and len(posts[0]) == 2
+    assert requests[0].flight.pending is requests[1].flight.pending
+    env.reader.progress()
+    assert len(polls) == 1
+    env.agent.finish_stalled()
+    env.reader.progress()
+    first, second = [r.result() for r in requests]
+    assert bytes(first.view) == b"a" * PAGE
+    assert bytes(second.view) == b"b" * PAGE
+    assert len(env.unpins) == 2
+    first.release()
+    assert env.reader.capacity() == 3
+    second.release()
+    assert env.reader.capacity() == 4
+
+
+def test_a_consumer_does_not_hide_an_undecided_joiners_invalidation(env):
+    env.agent.stall = True
+    first, second = env.start(), env.start()
+    env.agent.finish_stalled()
+    env.reader.progress()
+    read = first.result()
+    assert read is not None
+    env.reader.advance()
+    env.reader.progress()
+    assert second.result() is None and second.reason == "generation"
+    assert env.reader.capacity() == 3
+    read.release()
+    assert env.reader.capacity() == 4
+
+
+@pytest.mark.parametrize("change", ["generation", "peer", "current"])
+def test_batched_reads_recheck_lifetimes_before_post(env, monkeypatch, change):
+    batch, posts = [], []
+    current = [True]
+    first = env.start(batch=batch, current=lambda: current[0])
+    second = env.start(env.outcome(PAGE), batch=batch)
+    if change == "generation":
+        env.reader.advance()
+    elif change == "peer":
+        env.reader.notify_peers([dataclasses.replace(env.peer, conn_gen=2)])
+    else:
+        current[0] = False
+    post = env.reader.transport.post_nowait
+
+    def posted(op, peer, pairs):
+        posts.append(pairs)
+        return post(op, peer, pairs)
+
+    monkeypatch.setattr(env.reader.transport, "post_nowait", posted)
+    env.reader.post_reads(batch)
+    env.reader.progress()
+    assert first.result() is None and first.reason == "generation"
+    read = second.result()
+    if change == "current":
+        assert len(posts) == 1 and len(posts[0]) == 1
+        assert bytes(read.view) == b"b" * PAGE
+        read.release()
+    else:
+        assert not posts and read is None
+    assert len(env.unpins) == 2
+    assert env.reader.capacity() == 4
+
+
+@pytest.mark.parametrize("complete", [True, False])
+def test_uncertain_batch_keeps_every_slot_until_completion(env, monkeypatch, complete):
+    batch = []
+    env.agent.stall = True
+    requests = [env.start(env.outcome(offset), batch=batch) for offset in (0, PAGE)]
+    post = env.reader.transport.post_nowait
+
+    def uncertain(*args):
+        pending = post(*args)
+        error = RuntimeError("post failed")
+        error.pending_transfer = pending
+        raise error
+
+    monkeypatch.setattr(env.reader.transport, "post_nowait", uncertain)
+    env.reader.post_reads(batch)
+    assert all(r.result() is None and r.reason == "io_error" for r in requests)
+    assert env.reader.snapshot()["free_slots"] == 2
+    assert env.reader.capacity() == 0
+    assert len(env.unpins) == 2
+    if complete:
+        env.agent.finish_stalled()
+    else:
+        env.agent.fail_stalled(late=True)
+    env.reader.progress()
+    assert env.reader.snapshot()["free_slots"] == (4 if complete else 2)
+    if not complete:
+        env.agent.deliver_late()
+        env.reader.progress()
+        assert env.reader.snapshot()["free_slots"] == 2
+
+
+def test_busy_batch_post_misses_without_posting_or_leaking_slots(env):
+    batch = []
+    requests = [env.start(env.outcome(offset), batch=batch) for offset in (0, PAGE)]
+    with env.reader.gate:
+        env.reader.post_reads(batch)
+    assert all(r.flight.pending is None for r in requests)
+    assert all(r.result() is None and r.reason == "gate_busy" for r in requests)
+    assert len(env.unpins) == 2
+    assert env.reader.capacity() == 4
+
+
 def test_joined_copies_free_the_slot_after_the_last(env):
     env.agent.stall = True
     first, second = env.start(), env.start()

@@ -1720,6 +1720,7 @@ class MaruClient:
             return _ChunkRead([None] * len(keys))
         outcomes, epoch, node_epoch = answered
         chunk = _ChunkRead([], server, keys, outcomes, epoch, node_epoch)
+        batch = []
         try:
             for key, outcome in zip(keys, outcomes, strict=True):
                 if (
@@ -1737,6 +1738,7 @@ class MaruClient:
                         outcome,
                         outcome_generation,
                         server.unpin,
+                        batch=batch,
                         current=lambda: (
                             server.server_epoch == epoch
                             and self.node_epoch == node_epoch
@@ -1749,6 +1751,8 @@ class MaruClient:
                     chunk.out.append(
                         self._take_outcome(server, key, outcome, epoch, node_epoch)
                     )
+            if batch:
+                self._rdma.post_reads(batch)
         except BaseException:
             self._drop_chunks([chunk])
             if not self._stopped.is_set():

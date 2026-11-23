@@ -97,9 +97,10 @@ def test_inline_remote_load_reads_on_the_engine_thread_and_reuses_no_copy(
     original_post = reader._rdma.transport.post_nowait
     original_release = reader._rdma.release
 
-    def post(*args, **kwargs):
-        posts.append(threading.get_ident())
-        return original_post(*args, **kwargs)
+    def post(operation, peer, pairs):
+        assert operation == "READ"
+        posts.append((threading.get_ident(), len(pairs)))
+        return original_post(operation, peer, pairs)
 
     def release(ref):
         chunk = int(torch.frombuffer(ref.view, dtype=torch.float32)[0]) - 1
@@ -114,7 +115,9 @@ def test_inline_remote_load_reads_on_the_engine_thread_and_reuses_no_copy(
         worker.start_load_kv(context, MaruConnectorMetadata(requests=[meta]))
         for i in range(6):
             assert torch.all(kv[:, i * 2 : i * 2 + 2] == i + 1)
-    assert posts == [engine] * 12 and releases == list(range(6)) * 2
+    assert all(thread == engine for thread, _ in posts)
+    assert sum(count for _, count in posts) == 12
+    assert releases == list(range(6)) * 2
     assert reader.retrieve_capacity() == reader._rdma.slot_count
     assert not worker.take_failed_load_blocks()
 
