@@ -89,7 +89,7 @@ class MaruHandler:
             config: Configuration object. If None, uses defaults.
         """
         self._config = config or MaruConfig()
-        self._rpc = self._make_rpc(self._config.server_url)
+        self._rpc = self._make_rpc(self._config.server_url.strip())
         self._mapper: DaxMapper | None = None
         self._cpu = None
         if self._config.maru_node:
