@@ -19,8 +19,8 @@ On the `cxl` storage backend (the default) and the `remote_cxl` backend:
    |                                |                                    +-----------------+-----------------+                        |
    |                                |                                    | Single GPU      | Tensor parallel |                        |
    +================================+====================================+=================+=================+========================+
-   | Full attention (MHA, GQA), one | Qwen3 (dense and MoE), GLM-4.5,    | 🟢              | 🟢              | | Llama-3.1-8B         |
-   | KV cache group                 | GLM-4.6                            |                 |                 | | Qwen3-0.6B           |
+   | Full attention (MHA, GQA), one | Llama 3.1, Qwen3 (dense and MoE)   | 🟢              | 🟢              | | Llama-3.1-8B         |
+   | KV cache group                 |                                    |                 |                 | | Qwen3-0.6B           |
    |                                |                                    |                 |                 | | Qwen3-30B-A3B        |
    +--------------------------------+------------------------------------+-----------------+-----------------+------------------------+
    | Sliding window + full          | gpt-oss                            | 🟢              | 🟢              | | gpt-oss-20b          |
