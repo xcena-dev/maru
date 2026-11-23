@@ -534,6 +534,23 @@ in flight.
 the first token of the current step is not delayed by the GPU→CXL copy and
 the metadata registration.
 
+With DSpark speculative decoding (`"method": "dspark"`), a model with one KV
+cache group, such as Qwen3-4B with `deepseek-ai/dspark_qwen3_4b_block7`, also
+stores after the drafter runs: vLLM's V2 model runner replays DSpark's draft
+step as a full CUDA graph unless `--enforce-eager`, and a replay calls no
+per-layer connector hook for the draft layers. The target's layers store from
+their hooks as usual, and the layers that called none in the step are stored
+after the drafter, so each chunk holds the draft layers too. The layerwise
+format then stores the draft layers' objects and the chunk's `_DONE` marker;
+the chunkwise format, whose chunk is one object of every layer, stores the
+chunk. A load that overlaps compute (`maru_overlap_load_with_compute`) is
+also awaited for every layer before the drafter runs, so the draft layers do
+not depend on their per-layer hooks to wait for it.
+Other speculative decoding methods store only from the per-layer hooks, as
+without speculative decoding. A method whose draft layers call none, as DFlash's
+likely do since vLLM runs its draft step the way it runs DSpark's, is not
+covered and was not run.
+
 `maru_load_admission_window` bounds how many asynchronous loads may be in
 flight at once. The default `0` submits every load immediately. Set a
 positive value only if you need request-level backpressure.

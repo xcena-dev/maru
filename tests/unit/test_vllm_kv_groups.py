@@ -2837,7 +2837,7 @@ def test_save_kv_layer_leaves_several_groups_to_wait_for_save():
 def test_connector_wait_for_save_hands_several_groups_to_the_worker():
     connector = MaruKVConnector.__new__(MaruKVConnector)
     connector._kv_groups = describe_kv_groups(tiny_config())
-    connector._worker = MagicMock()
+    connector._worker = MagicMock(stores_after_forward=False)
     meta = MaruConnectorMetadata()
     connector._connector_metadata = meta
     connector.wait_for_save()
@@ -2847,6 +2847,11 @@ def test_connector_wait_for_save_hands_several_groups_to_the_worker():
     connector._worker.reset_mock()
     connector.wait_for_save()
     connector._worker.wait_for_save.assert_not_called()
+
+    # One group with DSpark stores after the forward too.
+    connector._worker.stores_after_forward = True
+    connector.wait_for_save()
+    connector._worker.wait_for_save.assert_called_once_with(meta)
 
 
 def test_a_later_step_stores_the_state_at_its_own_end():
