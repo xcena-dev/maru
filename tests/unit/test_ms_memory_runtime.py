@@ -4,6 +4,8 @@
 import dataclasses
 import mmap
 
+import pytest
+
 from maru_common.protocol import NodeHeartbeatResponse, RecoverItem
 from maru_common.remote_protocol import TransferEnd
 from maru_common.storage_types import (
@@ -14,12 +16,86 @@ from maru_common.storage_types import (
     Status,
     Visibility,
 )
-from maru_storage_service.config import TierConfig
+from maru_storage_service.config import TierConfig, parse_node_config
 from maru_storage_service.pool_manager import PageState
 from tests.unit.ms_node_helpers import PAGE, FakeRm, MetadataServer, wait_until
 from tests.unit.test_ms_memory_role import DOMAIN
 from tests.unit.test_ms_memory_role import memory as memory
 from tests.unit.test_ms_peer_ops import fail_fence, fence, state
+
+
+@pytest.mark.parametrize("store", ["dram", "local_cxl"])
+@pytest.mark.parametrize("high,reserve", [(0.95, None), (0.95, "128MiB"), (1.0, 0)])
+def test_credit_pressure_keeps_storing_below_high_and_preserves_pins(
+    memory, monkeypatch, store, high, reserve
+):
+    memory.node.stop()
+    page_size, capacity = 32 << 20, 1 << 30
+    tier = {
+        "store": store,
+        "size": capacity,
+        "high_watermark": high,
+        "low_watermark": 0.8,
+        **({"hugepage": False} if store == "dram" else {"region_size": "256MiB"}),
+    }
+    config = parse_node_config(
+        {
+            "node_id": memory.config.node_id,
+            "state_dir": memory.directory,
+            "server": memory.fake.url,
+            "page_size": page_size,
+            "tiers": [tier],
+            "budgets": {}
+            if reserve is None
+            else {"transfer_reserve_bytes": {store: reserve}},
+        },
+        role="memory",
+    )
+    memory.config = dataclasses.replace(
+        config, remote_server=memory.config.remote_server
+    )
+    node = memory.start(
+        region_source=FakeRm(),
+        map_region=lambda pool: mmap.mmap(-1, pool.capacity),
+    )
+    memory.node, memory.parts, memory.ops = node, node.role.parts, node.role.ops
+    evict = node.store._evict_once
+    monkeypatch.setattr(node.store, "_evict_once", lambda: None)
+    reserve_bytes = config.budgets.transfer_reserve_bytes[store]
+    if reserve is None:
+        assert reserve_bytes == int(capacity * 0.05)
+    pages = (capacity - reserve_bytes) // page_size
+    pinned = Key("ns", "initial-0-0")
+    memory.fake.preserve(pinned)
+    for i in range(pages):
+        credits = memory.reserve().credits
+        assert len(credits) == 1
+        assert (
+            memory.write(credits, key=f"initial-{i}-").items[0].result
+            == ItemResult.ADDED
+        )
+    original = memory.fake.locations(pinned)
+    assert node.pools.bytes_in(PageState.READY) == pages * page_size
+    assert node.pools.bytes_in(PageState.READY) <= high * capacity
+    assert memory.reserve().credits == []
+
+    for i in range(33):
+        # The first pass can encounter only the pinned oldest page.
+        evict()
+        evict()
+        credits = memory.reserve().credits
+        assert len(credits) == 1
+        assert (
+            memory.write(credits, key=f"new-{i}-").items[0].result == ItemResult.ADDED
+        )
+        assert memory.fake.locations(Key("ns", f"new-{i}-0")) == [
+            dataclasses.replace(credits[0], length=PAGE)
+        ]
+        assert memory.fake.locations(pinned) == original
+        assert node.pools.bytes_in(PageState.FREE) >= reserve_bytes
+        node.pools.check()
+    assert node.store.retire_results["KEPT:PINNED"] > 0
+    assert node.store.retire_results["RETIRED"] >= 33
 
 
 def test_lru_uses_catalog_read_hints_and_retires_before_reuse(memory, monkeypatch):

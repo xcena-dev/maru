@@ -315,6 +315,11 @@ class NodeStore:
                 retiring_bytes=retiring,
                 page_size=page_size,
                 limit=MAX_BATCH,
+                demand_bytes=(
+                    self.pools.budgets.transfer_reserve_bytes.get(name, 0) + page_size
+                    if traits.credit
+                    else 0
+                ),
             )
             refs, items = self._ready_items(candidates)
             if refs:

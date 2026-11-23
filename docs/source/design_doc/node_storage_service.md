@@ -45,7 +45,7 @@ Unavailable keys, stale locations and lack of a staging slot produce a MISS and 
 | GPU `remote` | Memory node | Memory node evicts its least recently used unpinned keys |
 | Memory-node `dram` or `local_cxl` | Memory node | Shared LRU, using the high and low watermarks |
 
-Memory-node eviction covers all writers using that memory node, rather than a per-engine partition. Each GPU service connects to one memory-node endpoint. There is one Catalog per deployment; a list of Catalogs or memory endpoints is not accepted.
+Memory-node eviction covers all writers using that memory node, rather than a per-engine partition. It also frees space below the high watermark when FREE bytes cannot cover the transfer reserve plus one credit page. Pinned keys remain protected. Each GPU service connects to one memory-node endpoint. There is one Catalog per deployment; a list of Catalogs or memory endpoints is not accepted.
 
 | Protection | Ends only when |
 |---|---|
@@ -119,7 +119,7 @@ Set `staging_max_bytes` for the number of simultaneous workers, including TP and
 
 For a sized local store, `credit_total_max_bytes` defaults to 25% of its size. For `remote`, it defaults to two pages. `credit_max_bytes` defaults to that total rounded down to whole pages, with a one-page minimum. `credit_refill_high` defaults to the smaller of that worker cap and `max(16 pages, 512MiB)`, rounded down to whole pages. `credit_refill_low` defaults to 25% of the refill high value. `commit_pending_max_bytes` defaults to the total credit limit.
 
-`transfer_reserve_bytes` defaults to 5% of each local store's size and accepts a byte size or a map keyed by `dram` or `local_cxl`. It is not the remote reader's staging reserve. Memory nodes reject the worker-only `credit_max_bytes`, `credit_refill_low` and `credit_refill_high` keys.
+`transfer_reserve_bytes` defaults to 5% of each local store's size and accepts a byte size or a map keyed by `dram` or `local_cxl`. Credit excludes these bytes. Memory nodes copy no KV data themselves; they retain this setting and evict as needed to make one credit page available beyond the reserve. Memory nodes reject the worker-only `credit_max_bytes`, `credit_refill_low` and `credit_refill_high` keys.
 
 Validation requires `credit_refill_low <= credit_refill_high <= credit_max_bytes <= credit_total_max_bytes`, at least one page of worker credit, and, for a sized local store, total credit plus pending writes plus transfer reserve no greater than capacity. Sizes accept integer bytes or binary suffixes such as `M`, `MiB`, `G` and `GiB`.
 
