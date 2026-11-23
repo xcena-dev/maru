@@ -357,61 +357,6 @@ class TestServiceTransitions:
         assert pm.bytes_in(PageState.CREDITED) == PS
         pm.check()
 
-    def test_a_page_with_io_running_never_becomes_free(self):
-        pm = manager()
-        (c,) = pm.credit("w", PS)
-        ref, _, _ = pm.write_done("w", c, Key("ns", "a"), 10)
-        pm.commit_added(ref)
-        (dest,) = pm.reserve_transfer("dram:n:e", 1)
-        # a source must be READY and a destination TRANSFER
-        assert not pm.io_acquire(dest, ref) and pm.io_refs(ref) == 0
-        assert pm.io_acquire(ref, dest)
-        assert (pm.io_refs(ref), pm.io_refs(dest)) == (1, 1)
-        # a write that failed, a page retired meanwhile: neither is FREE yet
-        with pytest.raises(InvalidTransitionError, match="I/O running"):
-            pm.transfer_failed(dest)
-        pm.retired(ref)
-        assert not pm.reclaim(ref)
-        assert pm.page(ref).state == PageState.RETIRING
-        # a RETIRING page takes no new I/O
-        (spare,) = pm.reserve_transfer("dram:n:e", 1)
-        assert not pm.io_acquire(ref, spare) and pm.io_refs(ref) == 1
-        pm.transfer_failed(spare)
-        pm.check()
-        pm.io_release([ref, dest])
-        pm.transfer_failed(dest)
-        assert pm.reclaim(ref)
-        assert pm.io_refs(ref) == 0
-        # FREE, at another generation or released twice: refused
-        (other,) = pm.reserve_transfer("dram:n:e", 1)
-        assert not pm.io_acquire(ref, other) and pm.io_refs(other) == 0
-        (c2,) = pm.credit("w", PS)
-        src, _, _ = pm.write_done("w", c2, Key("ns", "b"), 10)
-        pm.commit_added(src)
-        stale = dataclasses.replace(other, generation=other.generation + 1)
-        assert not pm.io_acquire(src, stale) and pm.io_refs(src) == 0
-        with pytest.raises(InvalidTransitionError):
-            pm.io_release([other])
-        pm.check()
-
-    def test_transfer_path(self):
-        pm = manager()
-        (ref,) = pm.reserve_transfer("dram:n:e", 1)
-        assert pm.page(ref).state == PageState.TRANSFER
-        pm.transfer_failed(ref)
-        assert pm.page(ref).state == PageState.FREE
-        (other,) = pm.reserve_transfer("dram:n:e", 1)
-        assert pm.io_acquire_transfer(other)
-        with pytest.raises(InvalidTransitionError, match="I/O running"):
-            pm.quarantine_transfer(other, "kept")
-        pm.io_release([other])
-        pm.quarantine_transfer(other, "kept")
-        assert pm.page(other).state == PageState.QUARANTINED
-        assert pm.release_quarantine("unrelated") == 0
-        assert pm.release_quarantine("kept") == 1
-        assert pm.page(other).state == PageState.FREE
-        pm.check()
-
     def test_adopted_pool_ledger(self):
         pm = manager()
         info = PoolInfo(

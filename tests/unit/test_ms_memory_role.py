@@ -172,7 +172,7 @@ def memory():
 
 def test_memory_run_exports_before_serving_and_uses_no_data_mover(memory):
     node, parts = memory.node, memory.parts
-    assert node.local is None and node.transfers is None
+    assert node.local is None
     conn, hello = memory.connect()
     assert hello.status == Status.OK and hello.capabilities == [MEMORY_CAPABILITY]
     assert hello.boot == node.server.host_boot_id

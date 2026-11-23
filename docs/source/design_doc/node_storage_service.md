@@ -51,13 +51,14 @@ Memory-node eviction covers all writers using that memory node, rather than a pe
 |---|---|
 | Write credit | Its write is committed, safely cancelled or fenced |
 | Catalog source pin | The READ completes or the unused result is discarded safely |
-| Worker staging slot | NIC access and all GPU copies using it have ended |
+| Worker READ destination slot | READ is confirmed and all GPU consumers release it; an unconfirmed READ keeps it until process exit |
+| Worker WRITE source slot | D2H finishes before WRITE; the WRITE result releases the slot, including UNKNOWN, unless the worker stopped |
 | Orphan source pin after a GPU-service run change | The old worker releases it or its exit is verified |
 | CXL region hold | Its mapping or NIC registration is safely removed |
 
 The memory node maintains a separate write domain for each vLLM instance within a GPU-node run. Only ranks of that instance attached to the same GPU-node run share the domain; another GPU node or run has a separate domain. A worker exit, stopped worker, uncertain write, lost control connection or expired credit triggers revocation of that domain's write registration before unconfirmed pages are reclaimed. Fencing affects only the specified domain. Workers share the memory node's read registration, which is independent of write-domain revocation.
 
-Time alone is not a fence. If revocation fails, unconfirmed pages remain quarantined; at the configured limit that GPU node receives no new credit. A confirmed revocation or a verified memory-node restart can recover those pages. An uncertain or failed native transfer keeps its worker staging out of reuse until the vLLM processes exit. Failed service teardown retains mappings and prevents another run in that process.
+Time alone is not a fence. If revocation fails, unconfirmed pages remain quarantined; at the configured limit that GPU node receives no new credit. A confirmed revocation or a verified memory-node restart can recover those pages. An uncertain or failed READ keeps its destination slot out of reuse until the worker process exits. A WRITE starts after D2H completes and releases its source slot when it returns DONE, UNKNOWN or NOT_POSTED. An unfinished WRITE retains its pending transfer object; UNKNOWN retires the write domain. The memory-node destination credit remains protected by domain fencing. A stopped worker returns no slots. Failed service teardown retains mappings and prevents another run in that process.
 
 A GPU-service run change closes the worker's read admission gate before new READs can use old locations. Source pins held by live old workers survive that run change. A CUDA error that leaves a copy unconfirmed stops the worker, which returns no resources; restart the complete vLLM instance and verify that its old worker processes have exited.
 

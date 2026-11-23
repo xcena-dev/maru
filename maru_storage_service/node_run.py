@@ -40,7 +40,6 @@ from .pool_manager import PageState, PoolManager
 from .ports import EpochChanged, NodeRole, ServerStopped
 from .server_client import ServerClient
 from .tiers import L1Tier, Leased, Tier, TierEnv
-from .transfer_engine import DEFAULT_TRANSFER_BYTES_PER_S, TransferEngine
 
 logger = logging.getLogger("maru_storage_service.service")
 
@@ -94,7 +93,6 @@ class NodeRun:
         region_source: RegionSource | None = None,
         cxl_renew_s: float = DEFAULT_RENEW_S,
         unmap_timeout_s: float = DEFAULT_UNMAP_TIMEOUT_S,
-        transfer_bytes_per_s: float = DEFAULT_TRANSFER_BYTES_PER_S,
         map_region: Callable[[CxlRegionPool], mmap.mmap] | None = None,
     ):
         """``map_region`` supplies the node's mapping of a CXL region."""
@@ -113,9 +111,7 @@ class NodeRun:
         self.region_source = region_source
         self.cxl_renew_s = cxl_renew_s
         self.unmap_timeout_s = unmap_timeout_s
-        self.transfer_bytes_per_s = transfer_bytes_per_s
         self.map_region = map_region
-        self.transfers: TransferEngine | None = None
         # The run's tiers by store name, in the order they started
         self._tiers: dict[str, Tier] = {}
         # Why the run ended on its own, and whether a new run follows
@@ -175,7 +171,6 @@ class NodeRun:
             node_epoch=self.node_epoch,
             page_size=self.config.page_size,
             own_holder=self.own_holder,
-            transfer_bytes_per_s=self.transfer_bytes_per_s,
             interrupted=self._interrupted,
             later_run=self.later_run,
             on_lost=self._lose_regions,
@@ -398,16 +393,6 @@ class NodeRun:
                 raise ServerStopped("stopped while waiting for the dram pool")
             pause = min(pause * 2, DRAM_RETRY_MAX_S)
 
-    def _map_for_transfers(self, engine: TransferEngine) -> None:
-        """Keep node mappings until the leased pools can be released."""
-        tiers = self._tiers.values()
-        for tier in tiers:
-            if isinstance(tier, L1Tier):
-                for pool in tier.pools:
-                    mapping = tier.map_for_transfers(pool)
-                    if mapping is not None:
-                        engine.add_pool(pool.pool_id, mapping)
-
     def _end_quarantine(self, pool_id: str) -> None:
         """No earlier run holds the pool: its quarantined pages are free, and
         it gives credit if its tier does and MaruServer did not call it
@@ -511,21 +496,11 @@ class NodeRun:
         if self.config.role == "memory":
             for lease in leases:
                 lease.after_transfers_closed()
-        kept: set[str] = set()
-        if self.transfers is not None:
-            kept = self.transfers.close()  # unmapped before the regions may go back
-            if kept:
-                logger.error(
-                    "pools %s stay mapped: their hold and regions stay", sorted(kept)
-                )
-            else:
-                for lease in leases:
-                    lease.after_transfers_closed()
         if self.server is not None:
             if self.server.close_session(mode):
                 logger.info("node session closed (%s)", mode.value)
             self.server.close()
-        if mode == CloseMode.LEAVE and not kept:
+        if mode == CloseMode.LEAVE:
             for lease in leases:
                 lease.release()
         for tier in tiers:

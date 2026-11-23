@@ -614,8 +614,6 @@ _REMOVED_STORAGE_KNOBS = (
 )
 # Share of worker staging slots that asynchronous stores leave for loads.
 _NODE_ASYNC_LOAD_RESERVE = 0.5
-# How long the loader thread waits for a staging slot another load holds.
-_LEASED_SLOT_WAIT_S = 1.0
 # Failed handler creations in a row (5 s apart) after which the engine says,
 # at ERROR, that it serves without the cache and what to check
 _HANDLER_FAILURES_BEFORE_ERROR = 12
@@ -7174,23 +7172,9 @@ class MaruWorkerConnector:
         self._fail_deferred_load(rest)
 
     def _leased_batch_size(self, handler: Any, chunks: int, offthread: bool) -> int:
-        """Chunks the next leased batch may hold.
-
-        On the loader thread a load that finds every slot taken waits up to
-        :data:`_LEASED_SLOT_WAIT_S` for another load to give its slots back;
-        on the engine thread it fails at once rather than hold up the step.
-        """
-        if self._node_mode:
-            capacity = handler.retrieve_capacity(chunks)
-            return chunks if capacity is None else int(capacity)
-        deadline = time.monotonic() + _LEASED_SLOT_WAIT_S
-        while True:
-            capacity = handler.retrieve_capacity(chunks)
-            if capacity is None:
-                return chunks
-            if capacity > 0 or not offthread or time.monotonic() >= deadline:
-                return int(capacity)
-            time.sleep(0.01)
+        """Chunks the next leased batch may hold without waiting."""
+        capacity = handler.retrieve_capacity(chunks)
+        return chunks if capacity is None else int(capacity)
 
     def _drain_load_stream(
         self, stream: Any, *held: Any, req_id: str | None = None

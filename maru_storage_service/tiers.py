@@ -11,13 +11,10 @@ from enum import StrEnum
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 from maru_common.storage_types import (
-    Location,
     PoolDescriptor,
     PoolInfo,
     RmDomain,
 )
-
-from .page_table import PageRef
 
 if TYPE_CHECKING:
     from .drivers.cxl import CxlRegionPool, RegionSource
@@ -29,48 +26,6 @@ class Level(StrEnum):
 
 
 @dataclass(frozen=True)
-class Span:
-    """``nbytes`` at ``offset`` of an attached L1 mapping."""
-
-    pool_id: str
-    offset: int
-    nbytes: int
-
-
-class IOResult(Protocol):
-    """L2 result; ok means all bytes moved, done follows callback and cleanup."""
-
-    @property
-    def run(self) -> str: ...
-
-    @property
-    def src(self) -> PageRef | None: ...
-
-    @property
-    def dst(self) -> PageRef | None: ...
-
-    @property
-    def ok(self) -> bool: ...
-
-    @property
-    def late(self) -> bool: ...
-
-    @property
-    def cancelled(self) -> bool: ...
-
-    @property
-    def error(self) -> Exception | None: ...
-
-    @property
-    def kept(self) -> bool:
-        """The tier holds local pages until late DONE (settled) or run end."""
-        ...
-
-    @property
-    def done(self) -> threading.Event: ...
-
-
-@dataclass(frozen=True)
 class TierEnv:
     """What a tier is made with besides its config: the run, and the
     service's pieces a tier uses."""
@@ -79,7 +34,6 @@ class TierEnv:
     node_epoch: str
     page_size: int
     own_holder: str  # this run's RM holder of the node's own mappings
-    transfer_bytes_per_s: float
     interrupted: threading.Event  # a start waits no longer once set
     later_run: bool  # an earlier run of this process may still map its memory
     on_lost: Callable[[str], None]  # a leased tier must let go (its thread)
@@ -151,56 +105,6 @@ class L1Tier(Tier):
     def map_for_transfers(self, pool: L1Pool) -> mmap.mmap | None:
         """The node's own mapping of ``pool`` for transfers; None (logged)
         if it takes none."""
-
-
-class L2Tier(Tier):
-    """Asynchronous I/O; rejected submissions raise. Callbacks run outside locks.
-    Hold I/O references until callback, or settled after a kept result."""
-
-    level = Level.L2
-
-    @abstractmethod
-    def io_size(self, nbytes: int) -> int:
-        """Bytes a transfer of ``nbytes`` holds in flight."""
-
-    @abstractmethod
-    def attach(self, pool_id: str, memory: mmap.mmap) -> None:
-        """An L1 mapping transfers use."""
-
-    @abstractmethod
-    def detach(self, pool_id: str) -> None:
-        """Before ``memory`` is unmapped; if this raises, it stays mapped."""
-
-    @abstractmethod
-    def submit_store(
-        self,
-        src: Span,
-        dst: Location,
-        *,
-        refs: tuple[PageRef | None, PageRef | None],
-        callback: Callable[[IOResult], None] | None = None,
-        deadline: float | None = None,
-        settled: Callable[[IOResult], None] | None = None,
-    ) -> IOResult:
-        """Write ``src`` to the start of the tier page ``dst``."""
-
-    @abstractmethod
-    def submit_load(
-        self,
-        src: Location,
-        dst: Span,
-        *,
-        refs: tuple[PageRef | None, PageRef | None],
-        callback: Callable[[IOResult], None] | None = None,
-        deadline: float | None = None,
-        settled: Callable[[IOResult], None] | None = None,
-    ) -> IOResult:
-        """Read the start of the tier page ``src`` into ``dst``."""
-
-    @abstractmethod
-    def drain(self) -> None:
-        """No new submit; queued ones are cancelled; returns after every
-        callback ran."""
 
 
 class Leased(ABC):

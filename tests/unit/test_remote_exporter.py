@@ -1,6 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""NixlExporter: whole-pool NIC registration per run, and the TransferEngine
-deregistering a pool before it unmaps it."""
+"""Whole-pool NIC registration and deregistration before unmapping."""
 
 import pytest
 

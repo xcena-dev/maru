@@ -42,7 +42,6 @@ from maru_common.storage_types import (
     EPOCH_SEQ_MAX,
     MAX_BATCH,
     MS_PROTOCOL,
-    WORKER_RDMA_CAPABILITY,
     CloseMode,
     ExitCause,
     KeyLocation,
@@ -126,9 +125,7 @@ class ServerClient:
             capabilities=list(capabilities or []),
             pools=list(pools),
             rm_domains=list(rm_domains or []),
-            pid_ns=process_identity()[3]
-            if WORKER_RDMA_CAPABILITY in (capabilities or [])
-            else 0,
+            pid_ns=process_identity()[3],
         )
         self._open_request = request
         response = self._open_until_answered(request)

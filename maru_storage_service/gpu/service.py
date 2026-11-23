@@ -87,12 +87,12 @@ class GpuNode:
         """Workers attach from now: they map the L1 pools."""
         assert self.local is not None and run.store is not None
         self.local.manager = run.store
-        if self.remote:
-            from .orphans import OrphanWatch
+        from .orphans import OrphanWatch
 
-            self.orphans = OrphanWatch(run.store, run.server.host_boot_id)
-            run.store.orphans = self.orphans
-            self.orphans.start(run.server.orphans(run.opened))
+        self.orphans = OrphanWatch(run.store, run.server.host_boot_id)
+        run.store.orphans = self.orphans
+        self.orphans.start(run.server.orphans(run.opened))
+        if self.remote:
             run.store.remote.open()
         # memfd indexes the fds sent with ATTACH
         attach: list[tuple[PoolDescriptor, int | None]] = []

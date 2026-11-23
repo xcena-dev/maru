@@ -116,7 +116,7 @@ def test_inline_remote_load_reads_on_the_engine_thread_and_reuses_no_copy(
             assert torch.all(kv[:, i * 2 : i * 2 + 2] == i + 1)
     assert posts == [engine] * 12 and releases == list(range(6)) * 2
     assert reader.retrieve_capacity() == reader._rdma.slot_count
-    assert w.gpu.transfers is None and not worker.take_failed_load_blocks()
+    assert not worker.take_failed_load_blocks()
 
 
 @pytest.mark.parametrize("error", [None, "io", "cuda"])

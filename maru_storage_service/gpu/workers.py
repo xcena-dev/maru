@@ -106,7 +106,13 @@ class WorkerOps(NodeStore):
         )
 
         self._exits: collections.deque[WorkerRef] = collections.deque()
+        self.orphans = None
         self._unmapped: set[tuple[str, str, int]] = set()
+
+    def on_heartbeat(self, response):
+        super().on_heartbeat(response)
+        if self.orphans is not None:
+            self.orphans.retry()
 
     def start(self) -> None:
         """After the session opened."""

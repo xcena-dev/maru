@@ -17,7 +17,6 @@ from .node_run import check_servable as check_servable
 from .node_store import DEFAULT_EVICT_INTERVAL_S
 from .op_ledger import OP_WINDOW
 from .placement import DEFAULT_KEPT_BACKOFF_S
-from .transfer_engine import DEFAULT_TRANSFER_BYTES_PER_S
 
 
 class StorageService(NodeRun):
@@ -37,7 +36,6 @@ class StorageService(NodeRun):
         region_source: RegionSource | None = None,
         cxl_renew_s: float = DEFAULT_RENEW_S,
         unmap_timeout_s: float = DEFAULT_UNMAP_TIMEOUT_S,
-        transfer_bytes_per_s: float = DEFAULT_TRANSFER_BYTES_PER_S,
         map_region: Callable[[CxlRegionPool], mmap.mmap] | None = None,
         make_transport: Callable[[str, str], Any] | None = None,
     ):
@@ -63,7 +61,6 @@ class StorageService(NodeRun):
             region_source=region_source,
             cxl_renew_s=cxl_renew_s,
             unmap_timeout_s=unmap_timeout_s,
-            transfer_bytes_per_s=transfer_bytes_per_s,
             map_region=map_region,
         )
 

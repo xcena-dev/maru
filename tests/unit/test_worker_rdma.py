@@ -934,6 +934,42 @@ def test_client_unknown_write_reports_without_returning_the_credit(env, client):
     env.reader.progress()
 
 
+def test_client_keeps_credit_when_staging_is_temporarily_full(env, client):
+    from maru_handler.client.maru_client import CreditUnavailableError
+
+    assert client._refill_once()
+    with env.reader.gate:
+        slots = list(env.reader._free)
+        env.reader._free.clear()
+    try:
+        with pytest.raises(CreditUnavailableError, match="no remote staging slot"):
+            client.alloc(PAGE)
+        assert client.credits.unused_bytes == PAGE
+    finally:
+        with env.reader.gate:
+            env.reader._free.extend(slots)
+    handle = client.alloc(PAGE)
+    client.free(handle)
+    assert env.reader.capacity() == env.reader.slot_count
+
+
+def test_client_discards_remaining_credit_of_a_retired_domain(env, client, writer):
+    from maru_handler.client.maru_client import CreditUnavailableError
+
+    assert client._refill_once()
+    _, _, agent, _ = writer
+    other = env.outcome(PAGE).location
+    assert env.reader.bind_credits([other], agent, "gpu", "gpu-run")
+    assert client.credits.put([other], client.node_epoch)
+    env.reader._retired_domains.add(agent.domain)
+    with pytest.raises(CreditUnavailableError, match="write domain ended"):
+        client.alloc(PAGE)
+    assert client.credits.unused_bytes == 0
+    assert client._refill_wake.is_set()
+    assert env.reader.capacity() == env.reader.slot_count
+    assert len(client._storage.requests) == 1
+
+
 def test_client_stop_returns_no_reads_slots_or_credit(env, client):
     assert client._refill_once()
     handle = client.alloc(PAGE)

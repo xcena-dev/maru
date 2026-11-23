@@ -6,6 +6,7 @@ ended StorageService run is dropped, never written."""
 import collections
 import threading
 import time
+from collections.abc import Callable
 
 from maru_common.storage_types import Location
 
@@ -77,6 +78,14 @@ class CreditCache:
             self._credits.clear()
             self._bytes = 0
             return out
+
+    def discard(self, predicate: Callable[[Location], bool]) -> None:
+        """Drop unused credit matching ``predicate``."""
+        with self._lock:
+            self._credits = collections.deque(
+                c for c in self._credits if not predicate(c)
+            )
+            self._bytes = sum(c.length for c in self._credits)
 
     def remove_pool(self, pool_id: str) -> list[Location]:
         with self._lock:

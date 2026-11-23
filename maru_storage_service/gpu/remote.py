@@ -209,7 +209,6 @@ class RemoteWorkerOps(WorkerOps):
         # Location -> (worker incarnation, write domain); PENDING stays charged.
         self._credits = {}
         self._reserves = {}
-        self.orphans = None
         self._control_tasks = ThreadPoolExecutor(
             max_workers=1, thread_name_prefix="maru-remote-control"
         )
@@ -552,11 +551,6 @@ class RemoteWorkerOps(WorkerOps):
                 self._admitted.pop(incarnation, None)
                 for key in [key for key in self._reserves if key[0] == incarnation]:
                     del self._reserves[key]
-
-    def on_heartbeat(self, response):
-        super().on_heartbeat(response)
-        if self.orphans is not None:
-            self.orphans.retry()
 
     def stats(self):
         result = super().stats()

@@ -304,17 +304,23 @@ def test_a_late_callback_of_an_ended_connection_is_ignored(client, monkeypatch):
 
 
 def test_catalog_close_waits_for_a_live_read_socket():
+    import zmq
+
     from maru_common.ms_rpc import MsRpcClient, RpcUnknownError
     from maru_common.protocol import MessageType, ProbeRequest
     from tests.unit.ms_node_helpers import wait_until
 
-    rpc = MsRpcClient("tcp://127.0.0.1:1", timeout_s=5)
+    context = zmq.Context()
+    router = context.socket(zmq.ROUTER)
+    port = router.bind_to_random_port("tcp://127.0.0.1")
+    rpc = MsRpcClient(f"tcp://127.0.0.1:{port}", timeout_s=5)
     entries, errors = [], []
 
     def read():
         try:
             rpc.prepare_thread()
             entries.append(rpc._direct_local.entry)
+            assert entries[-1][0].poll(1000, zmq.POLLOUT)
             rpc.call(MessageType.PROBE, ProbeRequest("s", "e", []))
         except BaseException as e:
             errors.append(e)
@@ -334,6 +340,8 @@ def test_catalog_close_waits_for_a_live_read_socket():
     finally:
         rpc.close()
         thread.join(1)
+        router.close(linger=0)
+        context.term()
 
 
 @pytest.mark.parametrize(

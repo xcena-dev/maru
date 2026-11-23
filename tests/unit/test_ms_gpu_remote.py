@@ -7,6 +7,7 @@ import mmap
 import subprocess
 import sys
 import threading
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -192,7 +193,6 @@ def test_worker_writer_commits_and_another_worker_reads_without_a_copy_cache(pai
     writer = store(pair)
     reader = pair.client("reader", load_only=True)
     assert writer.attach_info.pools == []
-    assert pair.gpu.transfers is None
     assert writer._rdma.staging.nbytes == pair.config.top.options["staging_size"]
     assert writer._rdma.kept_limit == 2
     first = reader.batch_retrieve(["kv"])[0]
@@ -277,6 +277,37 @@ def test_unknown_write_fences_the_shared_instance_before_reclaim(pair):
     assert not pair.gpu.store._credits
     newer = second.credit(PAGE)
     assert newer.write_agent.domain.number > domain.number
+
+
+@pytest.mark.parametrize("failure", ["idle_ttl", "write_error"])
+def test_worker_resumes_storing_after_its_cached_domain_is_fenced(pair, failure):
+    writer = pair.client()
+    wait_until(lambda: writer.credits.unused_bytes == 4 * PAGE)
+    original = pair.gpu.store._domains["instance"]
+    if failure == "idle_ttl":
+        ops = pair.memory.role.ops
+        now = time.monotonic()
+        ops._clock = lambda: now + 120
+        assert ops.sweep() == 4
+        assert original in pair.memory.role.parts._closed_domains
+    else:
+        writer._rdma.transport.fail_next()
+    handle = writer.alloc(PAGE)
+    handle.buf[:] = b"a" * PAGE
+    assert writer.batch_store(["failed"], [handle]) == [False]
+    assert writer._rdma.capacity() == writer._rdma.slot_count
+    wait_until(
+        lambda: (
+            pair.gpu.store._domains.get("instance", original) != original
+            and writer.credits.unused_bytes >= PAGE
+        )
+    )
+    assert original in pair.memory.role.parts._closed_domains
+    handle = writer.alloc(PAGE)
+    assert handle.remote.agent.domain.number > original.number
+    handle.buf[:] = b"b" * PAGE
+    assert writer.batch_store(["resumed"], [handle]) == [True]
+    assert writer.batch_exists(["failed", "resumed"]) == [False, True]
 
 
 def test_worker_exit_fences_only_its_instance_domain(pair):

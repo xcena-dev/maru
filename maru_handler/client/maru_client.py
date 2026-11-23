@@ -1023,6 +1023,10 @@ class MaruClient:
                     raise StaleRunError("credit run ended")
                 remote = self._rdma.alloc_write(credit, size)
                 if remote is None:
+                    if self._rdma.credit_retired(credit):
+                        self.credits.discard(self._rdma.credit_retired)
+                        self._refill_wake.set()
+                        raise CreditUnavailableError("write domain ended")
                     self.credits.put([credit], node_epoch)
                     raise CreditUnavailableError("no remote staging slot")
                 view = remote.view
@@ -1433,6 +1437,8 @@ class MaruClient:
         ):
             return False  # one CREDIT at a time; that one is resent until known
         budgets = info.budgets
+        if self._rdma is not None:
+            self.credits.discard(self._rdma.credit_retired)
         unused = self.credits.unused_bytes
         with self._lock:
             demand = max(0, self._demand - self._demand_taken)

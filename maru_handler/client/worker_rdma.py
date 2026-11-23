@@ -631,6 +631,10 @@ class WorkerRdma:
     def owns_credit(self, credit):
         return credit in self._credit_agents
 
+    def credit_retired(self, credit):
+        agent = self._credit_agents.get(credit)
+        return agent is not None and agent.domain in self._retired_domains
+
     def alloc_write(self, credit, size):
         if not self._acquire_gate():
             return None
