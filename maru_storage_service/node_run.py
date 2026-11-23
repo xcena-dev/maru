@@ -54,7 +54,10 @@ DRAM_RETRY_MAX_S = 30.0
 DRAM_LOG_S = 30.0
 
 
-SERVED_TIERS = {"gpu": (["dram"], ["local_cxl"]), "memory": (["dram"], ["local_cxl"])}
+SERVED_TIERS = {
+    "gpu": (["dram"], ["local_cxl"], ["remote"]),
+    "memory": (["dram"], ["local_cxl"]),
+}
 
 
 class CapabilityRefusedError(RuntimeError):
@@ -235,7 +238,7 @@ class NodeRun:
             if top.low_watermark is not None
             else DEFAULT_LOW_WATERMARK
         )
-        if size is None:
+        if size is None and top.store != "remote":
             raise NodeConfigError(f"the {top.store} tier needs a size")
         if self._interrupted.is_set():
             raise ServerStopped()
@@ -295,6 +298,7 @@ class NodeRun:
                 f"MaruServer {config.server} does not accept {sorted(refused)}: "
                 f"it cannot serve a {config.role} node"
             )
+        self.opened = opened
         self.pool_registrations = dict(opened.pool_registrations)
         self.pools.set_epoch_seq(opened.epoch_seq)
         adopted_ids = {info.pool_id for info in opened.adopted}

@@ -25,6 +25,8 @@ from maru_common.node_protocol import (
     Budgets,
     NodeMessageType,
     Notify,
+    Peers,
+    ReadJoinResponse,
     TransferDefaults,
     peer_credentials,
     process_start_time,
@@ -54,7 +56,6 @@ _DISABLED = {
     NodeMessageType.LOCAL_PIN: "local pins are not supported",
     NodeMessageType.LOCAL_UNPIN: "local pins are not supported",
     NodeMessageType.HINT: "hints are not served",
-    NodeMessageType.READ_JOIN: "worker RDMA is not served",
 }
 
 
@@ -113,7 +114,11 @@ class Connection:
     def post_notify(self, notify: Notify) -> None:
         self._post(
             self.server.serializer.encode(
-                NodeMessageType.NOTIFY, notify, seq=NOTIFY_SEQUENCE
+                NodeMessageType.PEERS
+                if isinstance(notify, Peers)
+                else NodeMessageType.NOTIFY,
+                notify,
+                seq=NOTIFY_SEQUENCE,
             )
         )
 
@@ -466,7 +471,15 @@ class LocalServer:
             conn.respond(header, manager.abort(rec, decoded))
         elif code == NodeMessageType.UNMAP_ACK:
             conn.respond(header, manager.unmap_ack(rec, request))
+        elif code == NodeMessageType.READ_JOIN:
+            join = getattr(manager, "read_join", None)
+            conn.respond(
+                header,
+                join(rec, request) if join else ReadJoinResponse(Status.DISABLED),
+            )
         elif code == NodeMessageType.DETACH:
+            if hasattr(manager, "remote_detach"):
+                manager.remote_detach(rec)
             conn.respond(header, manager.workers.detach(rec))
             manager.workers.after_detach_reply(rec)
         else:  # every code of the table is handled above
@@ -526,13 +539,21 @@ class LocalServer:
             pid=node_pid,
             pid_start=pid_start,
             namespace=req.namespace,
+            instance=req.instance,
         )
         manager = self._manager()
+        if WORKER_RDMA_CAPABILITY in self.capabilities:
+            if not probe and WORKER_RDMA_CAPABILITY not in req.capabilities:
+                return reject("remote requires worker_rdma_v1")
+            if not probe and not manager.admit(ident):
+                return reject("worker staging budget exhausted")
         if probe:
             rec, why = manager.workers.attach_probe(conn, ident)
         else:
             rec, why = manager.workers.attach(conn, ident)
         if rec is None:
+            if hasattr(manager, "refuse_admission"):
+                manager.refuse_admission(ident.incarnation)
             return reject(why)
         agreed = [c for c in req.capabilities if c in self.capabilities]
         rec.capabilities = frozenset(agreed)
@@ -551,6 +572,8 @@ class LocalServer:
             pid=node_pid,
             pid_start=pid_start,
             capabilities=agreed,
+            peers=manager.remote.peers if hasattr(manager, "remote") else [],
+            staging=manager.remote.staging if hasattr(manager, "remote") else None,
         )
         fds = [] if probe else [fd for _, fd in self.pools if fd is not None]
         if not conn.respond(header, response, fds):

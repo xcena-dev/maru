@@ -39,6 +39,7 @@ class AttachIdentity:
     pid: int
     pid_start: int
     namespace: str
+    instance: str = ""
 
 
 @dataclass(eq=False)
@@ -89,7 +90,10 @@ class WorkerRegistry:
         gpu_drain_grace_s: float,
         on_settled: Callable[[str], None] = lambda incarnation: None,
         on_ended: Callable[[str], None] = lambda incarnation: None,
+        retain_detached: bool = False,
+        on_disconnected: Callable[[str], None] = lambda incarnation: None,
     ):
+        self.retain_detached = retain_detached
         self.node_epoch = node_epoch
         self.gpu_drain_grace_s = gpu_drain_grace_s
         self._pools = pools
@@ -101,6 +105,7 @@ class WorkerRegistry:
         self._on_settled = on_settled
         # Its process ended: what it waits for is answered now
         self._on_ended = on_ended
+        self._on_disconnected = on_disconnected
         # incarnation -> when its exit's GPU drain grace ends
         self._settles_at: dict[str, float] = {}
         self._lock = threading.RLock()
@@ -195,13 +200,17 @@ class WorkerRegistry:
     def connection_lost(self, rec: WorkerRecord, conn: WorkerEndpoint) -> None:
         """The UDS closed; the credit stays until the process exits. A probe
         is forgotten."""
+        disconnected = False
         with self._lock:
             if rec.role == SessionRole.PROBE:
                 self._forget_probe(rec, conn)
                 return
             if rec.conn is conn:
                 rec.conn = None
+                disconnected = not rec.detached
         self._ledger.forget_waiter(rec.incarnation, conn)
+        if disconnected:
+            self._on_disconnected(rec.incarnation)
 
     def detach(self, rec: WorkerRecord) -> DetachResponse:
         with self._lock:
@@ -222,6 +231,8 @@ class WorkerRegistry:
         """Forget a worker that detached holding nothing: its record, pidfd
         and op records go. One with credit or an op running waits for its
         exit."""
+        if self.retain_detached:
+            return
         incarnation = rec.incarnation
         with self._lock:
             if (

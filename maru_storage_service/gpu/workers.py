@@ -75,6 +75,9 @@ class WorkerOps(NodeStore):
         traits: dict[str, TierTraits] | None = None,
         on_worker_settled: Callable[[str], None] = lambda incarnation: None,
         on_end: Callable[[str], None] = lambda reason: None,
+        on_worker_ended: Callable[[str], None] = lambda incarnation: None,
+        retain_detached: bool = False,
+        on_worker_lost: Callable[[str], None] = lambda incarnation: None,
     ):
         """``on_end`` ends a run whose metadata result stays unknown."""
         super().__init__(
@@ -96,6 +99,9 @@ class WorkerOps(NodeStore):
             watcher=self.watcher,
             on_exit=self._queue_exit,
             on_settled=on_worker_settled,
+            on_ended=on_worker_ended,
+            retain_detached=retain_detached,
+            on_disconnected=on_worker_lost,
             gpu_drain_grace_s=gpu_drain_grace_s,
         )
 

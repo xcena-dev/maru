@@ -1722,7 +1722,11 @@ _DEFERRED_STORE_MAX_BYTES = 256 << 20
 
 
 def _wait_node_handler(
-    handler: Any, role: str, attach_timeout_s: float | None = None
+    handler: Any,
+    role: str,
+    attach_timeout_s: float | None = None,
+    *,
+    extra_config: dict[str, Any] | None = None,
 ) -> None:
     """Wait at startup for a node handler: its ATTACH up to
     ``attach_timeout_s`` (default the node connect timeout), then its
@@ -1740,12 +1744,24 @@ def _wait_node_handler(
             handler.wait_connected(_NODE_SESSION_WAIT_S)
     except AttachRefusedError as e:
         raise ValueError(f"Maru: the StorageService refused this {role}: {e}") from e
+    _check_node_modes(handler, extra_config or {})
     if not handler.connected:
         logger.warning(
             "Maru: the %s is not connected to the StorageService and MaruServer "
             "yet; it serves without the cache until it is",
             role,
         )
+
+
+def _check_node_modes(handler: Any, extra_config: dict[str, Any]) -> None:
+    info = getattr(getattr(handler, "_cpu", None), "attach_info", None)
+    if info is not None and "worker_rdma_v1" in info.capabilities:
+        if _get_knob(extra_config, "maru_use_layerwise") or _get_knob(
+            extra_config, "maru_overlap_load_with_compute"
+        ):
+            raise ValueError(
+                "Maru: remote nodes do not support layerwise or overlap loads"
+            )
 
 
 # ============================================================================
@@ -3152,7 +3168,9 @@ class MaruSchedulerConnector:
                 return
             handler = _create_maru_handler(self._extra_config, metadata_only=True)
             self._node_handler = handler
-        _wait_node_handler(handler, "scheduler", attach_timeout_s)
+        _wait_node_handler(
+            handler, "scheduler", attach_timeout_s, extra_config=self._extra_config
+        )
         with self._handler_lock:
             if handler is self._node_handler and handler.connected:
                 self._handler = handler
@@ -3175,6 +3193,7 @@ class MaruSchedulerConnector:
                 logger.error("Maru: the StorageService refused the scheduler: %s", e)
             return
         if handler.connected:
+            _check_node_modes(handler, self._extra_config)
             self._handler = handler
 
     def request_arrived(self, request: Request) -> None:
@@ -4729,7 +4748,7 @@ class MaruWorkerConnector:
         if handler is None:
             handler = self._node_handler = self._create_node_worker_handler()
         if wait:
-            _wait_node_handler(handler, "worker")
+            _wait_node_handler(handler, "worker", extra_config=self._extra_config)
         else:
             try:
                 handler.wait_attached(0)
@@ -4742,6 +4761,7 @@ class MaruWorkerConnector:
                 )
                 return
         if handler.connected:
+            _check_node_modes(handler, self._extra_config)
             self._handler = handler
         if wait:
             self._prepare_node_reads(handler)
