@@ -2,10 +2,13 @@
 """Shared progress during worker connection setup."""
 
 import logging
+import sys
 import time
+import types
 
 import pytest
 
+from maru_remote import transport as transport_mod
 from maru_remote.progress import ConnectProgress
 from maru_remote.transport import NixlTransport
 from tests.unit.remote_fakes import FakeNixlAgent, reset_fake_agents
@@ -111,3 +114,39 @@ def test_a_failing_drain_keeps_the_wait_going_until_the_window(agent_logs):
 
 
 # ------------------------------------------------------------------ service
+
+
+def test_the_nixl_agent_has_no_progress_thread(monkeypatch):
+    made = {}
+
+    class Agent:
+        def __init__(self, name, config):
+            made["name"], made["config"] = name, config
+
+        def create_backend(self, backend, params):
+            made["backend"] = (backend, params)
+
+    api = types.ModuleType("nixl._api")
+    api.nixl_agent = Agent
+    api.nixl_agent_config = lambda **kwargs: kwargs
+    monkeypatch.setitem(sys.modules, "nixl", types.ModuleType("nixl"))
+    monkeypatch.setitem(sys.modules, "nixl._api", api)
+    transport_mod._default_agent("w1", "mlx5_0:1")
+    assert made["config"]["enable_prog_thread"] is False
+    assert made["backend"] == ("UCX", {"ucx_devices": "mlx5_0:1"})
+
+
+def test_an_announcement_reaches_the_peer_and_take_notifs_returns_it():
+    a, b = worker("a"), worker("b")
+    peer = a.add_peer(b.metadata())
+    assert a.announce(peer)
+    assert b.take_notifs() == {"a": [b""]}
+    assert b.take_notifs() == {}
+
+
+def test_an_announcement_over_a_failed_connection_is_refused():
+    a, b = worker("a"), worker("b")
+    peer = a.add_peer(b.metadata())
+    a._agent.fail_endpoint(peer)
+    assert not a.announce(peer)
+    assert b.take_notifs() == {}

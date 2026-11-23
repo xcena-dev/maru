@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 XCENA Inc.
-"""ReadLease: what a retrieve hands back on a node or the cpu backend, whatever
-medium the bytes are on (DRAM or CXL pool)."""
+"""Explicit ownership of node read buffers."""
 
 from typing import Protocol, runtime_checkable
 

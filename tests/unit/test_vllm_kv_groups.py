@@ -713,11 +713,10 @@ def test_dsv41_step_stores_each_whole_chunk_as_its_blocks(per):
     assert worker._handler.batch_store.call_count == 1
 
 
-def test_dsv41_store_allocates_in_the_requests_pool():
+def test_dsv41_store_allocates_without_legacy_routing():
     """Every store path allocates in the pool the request's route names, the
     MLA group's too."""
     worker, _ = _dsv41_storing_worker(_dsv41_shared())
-    worker._route = lambda req_meta: {"route_key": f"pool-of-{req_meta.req_id}"}
     worker._handler.alloc.side_effect = lambda nbytes, **kw: SimpleNamespace(
         buf=memoryview(bytearray(nbytes))
     )
@@ -726,7 +725,7 @@ def test_dsv41_store_allocates_in_the_requests_pool():
     )
     calls = worker._handler.alloc.call_args_list
     assert len(calls) == 2
-    assert all(c.kwargs == {"route_key": "pool-of-r1"} for c in calls)
+    assert all(not c.kwargs for c in calls)
 
 
 LAYERWISE = {"maru_use_layerwise": True}
@@ -2112,12 +2111,12 @@ def test_layerwise_done_markers_are_asked_for_again():
     assert sched.get_num_new_matched_tokens(later, 0)[0] == 256
 
 
-def test_cpu_mode_computes_without_maru_after_a_failed_load():
+def test_node_mode_computes_without_maru_after_a_failed_load():
     """CPU mode asks MaruServer at every lookup, where the objects still are;
     a request whose load failed gets no hit all the same."""
     a = list(range(1200))
     sched = make_scheduler(16, 256)
-    sched._cpu_mode = True
+    sched._node_mode = True
     sched._handler = _Store(_chunk_keys(a, 256))
     request = SimpleNamespace(request_id="b", prompt_token_ids=a)
     assert _load_given(sched, request) == 1024

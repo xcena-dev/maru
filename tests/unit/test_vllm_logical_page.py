@@ -440,10 +440,8 @@ class TestPackedSlab:
         with pytest.raises(ValueError, match="16 kernel blocks of 2 tokens"):
             worker(self.NUM_BLOCKS + 1)._resolve_kv_layout(caches)
 
-    def test_split_kernel_blocks_keep_the_cpu_storage_schema(self):
-        """The cpu, mixed and remote_cxl backends name the objects' format in
-        a schema. Engines whose attention backends split blocks differently
-        store the same objects, so they name the same schema."""
+    def test_split_kernel_blocks_keep_the_node_page_size(self):
+        """Splitting kernel blocks preserves the node object size."""
         k, v = self._kv()
         split = [self._kernel_blocks(t) for t in k], [self._kernel_blocks(t) for t in v]
         schemas = []
@@ -452,8 +450,7 @@ class TestPackedSlab:
                 block_size=self.BLOCK,
                 kv_chunk_tokens=self.CHUNK,
                 extra_config={
-                    "maru_storage_backend": "cpu",
-                    "maru_cpu_pool_size": "1M",
+                    "maru_node": "/unused",
                     "maru_engine_id": "one",
                     "maru_cache_namespace": "model-revision-1",
                 },
@@ -461,9 +458,9 @@ class TestPackedSlab:
                 head_size=self.HEAD_SIZE,
                 kv_cache_layout="LBNHC",
             )
-            worker._ensure_handler = MagicMock()
+            worker._take_node_handler = MagicMock()
             worker.register_kv_caches(dict(zip(self._names(), pages, strict=True)))
-            schemas.append(worker._extra_config["_maru_storage_schema"])
+            schemas.append(worker._page_size_bytes)
         assert schemas[0] == schemas[1]
 
     @pytest.mark.parametrize("device", DEVICES)
@@ -681,11 +678,11 @@ class TestPackedSlab:
 
         def as_loader(layers, prepared, attn):
             """As a loader thread of the backend loads: on its own stream."""
-            reader._node_mode = reader._leased_mode = node
+            reader._node_mode = node
             try:
                 return load(layers, prepared, attn, stream=loader, wait=True)
             finally:
-                reader._node_mode = reader._leased_mode = False
+                reader._node_mode = False
 
         reader._load_packed = as_loader
         reader.start_load_kv(

@@ -21,23 +21,23 @@ AUTH_TIMEOUT_S = 10.0
 # Connections served at once (each holds a thread and a file descriptor), and
 # connections from one source address that have not proved the key yet; more
 # are closed at accept. The first limit is also kept below the process's
-# file-descriptor limit, minus what the agent itself uses.
+# file-descriptor limit, minus what the server itself uses.
 MAX_CONNECTIONS = 1024
 MAX_PER_SOURCE = 64
 FD_RESERVE = 64
 
 
 class KeyFileError(ValueError):
-    """The remote CXL agent key file is missing, malformed or open to everyone."""
+    """The memory node key file is missing, malformed or open to everyone."""
 
 
 def new_key() -> str:
-    """A new remote CXL agent key: 32 random bytes as hex."""
+    """A new memory node key: 32 random bytes as hex."""
     return secrets.token_hex(32)
 
 
 def load_key(path: str) -> bytes:
-    """Read the remote CXL agent key.
+    """Read the memory node key.
 
     Args:
         path: Key file; one line of hex digits (at least 32). ``~`` is the
@@ -56,12 +56,10 @@ def load_key(path: str) -> bytes:
             mode = os.fstat(f.fileno()).st_mode
             text = f.read().strip()
     except OSError as exc:
-        raise KeyFileError(
-            f"cannot read the remote CXL agent key {path}: {exc}"
-        ) from exc
+        raise KeyFileError(f"cannot read the memory node key {path}: {exc}") from exc
     if mode & 0o004:
         raise KeyFileError(
-            f"the remote CXL agent key {path} is readable by every user; chmod o-r {path}"
+            f"the memory node key {path} is readable by every user; chmod o-r {path}"
         )
     try:
         key = bytes.fromhex(text)
@@ -69,7 +67,7 @@ def load_key(path: str) -> bytes:
         key = b""
     if len(key) < 16:
         raise KeyFileError(
-            f"{path} does not hold a remote CXL agent key (at least 32 hex digits)"
+            f"{path} does not hold a memory node key (at least 32 hex digits)"
         )
     return key
 
@@ -87,7 +85,7 @@ def write_key(path: str) -> None:
         FileExistsError: if the file exists.
     """
     directory = os.path.dirname(os.path.abspath(path))
-    fd, tmp = tempfile.mkstemp(prefix=".remote-cxl-agent-key-", dir=directory)
+    fd, tmp = tempfile.mkstemp(prefix=".maru-key-", dir=directory)
     try:
         with os.fdopen(fd, "w") as f:
             f.write(new_key() + "\n")
@@ -103,7 +101,7 @@ def prove(key: bytes, role: str, nonce: bytes) -> bytes:
 
     Args:
         key: Remote CXL agent key.
-        role: ``"handler"`` for a client, ``"agent"`` for the remote CXL agent.
+        role: ``"handler"`` for a client, ``"agent"`` for the memory node.
         nonce: The nonce the other side chose for this connection.
 
     Returns:
@@ -126,7 +124,7 @@ def set_keepalive(sock: socket.socket) -> None:
 
 
 class ConnectionAuth:
-    """Whether one connection proved the remote CXL agent key."""
+    """Whether one connection proved the memory node key."""
 
     def __init__(self, key: bytes | None) -> None:
         """Start a connection.
@@ -144,7 +142,7 @@ class ConnectionAuth:
         if self.key is None:
             return {
                 "ok": False,
-                "error": "this remote CXL agent runs without a key",
+                "error": "this memory node runs without a key",
                 "code": "invalid",
             }
         proof, nonce = message.get("proof"), message.get("nonce")
@@ -155,7 +153,7 @@ class ConnectionAuth:
         ):
             return {
                 "ok": False,
-                "error": "wrong remote CXL agent key",
+                "error": "wrong memory node key",
                 "code": "denied",
             }
         self.proved = True

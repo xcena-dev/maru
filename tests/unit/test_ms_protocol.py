@@ -54,7 +54,8 @@ def test_codes_are_in_the_multi_storage_range_and_unique():
 def test_maruserver_table_serves_both_backends():
     for code, classes in MS_MESSAGE_CLASSES.items():
         assert MESSAGE_CLASSES[code] == classes
-    assert MessageType.STORAGE in MESSAGE_CLASSES
+    assert 0x30 not in MESSAGE_CLASSES
+    assert 0x30 not in {int(code) for code in MessageType}
 
 
 @pytest.mark.parametrize("code", MS_CODES, ids=lambda c: MessageType(c).name)
@@ -171,7 +172,6 @@ def test_cpu_is_the_old_name_of_dram():
 # ---------------------------------------------------------------------------
 
 LEGACY_CODES = {
-    MessageType.STORAGE,
     MessageType.REQUEST_ALLOC,
     MessageType.RETURN_ALLOC,
     MessageType.LIST_ALLOCATIONS,

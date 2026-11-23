@@ -2013,23 +2013,3 @@ class TestStartRetrieve:
         assert started.done() and started.result() == [None]
 
         handler.close()
-
-
-@pytest.mark.parametrize("router", [False, True])
-def test_retrieve_capacity_forwards_wanted_to_legacy_remote(router):
-    from types import SimpleNamespace
-
-    from maru_handler.storage.remote_cxl.client import RemoteCxlStorageClient
-    from maru_handler.storage.remote_cxl.router import PoolRouter
-
-    staging = SimpleNamespace(load_capacity=lambda: 7)
-    if router:
-        client = object.__new__(PoolRouter)
-        client.data = SimpleNamespace(staging=staging)
-    else:
-        client = object.__new__(RemoteCxlStorageClient)
-        client._data = SimpleNamespace(staging=staging)
-    handler = object.__new__(MaruHandler)
-    handler._cpu = client
-    assert handler.retrieve_capacity() == 7
-    assert handler.retrieve_capacity(4) == 7

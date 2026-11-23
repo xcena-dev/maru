@@ -80,7 +80,7 @@ def _mock_shm_client():
         patch("maru_shm.MaruShmClient", MockShmClient),
         patch("maru_server.allocation_manager.MaruShmClient", MockShmClient),
         patch("maru_handler.memory.mapper.MaruShmClient", MockShmClient),
-        # MaruHandler.connect and the mixed backend's CXL pool scan the host's
+        # MaruHandler.connect scans the host's
         # DAX devices; on a CXL host that reads the real device headers. A
         # unit test sees none, as in CI. Tests of the scanner patch os calls,
         # and tests that need a table patch these names themselves.

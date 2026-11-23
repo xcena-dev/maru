@@ -25,7 +25,7 @@ def send_frame(sock: socket.socket, message: dict) -> None:
     """
     data = msgpack.packb(message, use_bin_type=True)
     if len(data) > MAX_FRAME:
-        raise ValueError(f"region map message of {len(data)} bytes is too large")
+        raise ValueError(f"remote message of {len(data)} bytes is too large")
     sock.sendall(_LEN.pack(len(data)) + data)
 
 
@@ -58,13 +58,13 @@ def recv_frame(sock: socket.socket) -> dict | None:
         return None
     (length,) = _LEN.unpack(head)
     if length > MAX_FRAME:
-        raise ValueError(f"region map frame of {length} bytes is too large")
+        raise ValueError(f"remote frame of {length} bytes is too large")
     body = _recv_exact(sock, length)
     if body is None:
         return None
     message = msgpack.unpackb(body, raw=False)
     if not isinstance(message, dict):
-        raise ValueError("region map message must be a map")
+        raise ValueError("remote message must be a map")
     return message
 
 
@@ -72,7 +72,7 @@ def parse_address(address: str) -> tuple[str, int]:
     """Split ``host:port``.
 
     Args:
-        address: Remote CXL agent address.
+        address: Remote peer address.
 
     Returns:
         ``(host, port)``.
@@ -82,5 +82,5 @@ def parse_address(address: str) -> tuple[str, int]:
     """
     host, sep, port = address.rpartition(":")
     if not sep or not host or not port.isdigit():
-        raise ValueError(f"remote CXL agent address must be host:port, got {address!r}")
+        raise ValueError(f"remote address must be host:port, got {address!r}")
     return host, int(port)

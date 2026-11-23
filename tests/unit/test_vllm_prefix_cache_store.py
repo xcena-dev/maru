@@ -16,7 +16,6 @@ import maru
 from maru_vllm.connector import (
     MaruConnectorMetadata,
     _chunk_keys,
-    _cpu_engine_config,
     _create_maru_handler,
     _step_chunks,
 )
@@ -29,7 +28,6 @@ from maru_vllm.kv_groups import (
     GroupCache,
     KVGroup,
 )
-from tests.unit.test_vllm_cpu_config import engine_config
 from tests.unit.vllm_connector_helpers import (
     attach_capturing_handler,
     fake_cached_reqs,
@@ -229,7 +227,7 @@ def test_prefix_repair_follows_retained_blocks(kind, window, eligible):
     assert entry.store_cached_prefix is eligible
 
 
-@pytest.mark.parametrize("backend", ["cxl", "remote_cxl"])
+@pytest.mark.parametrize("backend", ["cxl"])
 @pytest.mark.parametrize(
     "setting,expected",
     [
@@ -261,16 +259,3 @@ def test_vllm_passes_pool_expansion_policy_to_the_handler(
         }
     )
     assert configs[0].auto_expand is expected
-
-
-@pytest.mark.parametrize("failure", ["policy", "eager", "dtype"])
-def test_remote_config_errors_name_the_remote_backend(failure):
-    config = engine_config()
-    if failure == "policy":
-        config.kv_transfer_config.kv_load_failure_policy = "fail"
-    elif failure == "eager":
-        config.model_config.enforce_eager = False
-    else:
-        config.cache_config.cache_dtype = "fp8"
-    with pytest.raises(ValueError, match="Remote CXL storage"):
-        _cpu_engine_config({"maru_storage_backend": "remote_cxl"}, config)

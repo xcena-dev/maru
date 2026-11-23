@@ -122,7 +122,7 @@ def test_only_the_scheduler_sends_read_hints(monkeypatch):
     _create_maru_handler(config, metadata_only=True)
     _create_maru_handler(config, metadata_only=False)
     assert [c.read_hints for c in seen] == [True, False]
-    assert [c.write_hints for c in seen] == [False, False]
+    assert all(not hasattr(c, "write_hints") for c in seen)
     assert [c.read_promotes for c in seen] == [False, True]
     seen.clear()
     _create_maru_handler({**config, "maru_async_load": False}, metadata_only=False)
@@ -304,12 +304,12 @@ def test_the_cxl_backend_takes_read_hints_and_no_write_hints(monkeypatch):
     _create_maru_handler(config, metadata_only=True)
     _create_maru_handler(config, metadata_only=False)
     # Its hints go to handler plugins: the scheduler hints, the worker
-    # promotes; write hints stay with remote_cxl.
+    # promotes. Write hints belong in the node config.
     assert [c.read_hints for c in seen] == [True, False]
     assert [c.read_promotes for c in seen] == [False, True]
-    assert [c.write_hints for c in seen] == [False, False]
+    assert all(not hasattr(c, "write_hints") for c in seen)
     for knob in ("maru_write_hints", "maru_rdma_device"):
-        with pytest.raises(ValueError, match="remote_cxl"):
+        with pytest.raises(ValueError, match="were removed"):
             _validate_storage_config({**config, knob: True})
 
 
@@ -499,8 +499,8 @@ def test_the_scheduler_names_layers_as_the_workers_do():
     assert _scheduler_layer_indices([], None) == []
 
 
-@pytest.mark.parametrize("cpu_mode", [False, True], ids=["cxl", "storage-session"])
-def test_a_group_load_promotes_its_request_before_its_first_read(cpu_mode):
+@pytest.mark.parametrize("node_mode", [False, True], ids=["cxl", "node"])
+def test_a_group_load_promotes_its_request_before_its_first_read(node_mode):
     """Several KV cache groups load in _group_load_job; it promotes the
     hinted request before it reads, as the one-group load does."""
     import threading
@@ -509,11 +509,10 @@ def test_a_group_load_promotes_its_request_before_its_first_read(cpu_mode):
 
     worker = object.__new__(MaruWorkerConnector)
     calls = []
-    worker._cpu_mode = cpu_mode
+    worker._node_mode = node_mode
     worker._handler = SimpleNamespace(
         promote_read=lambda rid, **route: calls.append(("promote", rid, route))
     )
-    worker._route = lambda meta: {"route_key": "k0"} if cpu_mode else {}
     worker._retrieve_group_objects = lambda meta: calls.append(("read",))
     worker._load_group_leased = lambda *a, **k: calls.append(("read",))
     worker._fail_load = lambda meta, exc: calls.append(("failed",))
@@ -522,8 +521,7 @@ def test_a_group_load_promotes_its_request_before_its_first_read(cpu_mode):
     worker._inflight_deferred_req_ids = set()
     worker._abandoned_req_ids = set()
     meta = SimpleNamespace(req_id="r1")
-    # The storage-session path goes on to CUDA, which this test has none of.
+    # The node path goes on to CUDA, which this test has none of.
     worker._group_load_job(meta, None, None)
-    route = {"route_key": "k0"} if cpu_mode else {}
-    assert calls[0] == ("promote", "r1", route)
+    assert calls[0] == ("promote", "r1", {})
     assert calls[1] in {("read",), ("failed",)}

@@ -1,9 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Descriptors for the storage directory.
-
-The session backends (cpu, mixed, remote_cxl) use StorageLocation; the rest is
-the multi-storage wire types.
-"""
+"""Storage identities, wire types and result codes."""
 
 import struct
 from collections.abc import Iterator, Sequence
@@ -12,9 +8,6 @@ from enum import StrEnum, unique
 
 from maru_shm.types import MaruHandle
 
-STORAGE_CAPABILITY = "cpu_storage_v1"
-MIXED_STORAGE_CAPABILITY = "mixed_storage_v1"
-REMOTE_CXL_STORAGE_CAPABILITY = "remote_cxl_storage_v1"
 MAX_STORAGE_BATCH = 1024
 
 
@@ -28,10 +21,6 @@ class StorageLocation:
     offset: int
     length: int
     medium: str = "cpu"
-
-
-# Compatibility for the first CPU-only protocol and callers.
-CpuLocation = StorageLocation
 
 
 class StorageError(RuntimeError):

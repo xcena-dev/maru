@@ -11,8 +11,6 @@ pytest.importorskip("vllm")
 
 from maru_vllm import connector
 from maru_vllm.kv_groups import GROUP_FULL, GROUP_MAMBA, KVGroup
-from tests.unit.test_vllm_cpu_config import extra, mixed_extra
-from tests.unit.test_vllm_remote_cxl_config import extra as remote_extra
 from tests.unit.vllm_connector_helpers import (
     fake_cached_reqs,
     fake_new_request_data,
@@ -22,9 +20,6 @@ from tests.unit.vllm_connector_helpers import (
 
 CONFIGS = [
     pytest.param({}, id="cxl"),
-    pytest.param(extra(), id="cpu"),
-    pytest.param(mixed_extra(), id="mixed"),
-    pytest.param(remote_extra(), id="remote_cxl"),
     pytest.param(
         {"maru_node": "/unused", "maru_engine_id": "e", "maru_cache_namespace": "ns"},
         id="node",
@@ -113,7 +108,7 @@ def test_repeated_request_reuses_hashes_across_passes_and_preemption(
     req.num_preemptions += 1
     assert sched.get_num_new_matched_tokens(req, 0)[0] > 0
     assert hashes.call_count == 1
-    if sched._node_mode or sched._cpu_mode:
+    if sched._node_mode:
         assert sched._handler.batch_exists.call_count == (2 if sched._node_mode else 3)
     sched.request_finished(req, [])
     assert req.request_id not in sched._request_hashes
@@ -165,14 +160,13 @@ def test_same_pass_probes_are_shared_but_namespace_and_key_order_are_distinct():
     assert sched._stored_keys(["a", "b"]) == {"a", "b"}
     assert sched._handler.batch_exists.call_count == 1
     sched._stored_keys(["b", "a"])
-    sched._stored_keys(["a", "b"], {"route_key": "other"})
     sched._extra_config["maru_cache_namespace"] = "other"
     sched._stored_keys(["a", "b"])
-    assert sched._handler.batch_exists.call_count == 4
+    assert sched._handler.batch_exists.call_count == 3
     sched.build_connector_meta(fake_scheduler_output([], None, {}))
     sched._handler.batch_exists.side_effect = lambda keys, **_: [False] * len(keys)
     assert sched._stored_keys(["a", "b"]) == set()
-    assert sched._handler.batch_exists.call_count == 5
+    assert sched._handler.batch_exists.call_count == 4
 
 
 @pytest.mark.parametrize("same_pass", [False, True])

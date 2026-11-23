@@ -1,6 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Read hints of the cxl backend: the handler gives the remote_cxl hint
-messages, in the same form, to the handler plugins that take them."""
+"""CXL read hints delivered to handler plugins."""
 
 import threading
 
@@ -64,7 +63,7 @@ def _drain(handler):
 
 def test_the_config_takes_read_hints_on_the_cxl_backend():
     MaruConfig(storage_backend="cxl", read_hints=True, read_promotes=True)
-    with pytest.raises(ValueError, match="write_hints"):
+    with pytest.raises(TypeError, match="write_hints"):
         MaruConfig(storage_backend="cxl", write_hints=True)
 
 

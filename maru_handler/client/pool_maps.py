@@ -63,7 +63,7 @@ class PoolMapping(Protocol):
 
 def map_dram_memfd(info: PoolInfo, fd: int) -> PoolMapping:
     """A DRAM pool's memfd mapped shared; the fd stays the caller's. Page-locked
-    with the cpu backend's code (#128)."""
+    through CpuPool."""
     size = os.fstat(fd).st_size
     if size < info.capacity:
         raise LocationError(

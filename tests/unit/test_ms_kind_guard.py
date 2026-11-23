@@ -33,18 +33,6 @@ ALLOWED: dict[tuple[str, str], tuple[int, str]] = {
         1,
         "MaruHandler storage_backend names, not a PoolKind",
     ),
-    ("maru_common/storage_policy.py", "validate_order"): (
-        1,
-        "MaruHandler L1 read/write order names, not a PoolKind",
-    ),
-    ("maru_server/replica_directory.py", "ReplicaDirectory._open"): (
-        1,
-        "MaruHandler L1 session pools by medium name, not a PoolKind",
-    ),
-    ("maru_server/server.py", "MaruServer.get_usage"): (
-        1,
-        "MaruHandler L1 pool usage by medium name, not a PoolKind",
-    ),
 }
 
 

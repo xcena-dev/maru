@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Thin NIXL wrapper: register host memory, exchange metadata, batch READ/WRITE.
 
-A memory node's remote CXL agent registers mapped CXL regions; a worker registers
-its host staging buffer. Metadata bytes travel in remote CXL agent replies, not
+A memory node's memory node registers mapped CXL regions; a worker registers
+its host staging buffer. Metadata bytes travel in memory node replies, not
 through NIXL's own side channels, so the transport never opens sockets.
 
 A timed-out transfer or failed cancellation can leave the NIC accessing its
@@ -16,7 +16,7 @@ released in ``ERR`` may still have bytes in the network.
 
 The default NIXL agent runs without its progress thread. A worker data path
 injects a native adapter with progress enabled and a 1 ms event-wait fallback.
-Transfer state queries still drive UCX on their caller. A remote CXL agent
+Transfer state queries still drive UCX on their caller. A memory node
 issues no transfers and retains progress OFF, so it drives UCX while a worker
 connects (``maru_remote.progress``).
 """
@@ -433,8 +433,8 @@ class NixlTransport:
         """Send a peer an empty notification once its metadata is loaded.
 
         The notification travels over the connection that loading the peer
-        sets up, so it reaches a remote CXL agent once that connection is
-        complete; the agent drives UCX until then
+        sets up, so it reaches a memory node once that connection is
+        complete; the memory node drives UCX until then
         (``maru_remote.progress``).
 
         Args:

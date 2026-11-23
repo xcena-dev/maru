@@ -28,6 +28,7 @@ from typing import cast
 from maru_common import MaruConfig
 from maru_shm import MaruHandle
 
+from .client.maru_client import CreditHandle
 from .memory import (
     AllocHandle,
     DaxMapper,
@@ -37,7 +38,6 @@ from .memory import (
 )
 from .plugin import load_handler_plugins
 from .rpc_client import RpcClient
-from .storage.cpu import CpuAllocation
 from .storage.lease import ReadLease
 
 logger = logging.getLogger(__name__)
@@ -57,8 +57,7 @@ class MaruHandler:
     - KV store/retrieve operations
 
     The architecture and locking below describe the default ``cxl`` backend.
-    ``cpu``, ``mixed`` and ``remote_cxl`` delegate to storage-session clients;
-    remote CXL uses worker staging and RDMA rather than a local DAX mapping.
+    ``maru_node`` delegates to the node client.
 
     Thread-safety (``cxl``):
     - Read operations (exists, retrieve, batch_exists, batch_retrieve) are
@@ -90,28 +89,14 @@ class MaruHandler:
             config: Configuration object. If None, uses defaults.
         """
         self._config = config or MaruConfig()
-        self._rpc = self._make_rpc(self._config.server_urls[0])
+        self._rpc = self._make_rpc(self._config.server_url)
         self._mapper: DaxMapper | None = None
         self._cpu = None
         if self._config.maru_node:
-            # Same methods as the storage clients below
+            # Node storage client
             from .client.maru_client import MaruClient
 
             self._cpu = MaruClient(self._config)
-        elif self._config.storage_backend in {"cpu", "mixed"}:
-            from .storage.client import CpuStorageClient
-
-            self._cpu = CpuStorageClient(self._config, self._rpc)
-        elif self._config.storage_backend == "remote_cxl":
-            from .storage.remote_cxl import PoolRouter, RemoteCxlStorageClient
-
-            urls = self._config.server_urls
-            if len(urls) == 1:
-                self._cpu = RemoteCxlStorageClient(self._config, self._rpc)
-            else:
-                rpcs = [self._rpc] + [self._make_rpc(url) for url in urls[1:]]
-                self._cpu = PoolRouter(self._config, rpcs, urls)
-
         # Managers (initialized on connect)
         self._owned: OwnedRegionManager | None = None
 
@@ -141,10 +126,7 @@ class MaruHandler:
         # loading is soft-fail so a broken plugin never blocks construction.
         self._plugins = load_handler_plugins()
 
-        # Memory hints of the cxl backend: the read hints, ends and promotes
-        # remote_cxl sends to remote CXL agents go, in the same form, to the
-        # plugins that take them (MaruHandlerPlugin.on_memory_hint), on one
-        # hint thread. None unless the config asks and a plugin takes them.
+        # CXL read hints, ends and promotes go to handler plugins.
         self._local_hints = None
         self._hint_plugins = [
             p
@@ -484,9 +466,8 @@ class MaruHandler:
         """Close this client's connections and end its buffer access.
 
         The cxl path sets ``_closing`` and waits on ``_write_lock`` before
-        teardown. Storage-session backends delegate to their client: remote
-        CXL can hand regions with keys to the server's keeper, and uncertain
-        native transfers can retain staging until cleanup is confirmed.
+        teardown. Node handlers delegate to MaruClient; uncertain native
+        transfers retain staging until cleanup is confirmed.
         """
         if self._local_hints is not None:
             # The hints already queued go out first, then the end of every
@@ -573,18 +554,16 @@ class MaruHandler:
         route_key: str | None = None,
         wait_s: float = 0.0,
         retry_later: bool = False,
-    ) -> AllocHandle | CpuAllocation:
+    ) -> AllocHandle | CreditHandle:
         """Allocate a page and return a handle with a writable memoryview.
 
         The caller finishes writing ``handle.buf`` before ``store(key, handle)``.
         With cxl the handle views a mapped page and store registers metadata.
-        Remote CXL instead allocates staging and store also sends an RDMA WRITE.
-        CPU/mixed use their worker-private allocation clients.
+        Node allocations use credit pages or worker staging.
 
         Args:
             size: Required bytes (must be <= chunk_size)
-            route_key: The request's first chunk key. With several remote_cxl
-                pools it picks the pool; other backends ignore it.
+            route_key: Unused compatibility argument.
             wait_s: maru_node: how long to wait for credit when none is at
                 hand (never on the engine thread); others ignore it.
             retry_later: maru_node: the caller retries a miss later, so it
@@ -597,15 +576,13 @@ class MaruHandler:
             RuntimeError: If not connected or closing
             ValueError: If size exceeds chunk_size or allocation fails
         """
-        if self._cpu is not None and self._config.maru_node:
+        if self._cpu is not None:
             return cast(
-                "AllocHandle | CpuAllocation",
+                "AllocHandle | CreditHandle",
                 self._cpu.alloc(
                     size, route_key=route_key, wait_s=wait_s, retry_later=retry_later
                 ),
             )
-        if self._cpu is not None:
-            return self._cpu.alloc(size, route_key=route_key)
         if self._config.metadata_only:
             raise RuntimeError("A metadata-only handler cannot allocate memory")
         self._ensure_connected()
@@ -669,12 +646,12 @@ class MaruHandler:
         if self._cpu is not None and self._config.maru_node:
             self._cpu.want_credit(pages)
 
-    def free(self, handle: AllocHandle | CpuAllocation) -> None:
+    def free(self, handle: AllocHandle | CreditHandle) -> None:
         """Free a page previously obtained via alloc().
 
         Can be called before store() (discard) or after (eviction).
-        CPU M1 only frees unsubmitted writes: store transfers ownership to
-        the pool, including when its RPC outcome is unknown.
+        Node stores transfer ownership to the node, including when the
+        publication outcome is unknown.
 
         Args:
             handle: AllocHandle from alloc()
@@ -717,12 +694,12 @@ class MaruHandler:
     def store(
         self,
         key: str,
-        handle: AllocHandle | CpuAllocation,
+        handle: AllocHandle | CreditHandle,
     ) -> bool:
         """Store a key using a pre-written allocation from this backend.
 
         Complete payload writes via ``handle.buf`` first. The cxl path only
-        checks duplicates and registers metadata; remote CXL also completes
+        checks duplicates and registers metadata; node storage also completes
         an RDMA WRITE from worker staging before publishing the key.
 
         Args:
@@ -806,9 +783,9 @@ class MaruHandler:
     def retrieve(self, key: str) -> MemoryInfo | ReadLease | None:
         """Retrieve a mapped view or a backend-specific read lease.
 
-        CPU, mixed, remote CXL and node return read leases. Release them after the
-        final CPU read or GPU copy; remote CXL leases protect worker staging
-        populated by RDMA, not a worker-side mapping of remote CXL.
+        Node return read leases. Release them after the
+        final CPU read or GPU copy; remote reads protect worker staging
+        populated by RDMA.
 
         The cxl path returns MemoryInfo over a directly mapped region.
         Works for both owned (RW) and shared (RO) regions.
@@ -820,7 +797,7 @@ class MaruHandler:
             key: The chunk key string
 
         Returns:
-            MemoryInfo, a storage-session read lease, or None on a miss
+            MemoryInfo, a node read buffer, or None on a miss
         """
         if self._config.metadata_only:
             raise RuntimeError("A metadata-only handler cannot access stored buffers")
@@ -1018,8 +995,6 @@ class MaruHandler:
             },
             "stats_manager": stats.stats_manager,
             "cxl_pool": stats.cxl_pool,
-            "cpu_storage": getattr(stats, "cpu_storage", {}),
-            "l1_storage": getattr(stats, "l1_storage", {}),
         }
 
         if self._owned is not None:
@@ -1055,9 +1030,9 @@ class MaruHandler:
     def batch_retrieve(
         self, keys: list[str], route_key: str | None = None
     ) -> list[MemoryInfo | ReadLease | None]:
-        """Retrieve mapped views or storage-session read leases in batch.
+        """Retrieve mapped views or node read buffers in batch.
 
-        CPU, mixed, remote CXL and node results carry read leases; release every
+        Node results carry read leases; release every
         non-None result after the final read/copy via release_retrieved.
 
         The cxl path uses one batch lookup RPC and returns views of owned
@@ -1070,8 +1045,7 @@ class MaruHandler:
 
         Args:
             keys: List of chunk key strings
-            route_key: The request's first chunk key. With several remote_cxl
-                pools it picks the pool; other backends ignore it.
+            route_key: Unused compatibility argument.
 
         Returns:
             List of MemoryInfo (None for keys not found)
@@ -1166,12 +1140,12 @@ class MaruHandler:
     def batch_store(
         self,
         keys: list[str],
-        handles: list[AllocHandle | CpuAllocation],
+        handles: list[AllocHandle | CreditHandle],
     ) -> list[bool]:
         """Store multiple pre-written allocations in the selected backend.
 
         The cxl path registers metadata over mapped pages. Storage-session
-        clients implement their own commit and lease rules; remote CXL
+        clients implement their own commit and read rules; remote storage
         completes staging-to-CXL RDMA WRITEs before publishing keys.
 
         Data must already be written to each page via ``handle.buf``.
@@ -1347,8 +1321,7 @@ class MaruHandler:
 
         Args:
             keys: List of chunk key strings
-            route_key: The request's first chunk key. With several remote_cxl
-                pools it picks the pool; other backends ignore it.
+            route_key: Unused compatibility argument.
 
         Returns:
             List of booleans indicating existence for each key
@@ -1722,7 +1695,7 @@ class MaruHandler:
             wanted: Keys the caller would read; a node worker reports its free staging slots (None: for all).
 
         Returns:
-            The read slots a load may use now (remote_cxl backend, node direct reads), or None when retrieves are not bounded.
+            The read slots a load may use now (node direct reads), or None when retrieves are not bounded.
         """
         capacity = getattr(self._cpu, "retrieve_capacity", None)
         return capacity(wanted) if capacity is not None else None
@@ -1757,7 +1730,7 @@ class MaruHandler:
 
         Returns:
             True when GPU copy kernels may read and write those buffers
-            directly (the remote_cxl backend's staging buffer registered with CUDA).
+            directly (node pools and worker staging registered with CUDA).
         """
         accessible = getattr(self._cpu, "storage_gpu_accessible", None)
         return bool(accessible()) if accessible is not None else False
@@ -1771,7 +1744,7 @@ class MaruHandler:
         )
 
     def release_retrieved(self, infos: list) -> None:
-        """Release storage-session read leases after the final read/GPU copy has completed."""
+        """Release node read buffers after the final read/GPU copy has completed."""
         release = getattr(self._cpu, "release_retrieved", None)
         if release is not None:
             # Return the batch together.
@@ -1782,12 +1755,10 @@ class MaruHandler:
                     info.release()
 
     def _no_pinning(self) -> str:
-        if self._config.maru_node:
-            return (
-                "maru_node handlers pin through retrieve and release_retrieved; "
-                "MaruServer decides eviction"
-            )
-        return "CPU M1 uses read leases and does not support eviction/pinning"
+        return (
+            "maru_node handlers pin through retrieve and release_retrieved; "
+            "MaruServer decides eviction"
+        )
 
     def _ensure_connected(self) -> None:
         """Ensure connected, raise if not or if closing."""

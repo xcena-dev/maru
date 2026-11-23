@@ -79,7 +79,6 @@ from tests.unit.test_vllm_kv_groups import (
     tiny_config,
     tiny_kv_caches,
 )
-from tests.unit.test_vllm_remote_cxl_tp_groups import remote_vllm_config
 from tests.unit.test_vllm_tp import (
     BLOCK,
     CHUNK,
@@ -101,6 +100,7 @@ from tests.unit.vllm_connector_helpers import (
     make_flash_attn_metadata,
     make_scheduler,
     make_worker,
+    model_vllm_config,
 )
 
 SOCKET = "/run/maru/test-node.sock"
@@ -304,7 +304,7 @@ def test_lookup_timeout_and_credit_wait_config(monkeypatch, metadata_only, custo
 
 
 def node_vllm_config(tp_size: int = 1, total_heads: int = 8, **parallel):
-    config = remote_vllm_config(
+    config = model_vllm_config(
         tp_size,
         total_heads,
         extra=node_extra(
@@ -348,14 +348,11 @@ def test_a_failed_load_must_be_recomputed():
 
 
 def test_the_namespace_is_bound_to_the_geometry_and_the_path():
-    from tests.unit.test_vllm_cpu_config import engine_config
-    from tests.unit.test_vllm_remote_cxl_config import extra as remote_cxl_extra
+    from tests.unit.vllm_connector_helpers import engine_config
 
     config = engine_config()
     tp1 = _node_engine_config(node_extra(), config)["maru_cache_namespace"]
     assert tp1 == _node_engine_config(node_extra(), config)["maru_cache_namespace"]
-    remote = connector_module._cpu_engine_config(remote_cxl_extra(), config)
-    assert remote["maru_cache_namespace"] != tp1
     config.parallel_config.tensor_parallel_size = 2
     assert _node_engine_config(node_extra(), config)["maru_cache_namespace"] != tp1
 
@@ -977,9 +974,7 @@ def test_chunks_waiting_for_credit_stay_with_an_unconfirmed_batch():
     wait_on(worker, "r", "k")
     wait_on(worker, "r2", "d")
     slab = torch.zeros(4)
-    worker._finish_write_behind_store(
-        FailedWait(), ["k"], [page()], [], [("d", slab, {})]
-    )
+    worker._finish_write_behind_store(FailedWait(), ["k"], [page()], [], [("d", slab)])
     assert "r" in worker._request_pending_store_keys
     assert "r2" in worker._request_pending_store_keys
     worker._release_deferred.assert_not_called()
@@ -994,7 +989,7 @@ def test_a_batch_without_a_handler_still_waits_for_its_copies(ended):
     worker = write_behind_worker()
     wait_on(worker, "r", "k", "d")
     handler, worker._handler = worker._handler, None
-    deferred = [("d", torch.zeros(4), {})]
+    deferred = [("d", torch.zeros(4))]
     worker._finish_write_behind_store(
         Done() if ended else FailedWait(), ["k"], [page()], [], deferred
     )
@@ -3222,7 +3217,7 @@ class FakeCredit:
 
 def wait_worker(monkeypatch, blocks: int = 6):
     """A write-behind worker on a CPU stand-in for CUDA, with FakeCredit."""
-    from tests.unit.test_vllm_remote_cxl_transfers import _cpu_cuda
+    from tests.unit.vllm_connector_helpers import _cpu_cuda
 
     _cpu_cuda(monkeypatch)
     worker = make_worker(
@@ -3555,14 +3550,14 @@ def test_a_failed_credit_copy_keeps_its_page_slab_and_room_once_queued(
     else:
         handle = SimpleNamespace(buf=memoryview(bytearray(8)))  # too short
     worker._handler.alloc.return_value = handle
-    waiting = [("k", slab, {}), ("k2", behind, {})]
+    waiting = [("k", slab), ("k2", behind)]
     worker._store_after_credit(worker._handler, waiting)
     if queued:
         worker._handler.free.assert_not_called()
         worker._handler.store_async.assert_not_called()
         assert worker._deferred_bytes == 32
         assert holds(worker, handle) and holds(worker, slab)
-        assert waiting == [("k2", behind, {})] and holds(worker, behind)
+        assert waiting == [("k2", behind)] and holds(worker, behind)
         assert stopped(worker, UNCONFIRMED)
     else:
         assert worker._handler.free.call_args_list == [mock.call(handle)] * 2
@@ -3736,7 +3731,7 @@ def test_a_group_load_without_a_free_slot_fails_over_its_whole_range(monkeypatch
 def node_store_worker(monkeypatch):
     """A write-behind node worker on a CPU stand-in for CUDA: every chunk
     finds credit, and MaruServer answers its WRITE_DONE at once."""
-    from tests.unit.test_vllm_remote_cxl_transfers import _cpu_cuda
+    from tests.unit.vllm_connector_helpers import _cpu_cuda
 
     _cpu_cuda(monkeypatch)
     worker = make_worker(
@@ -3773,7 +3768,7 @@ def node_store_worker(monkeypatch):
 def loaded_store_worker(monkeypatch, *, tokens=24, start=0, end=16, missing=None):
     """A node worker that loaded ``[start, end)`` of a prompt of ``tokens``
     (chunk ``missing`` gone), before its stores are checked."""
-    from tests.unit.test_vllm_remote_cxl_transfers import _slab, _view
+    from tests.unit.vllm_connector_helpers import _slab, _view
 
     worker, kernel, allocs, published = node_store_worker(monkeypatch)
     cache = next(iter(worker._kv_caches.values()))

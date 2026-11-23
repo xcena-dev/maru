@@ -35,7 +35,7 @@ dev = [
     "ruff>=0.1.0",
     "pre-commit>=3.0.0",
 ]
-# NIXL for the remote_cxl storage backend and the remote CXL agent (maru-remote-cxl-agent)
+# NIXL for worker RDMA and memory nodes
 rdma = [
     "nixl>=1.2.0,<2",
 ]
@@ -53,9 +53,7 @@ maru-node-server = "maru_server.node_server:main"
 maru-storage = "maru_storage_service.cli:main"
 maru-memory-node = "maru_storage_service.cli:memory_main"
 install-maru-resource-manager = "maru_common.resource_manager_installer:main"
-install-maru-remote-cxl-agent = "maru_remote_cxl_agent.installer:main"
 marutop = "maru_tools.cli:main"
-maru-remote-cxl-agent = "maru_remote_cxl_agent.cli:main"
 
 [project.urls]
 Homepage = "https://xcena-dev.github.io/maru/"

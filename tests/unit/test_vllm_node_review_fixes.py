@@ -208,8 +208,7 @@ def node_layer_writer():
     worker = _dsv41_worker(
         dsv41_kv_caches(_dsv41_shared()), extra_config={"maru_use_layerwise": True}
     )
-    worker._node_mode = worker._leased_mode = True
-    worker._cpu_mode = False
+    worker._node_mode = True
     worker._handler = MagicMock()
     worker._handler.has_local.return_value = False
     worker._handler.alloc.side_effect = lambda n, **_: SimpleNamespace(

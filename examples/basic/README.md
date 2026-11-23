@@ -1,6 +1,6 @@
 # Basic Examples
 
-Demonstrates the default `cxl` backend: write into a mapped CXL page, publish its key, and retrieve a memoryview of that page. Writing the initial payload still copies bytes. The `remote_cxl` backend instead uses host staging and RDMA; see the [remote CXL example](../vllm/remote_cxl/README.md).
+Demonstrates the default `cxl` backend: write into a mapped CXL page, publish its key, and retrieve a memoryview of that page. Writing the initial payload still copies bytes. See the [node migration guide](../../docs/source/getting_started/migrating_to_maru_node.md) for node storage and worker RDMA.
 
 ## Prerequisites
 

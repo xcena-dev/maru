@@ -25,7 +25,6 @@ from maru_common.protocol import (
     HandshakeRequest,
     MessageType,
     ProbeRequest,
-    StorageRequest,
 )
 from maru_common.serializer import Serializer
 from maru_common.storage_types import Status
@@ -190,11 +189,9 @@ def test_handshake_tells_the_runs_epoch(served):
 
 def test_storage_backend_requests_are_refused(served):
     _, wire = served
-    wire.socket.send(
-        wire.serializer.encode(MessageType.STORAGE, StorageRequest(action="usage"))
-    )
+    wire.socket.send(wire.serializer.encode(0x30, {"action": "usage"}))
     header, reply = wire.serializer.decode(wire.socket.recv())
-    assert header.msg_type == MessageType.STORAGE | 0x80
+    assert header.msg_type == 0x30 | 0x80
     assert "maru-server" in reply["error"]
     # the server keeps serving
     assert FakeNode(wire, "n1").open().status == Status.OK

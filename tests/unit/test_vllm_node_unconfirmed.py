@@ -205,7 +205,7 @@ def test_overlap_copies_that_cannot_be_queued_nor_drained(monkeypatch, node):
     load fails without giving the node's pages back; elsewhere the views are
     left for the resumed forward, as before."""
     worker = pinning_worker()
-    worker._node_mode = worker._leased_mode = node
+    worker._node_mode = node
     monkeypatch.setattr(torch.cuda, "set_device", lambda device: None)
     monkeypatch.setattr(torch.cuda, "stream", lambda s: contextlib.nullcontext())
     worker._layerwise_stream_for = lambda device: BrokenWait()
