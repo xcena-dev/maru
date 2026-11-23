@@ -735,7 +735,7 @@ def test_a_load_stopped_meanwhile_takes_and_logs_no_later_request(
     assert len(loaded) == 1 and loaded[0].endswith("for req r1 (kernel)")
 
 
-def test_an_inline_layerwise_step_logs_only_the_loads_it_took(caplog):
+def test_a_sync_layerwise_step_logs_only_the_loads_it_took(caplog):
     """Another thread stops the worker during r1's injects: start_load_kv
     raises, and only r1 is logged as batch-loaded."""
     worker = worker_of("cxl", maru_use_layerwise=True)
@@ -776,7 +776,7 @@ def test_a_load_failing_without_a_cuda_error_is_recomputed(backend, failure):
 
 
 @pytest.mark.parametrize("error", ["cuda", "other"])
-def test_an_inline_layerwise_inject_error_stops_only_on_a_cuda_error(error):
+def test_a_sync_layerwise_inject_error_stops_only_on_a_cuda_error(error):
     worker = worker_of("cxl")
     layers = [(LAYER, torch.zeros(4), 0)]
     worker._inject_kv_into_layer = MagicMock(

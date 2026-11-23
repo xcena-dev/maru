@@ -688,7 +688,7 @@ def test_a_copy_error_waits_for_queued_copies_before_releasing(monkeypatch):
     assert worker._stopped is None
 
 
-def test_an_inline_load_that_cannot_be_waited_for_stops_the_step(monkeypatch):
+def test_a_sync_load_that_cannot_be_waited_for_stops_the_step(monkeypatch):
     # The forward would read blocks the copies may still write: start_load_kv
     # raises, and the slots stay taken.
     log = []

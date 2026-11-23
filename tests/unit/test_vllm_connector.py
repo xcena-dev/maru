@@ -1882,7 +1882,7 @@ class TestPackedKernelRoundtripGPU:
                 staging_ptrs.add(store[2])
         assert len(staging_ptrs) <= 1
 
-    def test_inline_load_from_pageable_write_behind_store(self):
+    def test_sync_load_from_pageable_write_behind_store(self):
         """Exercise sync load independently of the direct store fallback."""
         import maru_kv_ops
 
@@ -2006,7 +2006,7 @@ class TestBuildConnectorMetaStoreAccumulation:
         assert req.block_ids == list(range(15))
         assert req.num_computed_tokens == 58
 
-    def test_inline_load_stores_the_chunks_computed_after_it(self):
+    def test_sync_load_stores_the_chunks_computed_after_it(self):
         """A request that loads a hit stores what it computes past it (#111)."""
         sched = self._make_scheduler()
         sched._count_matched_chunks = lambda tokens: 2
@@ -5101,7 +5101,7 @@ class TestStartLoadKvEarlyReturnSafety:
         assert worker.get_finished_loading() == {"r1"}
         assert worker.take_failed_load_blocks() == {0, 1, 2, 3}
 
-    def test_inline_load_unaffected_by_handler_outage(self):
+    def test_sync_load_unaffected_by_handler_outage(self):
         worker = self._worker_in_backoff()
 
         worker.start_load_kv(self._forward(), self._metadata(is_async=False))
@@ -5128,7 +5128,7 @@ class TestStartLoadKvEarlyReturnSafety:
         assert worker.get_finished_loading() == {"r1"}
         assert worker.take_failed_load_blocks() == {0, 1, 2, 3}
 
-    def test_zero_matched_chunks_inline_load_unaffected(self):
+    def test_zero_matched_chunks_sync_load_unaffected(self):
         worker = self._make_worker()
         worker._handler = MagicMock()
         metadata = self._metadata(is_async=False)

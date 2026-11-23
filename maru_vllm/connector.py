@@ -1805,7 +1805,7 @@ class MaruKVConnector(KVConnectorBase_V1, *_HYBRID_SUPPORT):
             so gpu_memory_utilization does not account for them. Pinned
             slabs only. 0 copies each slab in line (default: 2)
         maru_load_admission_window: int - With maru_async_load, cap how many
-            requests' packed loads may be enqueued on the async stream but
+            requests' packed loads may be enqueued on the async-load stream but
             not yet complete. The loader thread blocks before each GPU
             enqueue until fewer than this many loads are outstanding,
             bounding same-CUDA-context interference with model steps.
@@ -3831,7 +3831,7 @@ class MaruWorkerConnector:
         self._async_load_stream: torch.cuda.Stream | None = None
         self._async_load_stream_device: torch.device | None = None
         # Optional admission window: cap request loads enqueued on the
-        # async stream but not yet complete. Slot mappings are pinned
+        # async-load stream but not yet complete. Slot mappings are pinned
         # before asynchronous H2D, so the default submit-all path no longer
         # triggers the pageable-copy driver stall. A positive value keeps the
         # previous request-level backpressure available as a fallback guard.
@@ -4666,7 +4666,7 @@ class MaruWorkerConnector:
     ) -> None:
         """Retrieve and place an async-loading request's objects off-thread.
 
-        Copies run on the async stream after ``queued``, the compute
+        Copies run on the async-load stream after ``queued``, the compute
         stream's work at submission; ``get_finished_loading`` reports the
         request once its own event fires, and vLLM resumes it then. A
         storage-session load waits for its copies here, batch by batch
@@ -5469,7 +5469,7 @@ class MaruWorkerConnector:
                 return
             logger.error("Maru async load failed for req %s: %s", req_meta.req_id, e)
             # Copies may already be queued referencing the CXL views, on the
-            # async stream or a layerwise one; drain them before reporting
+            # async-load stream or a layerwise one; drain them before reporting
             # so that no kernel reads freed memory.
             for queue in [self._async_load_stream, *self._layerwise_streams]:
                 if queue is not None:
@@ -5488,7 +5488,7 @@ class MaruWorkerConnector:
         Runs on the loader thread just before a request's GPU enqueue. Counts
         the async loads whose completion event has not fired yet and, while
         the count is at or above ``maru_load_admission_window``, waits on the
-        oldest one. The async stream is FIFO, so dict insertion order is
+        oldest one. The async-load stream is FIFO, so dict insertion order is
         completion order and waiting on the oldest event is the shortest wait.
         The gated GPU work is already enqueued and depends on nothing from
         this thread, so the wait always terminates. A CUDA error from a query
@@ -8541,7 +8541,7 @@ class MaruWorkerConnector:
         slot_devs: list[torch.Tensor] = []  # read by the queued copies
         staged_chunks = 0
         # Requests sharing a prefix can yield the same base_key within one
-        # step; the single batched batch_store no longer dedupes them the way
+        # step; the single end-of-step batch_store no longer dedupes them the way
         # the per-request fallback's eager _stored_keys updates did.
         seen_keys: set[str] = set()
         try:

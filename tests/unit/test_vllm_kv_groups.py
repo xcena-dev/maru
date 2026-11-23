@@ -3121,7 +3121,7 @@ def _state(shared, layer, block):
 
 
 @pytest.mark.parametrize("version", ["0.23", "0.30"])
-def test_an_inline_load_restores_every_group(version):
+def test_a_sync_load_restores_every_group(version):
     source, stored, store = _stored_qwen(version)
     worker, target = _loading_worker(store, version)
     # B: same 40 tokens, hit 2 chunks (32 tokens), computes 32-39 this step.
@@ -3751,7 +3751,7 @@ def test_an_unavailable_handler_fails_the_loads(is_async):
     assert not target.any()
 
 
-def test_an_inline_load_of_a_missing_object_is_reported():
+def test_a_sync_load_of_a_missing_object_is_reported():
     _, _, store = _stored_qwen()
     k1 = _chunk_keys(list(range(40)), TINY_BLOCK)[1]
     del store[group_object_key(k1, 0, TINY_BLOCK)]
