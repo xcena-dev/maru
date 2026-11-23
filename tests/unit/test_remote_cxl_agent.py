@@ -92,8 +92,9 @@ def test_a_map_reply_names_only_that_region(node):
     h1, h2 = node.region(), node.region()
     reply = node.service.map(1, h1)
     node.service.map(1, h2)
-    name, conn, ranges = reply["metadata"].decode().split("|")
+    name, conn, ranges, incarnation = reply["metadata"].decode().split("|")
     assert name == "mapper" and conn == "1"
+    assert int(incarnation) == node.agent.incarnation
     assert [tuple(map(int, r.split(":")[:2])) for r in ranges.split(";")] == [
         (reply["addr"], h1["length"])
     ]
@@ -814,7 +815,7 @@ def test_the_command_line_defaults(monkeypatch):
         9860,
         "",
         None,
-        "/etc/maru/remote-cxl-agent.key",
+        "/etc/maru/maru.key",
         "",
         "",
         False,

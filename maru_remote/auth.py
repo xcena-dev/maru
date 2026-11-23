@@ -12,7 +12,7 @@ import socket
 import tempfile
 
 # The deployment key installed on memory nodes.
-DEFAULT_KEY_FILE = "/etc/maru/remote-cxl-agent.key"
+DEFAULT_KEY_FILE = "/etc/maru/maru.key"
 NONCE_BYTES = 16
 # TCP keepalive: probe after 10 s idle, every 5 s, give up after 3 misses.
 _KEEPALIVE = (10, 5, 3)
