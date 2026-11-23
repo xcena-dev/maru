@@ -20,7 +20,7 @@ from maru_common.storage_types import (
     WriteAgent,
     WriteDomain,
 )
-from maru_handler.client.worker_rdma import _KEPT_UNTIL_EXIT, WorkerRdma
+from maru_handler.client.worker_rdma import _GATE_WAIT_S, _KEPT_UNTIL_EXIT, WorkerRdma
 from maru_remote.transport import NixlTransport, buffer_address
 from tests.unit.remote_fakes import FakeNixlAgent
 
@@ -28,7 +28,8 @@ PAGE = 4096
 
 
 @pytest.fixture
-def env():
+def env(request):
+    settings = getattr(request, "param", {})
     name = uuid.uuid4().hex
     memory = bytearray(b"a" * PAGE + b"b" * PAGE)
     remote = NixlTransport(f"read-{name}", agent=FakeNixlAgent(f"read-{name}"))
@@ -42,14 +43,14 @@ def env():
         auto_connect=False,
         pin_pools=False,
         chunk_size_bytes=PAGE,
-        rdma_staging_size=4 * PAGE,
+        rdma_staging_size=settings.get("slots", 4) * PAGE,
         rdma_timeout_s=0.03,
     )
     reader = WorkerRdma(
         config,
         PAGE,
         transport_factory=lambda name: NixlTransport(name, agent=agent),
-        progress=False,
+        progress=settings.get("progress", False),
     )
     pool = RemotePool(
         "memory-pool",
@@ -194,6 +195,161 @@ def test_hit_decision_obeys_the_same_gate(env):
     assert request.reason == "gate_busy"
     env.reader.progress()
     assert env.reader.capacity() == 4
+
+
+@pytest.mark.parametrize("env", [{"slots": 64, "progress": True}], indirect=True)
+def test_repeated_starts_with_progress_have_no_gate_busy_misses(env, monkeypatch):
+    polling_threads = []
+    poll = env.reader.transport.poll_nowait
+
+    def observe(pending):
+        polling_threads.append(threading.current_thread())
+        return poll(pending)
+
+    monkeypatch.setattr(env.reader.transport, "poll_nowait", observe)
+    requests = []
+    for i in range(64):
+        assert env.reader.capacity() > 0
+        generation = env.reader.capture()
+        assert generation == 0
+        outcome = env.outcome()
+        outcome = dataclasses.replace(
+            outcome,
+            location=dataclasses.replace(outcome.location, allocation_id=str(i)),
+        )
+        requests.append(
+            env.reader.start(
+                outcome, generation, env.unpins.extend, deadline=time.monotonic() + 2
+            )
+        )
+    reads = []
+    try:
+        for request in requests:
+            read = request.result()
+            assert request.reason != "gate_busy"
+            assert read is not None
+            reads.append(read)
+            assert bytes(read.view) == b"a" * PAGE
+        assert len(env.unpins) == 64
+        assert polling_threads and all(t is env.reader._thread for t in polling_threads)
+    finally:
+        for read in reads:
+            read.release()
+
+
+@pytest.mark.parametrize("operation", ["start", "finish", "capacity", "capture"])
+def test_gate_wait_expires_while_the_owner_keeps_the_gate(env, operation):
+    request = env.start(deadline=time.monotonic() + 2)
+    env.reader.progress()
+    results, errors = [], []
+    entered = threading.Event()
+
+    def call():
+        try:
+            entered.set()
+            if operation == "start":
+                result = env.reader.start(env.outcome(), 0, env.unpins.extend)
+            elif operation == "finish":
+                result = request.result()
+            else:
+                result = getattr(env.reader, operation)()
+            results.append(result)
+        except BaseException as exc:
+            errors.append(exc)
+
+    caller = threading.Thread(target=call)
+    with env.reader.gate:
+        caller.start()
+        assert entered.wait(1)
+        caller.join(0.1)
+        returned_while_held = not caller.is_alive()
+    caller.join(1)
+    assert not caller.is_alive() and not errors
+    assert returned_while_held
+    if operation == "start":
+        busy = results[0]
+        assert busy.done() and busy.flight is None
+        assert busy.reason == "gate_busy" and busy.result() is None
+    elif operation == "finish":
+        assert results == [None] and request.reason == "gate_busy"
+        assert not request.flight.consumers
+    else:
+        assert results == [0 if operation == "capacity" else None]
+    if not request.decided:
+        request.result().release()
+    env.reader.progress()
+    assert env.reader.capacity() == 4
+
+
+@pytest.mark.parametrize("operation", ["start", "finish", "capacity", "capture"])
+def test_ttft_gate_uses_one_bounded_acquire(env, monkeypatch, operation):
+    request = env.start()
+    env.reader.progress()
+    timeouts = []
+
+    class BusyGate:
+        def acquire(self, *, timeout):
+            timeouts.append(timeout)
+            return False
+
+    with monkeypatch.context() as patch:
+        patch.setattr(env.reader, "gate", BusyGate())
+        if operation == "start":
+            busy = env.reader.start(env.outcome(), 0, env.unpins.extend)
+            assert busy.reason == "gate_busy"
+        elif operation == "finish":
+            assert request.result() is None
+        else:
+            getattr(env.reader, operation)()
+    assert timeouts == [_GATE_WAIT_S]
+    if operation == "start":
+        assert busy.result() is None
+    if not request.decided:
+        request.result().release()
+    env.reader.progress()
+
+
+@pytest.mark.parametrize("operation", ["start", "finish"])
+@pytest.mark.parametrize("remaining", [0.0005, 0, -1])
+def test_gate_wait_respects_the_request_deadline(
+    env, monkeypatch, operation, remaining
+):
+    request = env.start()
+    env.reader.progress()
+    timeouts = []
+
+    class BusyGate:
+        def acquire(self, *, timeout):
+            timeouts.append(timeout)
+            return False
+
+    with monkeypatch.context() as patch:
+        patch.setattr(time, "monotonic", lambda: 100)
+        patch.setattr(env.reader, "gate", BusyGate())
+        if operation == "start":
+            busy = env.reader.start(
+                env.outcome(), 0, env.unpins.extend, deadline=100 + remaining
+            )
+            assert busy.reason == "gate_busy"
+        else:
+            request.deadline = 100 + remaining
+            assert env.reader.finish(request) is None
+            assert request.reason == "gate_busy"
+    assert timeouts == [pytest.approx(max(0, remaining))]
+    if operation == "start":
+        assert busy.result() is None
+        request.result().release()
+    env.reader.progress()
+
+
+def test_idle_progress_does_not_acquire_the_gate(env, monkeypatch):
+    class IdleGate:
+        def acquire(self, *args, **kwargs):
+            pytest.fail("idle progress acquired the gate")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(env.reader, "gate", IdleGate())
+        env.reader.progress()
 
 
 def test_engine_release_does_not_wait_for_read_post_gate(env, client):

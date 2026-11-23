@@ -28,6 +28,7 @@ from maru_remote.transport import NixlTransport
 
 logger = logging.getLogger(__name__)
 _KEPT_UNTIL_EXIT: list[object] = []
+_GATE_WAIT_S = 0.002
 
 
 @dataclass(frozen=True)
@@ -188,8 +189,14 @@ class WorkerRdma:
     def slot_count(self):
         return self.staging.count
 
+    def _acquire_gate(self, deadline=None):
+        timeout = _GATE_WAIT_S
+        if deadline is not None:
+            timeout = min(timeout, max(0, deadline - time.monotonic()))
+        return self.gate.acquire(timeout=timeout)
+
     def capacity(self):
-        if not self.gate.acquire(False):
+        if not self._acquire_gate():
             return 0
         try:
             if self.stopped.is_set() or self.closed:
@@ -217,7 +224,7 @@ class WorkerRdma:
             self.gate.release()
 
     def capture(self):
-        if not self.gate.acquire(False):
+        if not self._acquire_gate():
             return None
         try:
             return None if self.closed or self.stopped.is_set() else self.generation
@@ -334,10 +341,11 @@ class WorkerRdma:
             if deadline is not None
             else time.monotonic() + self.config.rdma_timeout_s,
         )
-        if not self.gate.acquire(False):
+        if not self._acquire_gate(request.deadline):
             request.reason = "gate_busy"
             request.ready.set()
             return request
+        log_kept_limit = False
         try:
             loc = outcome.location
             peer = self._ready_peers.get(loc.pool_id) if loc else None
@@ -383,8 +391,9 @@ class WorkerRdma:
             if kept >= self.kept_limit or not self._free:
                 request.reason = "kept_limit" if kept >= self.kept_limit else "no_slot"
                 self.stats[request.reason] += 1
-                if request.reason == "kept_limit" and self.stats[request.reason] == 1:
-                    logger.error("RDMA kept slot limit reached")
+                log_kept_limit = (
+                    request.reason == "kept_limit" and self.stats[request.reason] == 1
+                )
                 request.ready.set()
                 return request
             flight = Flight(
@@ -433,11 +442,17 @@ class WorkerRdma:
                 request.ready.set()
         finally:
             self.gate.release()
+            if log_kept_limit:
+                logger.error("RDMA kept slot limit reached")
         self._wake.set()
         return request
 
     def progress(self):
-        if self.stopped.is_set() or not self.gate.acquire(False):
+        if (
+            self.stopped.is_set()
+            or not (self._flights or self._releases or self._write_pending)
+            or not self.gate.acquire(False)
+        ):
             return
         try:
             for _ in range(len(self._releases)):
@@ -493,7 +508,7 @@ class WorkerRdma:
         if request.decided:
             return None
         result = None
-        if not self.gate.acquire(False):
+        if not self._acquire_gate(request.deadline):
             request.reason = request._decision.setdefault("reason", "gate_busy")
             request.decided = True
         else:
@@ -617,7 +632,7 @@ class WorkerRdma:
         return credit in self._credit_agents
 
     def alloc_write(self, credit, size):
-        if not self.gate.acquire(False):
+        if not self._acquire_gate():
             return None
         try:
             agent = self._credit_agents.get(credit)
