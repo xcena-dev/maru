@@ -684,6 +684,9 @@ class FakeStorageControl:
             raise AssertionError(code)
         return future
 
+    def close(self):
+        self.closed = True
+
     def commit(self):
         from maru_common.node_protocol import WriteDoneResponse
         from maru_common.remote_protocol import TransferEnd

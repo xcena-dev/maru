@@ -17,6 +17,32 @@ from tests.unit.test_worker_rdma import PAGE
 from tests.unit.test_worker_rdma import env as env
 
 
+@pytest.mark.parametrize(
+    "knob", ["maru_use_layerwise", "maru_overlap_load_with_compute"]
+)
+@pytest.mark.parametrize("role", ["worker", "scheduler"])
+def test_remote_attach_rejects_unsupported_load_modes_at_startup(knob, role):
+    handler = SimpleNamespace(
+        _cpu=SimpleNamespace(
+            attach_info=SimpleNamespace(capabilities=["worker_rdma_v1"])
+        ),
+        wait_attached=lambda _: True,
+        wait_connected=lambda _: True,
+        connected=True,
+    )
+    with pytest.raises(ValueError, match="layerwise or overlap"):
+        connector._wait_node_handler(handler, role, extra_config={knob: True})
+
+
+def test_local_attach_keeps_layerwise_and_overlap_modes():
+    handler = SimpleNamespace(
+        _cpu=SimpleNamespace(attach_info=SimpleNamespace(capabilities=[]))
+    )
+    connector._check_node_modes(
+        handler, {"maru_use_layerwise": True, "maru_overlap_load_with_compute": True}
+    )
+
+
 def test_node_worker_uses_the_vllm_instance_and_its_staging_settings(monkeypatch):
     made = []
 

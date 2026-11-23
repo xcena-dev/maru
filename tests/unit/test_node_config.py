@@ -384,14 +384,58 @@ def test_budget_order_and_capacity():
 
 
 def test_served_stores_are_explicit_per_role():
-    assert list(TIERS) == ["dram", "local_cxl"]
+    assert list(TIERS) == ["dram", "local_cxl", "remote"]
     assert SERVED_TIERS == {
-        "gpu": (["dram"], ["local_cxl"]),
+        "gpu": (["dram"], ["local_cxl"], ["remote"]),
         "memory": (["dram"], ["local_cxl"]),
     }
     c = parse_node_config(GPU_NODE)
     with pytest.raises(NotServableError):
         check_servable(dataclasses.replace(c, tiers=c.tiers * 2))
+
+
+REMOTE_NODE = {
+    **GPU_NODE,
+    "tiers": [{"store": "remote", "url": "localhost:5600", "key_file": "~/maru.key"}],
+}
+
+
+def test_remote_uses_worker_staging_and_no_local_pool():
+    config = parse_node_config(REMOTE_NODE)
+    check_servable(config)
+    assert config.top.size is None
+    assert config.top.options["staging_size"] == max(1 << 30, 64 * config.page_size)
+    assert config.budgets.credit_total_max_bytes == 2 * config.page_size
+    assert config.budgets.transfer_reserve_bytes == {}
+
+
+@pytest.mark.parametrize(
+    "key,value",
+    [
+        ("url", "missing-port"),
+        ("url", "host:0"),
+        ("rdma_device", False),
+        ("timeout_s", 0),
+        ("timeout_s", float("nan")),
+        ("staging_size", "32M"),
+        ("staging_size", 64 * M + 1),
+        ("staging_max_bytes", "1M"),
+        ("quarantine_max", 0),
+        ("buffer_size", "1G"),
+        ("hugepage", True),
+        ("size", "1G"),
+        ("high_watermark", 0.9),
+        ("write_hints", True),
+    ],
+)
+def test_remote_rejects_invalid_staging_and_removed_buffer_keys(key, value):
+    with pytest.raises(NodeConfigError):
+        parse_node_config(with_tier(REMOTE_NODE, 0, **{key: value}))
+
+
+def test_remote_is_only_a_gpu_store():
+    raw = {k: v for k, v in REMOTE_NODE.items() if k != "socket"}
+    rejects(raw, "memory node cannot have a remote", role="memory")
 
 
 @pytest.mark.parametrize("check", [True, False])
