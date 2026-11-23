@@ -34,7 +34,7 @@ Use the same release for the Catalog, services and workers. The endpoint checks 
 
 Credit belongs to a GPU-node run. Within that run, each vLLM instance uses its own write agent and registration of the same pools. Only ranks of the same instance attached to that run share a write domain; another GPU node or run has a separate domain. All workers share the read registration. Each advertised pool includes its Catalog registration number. A successful WRITE_DONE response follows the Catalog COMMIT result.
 
-FENCE_DOMAIN revokes only the specified domain's write registration before reclaiming its unconfirmed credits. Pages waiting for COMMIT stay owned by their commit tickets. Connection loss, UNKNOWN writes and credit expiry trigger revocation. Elapsed time alone never releases a page.
+FENCE_DOMAIN revokes only the specified domain's write registration before reclaiming its unconfirmed credits. Pages waiting for COMMIT stay owned by their commit tickets. Connection loss, UNKNOWN writes and a GPU-node run that stays silent for `reserve_ttl_s` trigger revocation. Elapsed time alone never releases a page.
 
 Failed revocation quarantines only unconfirmed pages. Quarantine counts across all runs of the GPU node. At the configured threshold that GPU node receives no new credit. An explicit successful revocation or a verified memory-node restart permits reclamation. Failed teardown retains mappings and prevents another run in that process.
 
