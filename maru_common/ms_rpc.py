@@ -230,20 +230,14 @@ class MsRpcClient:
         end = time.monotonic() + timeout_s
         with guard:
             try:
-                sent = False
+                if self._closed:
+                    raise RpcUnknownError("the MaruServer connection is closed")
+                sock.send_multipart([b"", frame], flags=zmq.NOBLOCK)
                 while not self._closed:
                     left = end - time.monotonic()
                     if left <= 0:
                         break
-                    events = zmq.POLLIN if sent else zmq.POLLOUT
-                    if not sock.poll(max(1, min(50, int(left * 1000))), events):
-                        continue
-                    if not sent:
-                        try:
-                            sock.send_multipart([b"", frame], flags=zmq.NOBLOCK)
-                        except zmq.Again:
-                            continue
-                        sent = True
+                    if not sock.poll(max(1, min(50, int(left * 1000))), zmq.POLLIN):
                         continue
                     reply = sock.recv_multipart()[-1]
                     if len(reply) < HEADER_SIZE:

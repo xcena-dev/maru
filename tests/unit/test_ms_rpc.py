@@ -9,11 +9,13 @@ import socket
 import struct
 import threading
 import time
+from types import SimpleNamespace
 
 import msgpack
 import pytest
 import zmq
 
+from maru_common.ms_rpc import PLACEHOLDER_OP, MsRpcClient, RpcUnknownError
 from maru_common.protocol import (
     HEADER_FORMAT,
     HEADER_SIZE,
@@ -23,6 +25,7 @@ from maru_common.protocol import (
     CommitItem,
     CommitRequest,
     HandshakeRequest,
+    LookupAndPinRequest,
     MessageType,
     ProbeRequest,
 )
@@ -37,6 +40,67 @@ def free_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.bind(("127.0.0.1", 0))
         return s.getsockname()[1]
+
+
+@pytest.fixture(params=[MessageType.PROBE, MessageType.LOOKUP_AND_PIN])
+def direct_request(request):
+    code = request.param
+    if code == MessageType.PROBE:
+        return code, ProbeRequest("session", "epoch", [])
+    return code, LookupAndPinRequest("session", "epoch", PLACEHOLDER_OP, [])
+
+
+def test_disconnected_direct_send_fails_without_waiting(direct_request):
+    rpc = MsRpcClient(f"tcp://127.0.0.1:{free_port()}", timeout_s=0.5)
+    try:
+        started = time.monotonic()
+        with pytest.raises(RpcUnknownError):
+            rpc.call(*direct_request)
+        assert time.monotonic() - started < 0.1
+    finally:
+        rpc.close()
+
+
+def test_busy_direct_send_is_attempted_once_without_polling(direct_request):
+    rpc = MsRpcClient(f"tcp://127.0.0.1:{free_port()}", timeout_s=0.5)
+    sends = []
+
+    def send(parts, flags):
+        sends.append(flags)
+        raise zmq.Again()
+
+    rpc._direct_local.entry = (
+        SimpleNamespace(
+            send_multipart=send,
+            poll=lambda *args: pytest.fail("unsent RPC polled"),
+        ),
+        threading.Lock(),
+    )
+    try:
+        with pytest.raises(RpcUnknownError):
+            rpc.call(*direct_request)
+        assert sends == [zmq.NOBLOCK]
+    finally:
+        rpc.close()
+
+
+def test_sent_direct_request_keeps_its_response_timeout(direct_request):
+    context = zmq.Context()
+    router = context.socket(zmq.ROUTER)
+    port = router.bind_to_random_port("tcp://127.0.0.1")
+    rpc = MsRpcClient(f"tcp://127.0.0.1:{port}", timeout_s=0.08)
+    try:
+        sock, _ = rpc._direct_local.entry
+        assert sock.poll(1000, zmq.POLLOUT)
+        started = time.monotonic()
+        with pytest.raises(RpcUnknownError):
+            rpc.call(*direct_request)
+        assert time.monotonic() - started >= 0.06
+        assert router.recv_multipart(flags=zmq.NOBLOCK)
+    finally:
+        rpc.close()
+        router.close(linger=0)
+        context.term()
 
 
 class _Served:
