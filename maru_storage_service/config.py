@@ -46,6 +46,7 @@ CREDIT_MAX_MIN_BYTES = 512 << 20
 # a step asks only for what it stores, so the rest stays cache
 CREDIT_TOTAL_FRACTION = 0.25
 CREDIT_REFILL_LOW_FRACTION = 0.25
+REMOTE_CREDIT_REFILL_LOW_FRACTION = 0.5
 TRANSFER_RESERVE_FRACTION = 0.05
 
 _TOP_KEYS = {
@@ -235,13 +236,10 @@ def _parse_budgets(
     no_size = f"because tiers[0] ({top.store}) has no size"
     credit_tiers = [top]
     sized = [t for t in credit_tiers if t.size is not None]
+    refill_target = max(CREDIT_MAX_PAGES * page_size, CREDIT_MAX_MIN_BYTES)
     credit_total = size_or(
         "credit_total_max_bytes",
-        2 * page_size
-        if top.store == "remote"
-        else None
-        if top.size is None
-        else int(sum(t.size or 0 for t in sized) * CREDIT_TOTAL_FRACTION),
+        refill_target if top.store == "remote" else share(top, CREDIT_TOTAL_FRACTION),
         no_size,
     )
     # A worker may hold up to the node total: it asks for each step's stores
@@ -254,14 +252,15 @@ def _parse_budgets(
         "credit_refill_high",
         max(
             page_size,
-            min(max(CREDIT_MAX_PAGES * page_size, CREDIT_MAX_MIN_BYTES), credit_max)
-            // page_size
-            * page_size,
+            min(refill_target, credit_max) // page_size * page_size,
         ),
     )
-    refill_low = size_or(
-        "credit_refill_low", int(refill_high * CREDIT_REFILL_LOW_FRACTION)
+    low_fraction = (
+        REMOTE_CREDIT_REFILL_LOW_FRACTION
+        if top.store == "remote"
+        else CREDIT_REFILL_LOW_FRACTION
     )
+    refill_low = size_or("credit_refill_low", int(refill_high * low_fraction))
     # Writes waiting for their commit come from credit: as much may wait
     commit_pending = size_or("commit_pending_max_bytes", credit_total)
 

@@ -111,13 +111,23 @@ GPU-only keys are `socket` (default `/run/maru/node.sock`), `socket_group` (defa
 
 Set `staging_max_bytes` for the number of simultaneous workers, including TP and DP ranks. The service rejects attachment when another worker's staging would exceed this cap. Remote staging has no `hugepage` option.
 
-`remote_server` accepts `listen` and `key_file` (both required), `rdma_device` (empty by default), `reserve_ttl_s` (positive, default `60`; how long a GPU node run may send no control request before its open write domains are fenced), `peer_quarantine_max` (positive bytes, default twice the derived `credit_max_bytes`) and `quarantine_max` (positive bytes, default `max(page_size, registered capacity / 8)`). Configure it on a memory node to serve remote workers.
+`remote_server` accepts `listen` and `key_file` (both required), `rdma_device` (empty by default), `reserve_ttl_s` (positive, default `60`; how long a GPU node run may send no control request before its open write domains are fenced), `peer_quarantine_max` (positive bytes, default twice the **memory node's** derived `credit_max_bytes`) and `quarantine_max` (positive bytes, default `max(page_size, registered capacity / 8)`). Configure it on a memory node to serve remote workers.
 
 `region_extension` requires a memory-node `local_cxl` store. Its keys are `name` (required), `config` (empty string), `generation_poll_s` (`0.1`), `generation_grace_s` (`2.0`) and `hint_requests_max` (`4096`). Both intervals and the integer request limit must be positive.
 
 ### Budgets
 
-For a sized local store, `credit_total_max_bytes` defaults to 25% of its size. For `remote`, it defaults to two pages. `credit_max_bytes` defaults to that total rounded down to whole pages, with a one-page minimum. `credit_refill_high` defaults to the smaller of that worker cap and `max(16 pages, 512MiB)`, rounded down to whole pages. `credit_refill_low` defaults to 25% of the refill high value. `commit_pending_max_bytes` defaults to the total credit limit.
+| Budget | Sized local store | GPU `remote` store |
+|---|---|---|
+| `credit_total_max_bytes` (shared by writers) | 25% of store size | `max(16 pages, 512MiB)` |
+| `credit_max_bytes` (per worker) | Node total rounded down to whole pages, at least one page | Same |
+| `credit_refill_high` | Smaller of the worker cap and `max(16 pages, 512MiB)`, rounded down to whole pages | Same |
+| `credit_refill_low` | 25% of high | 50% of high |
+| `commit_pending_max_bytes` | Node total | Node total |
+
+With 32 MiB pages, one remote writer can keep 16 pages at hand. This covers a 4,096-token document when each 256-token chunk occupies one page. When unused credit drops below eight pages, the background refill requests the gap to 16 in one batched RESERVE, subject to available credit and the protocol batch limit. A worker can also request credit before a step's forward pass. The default engine-thread credit wait is zero. A store skips a chunk if the refill has yet to arrive and the worker has used its last credit.
+
+The memory node grants pages from its own shared credit budget and free pool space above the transfer reserve. Granted pages occupy pool capacity even while idle in a worker's credit cache. For simultaneous writers, size the GPU node's total for their combined demand and the memory node's credit budget for the GPU nodes it serves. Larger grants can leave more unconfirmed pages in quarantine after a failed fence. The memory node checks its per-peer and global quarantine thresholds before granting new reservations.
 
 `transfer_reserve_bytes` defaults to 5% of each local store's size and accepts a byte size or a map keyed by `dram` or `local_cxl`. Credit excludes these bytes. Memory nodes copy no KV data themselves; they retain this setting and evict as needed to make one credit page available beyond the reserve. Memory nodes reject the worker-only `credit_max_bytes`, `credit_refill_low` and `credit_refill_high` keys.
 
@@ -147,13 +157,14 @@ Validation requires `credit_refill_low <= credit_refill_high <= credit_max_bytes
 
 ### GPU remote and memory-node local CXL
 
-GPU configuration, allowing four workers with 2 GiB of staging each:
+GPU configuration for four writers, each with 2 GiB of staging and up to 512 MiB of credit:
 
 ```json
 {
   "node_id": "gpu-1",
   "server": "tcp://192.0.2.1:5556",
   "page_size": "32MiB",
+  "budgets": {"credit_total_max_bytes": "2GiB", "credit_max_bytes": "512MiB"},
   "tiers": [{"store": "remote", "url": "192.0.2.10:9871", "key_file": "/etc/maru/maru.key", "staging_size": "2GiB", "staging_max_bytes": "8GiB"}]
 }
 ```

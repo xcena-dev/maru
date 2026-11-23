@@ -53,14 +53,26 @@ def pair(monkeypatch, request):
     catalog = MetadataServer()
     key = f"{directory}/maru.key"
     write_key(key)
+    profile = getattr(request, "param", "dram")
+    store_batches = profile == "store_batches"
+    if store_batches:
+        # Scale the 32 MiB page workload to the test pool.
+        monkeypatch.setattr(
+            "maru_storage_service.config.CREDIT_MAX_MIN_BYTES", 16 * PAGE
+        )
     memory_config = dataclasses.replace(
         node_config(
-            catalog.address, f"{directory}/unused", node_id="memory", role="memory"
+            catalog.address,
+            f"{directory}/unused",
+            node_id="memory",
+            role="memory",
+            pages=128 if store_batches else 16,
+            budgets={"credit_total_max_bytes": 32 * PAGE} if store_batches else None,
         ),
         remote_server=RemoteServerConfig(f"127.0.0.1:{free_port()}", key, 8 * PAGE),
     )
     options = {}
-    if getattr(request, "param", "dram") == "local_cxl":
+    if profile == "local_cxl":
         memory_config = dataclasses.replace(
             memory_config,
             tiers=node_config(
@@ -96,13 +108,15 @@ def pair(monkeypatch, request):
                     "store": "remote",
                     "url": memory_config.remote_server.listen,
                     "key_file": key,
-                    "staging_size": 8 * PAGE,
+                    "staging_size": (32 if store_batches else 8) * PAGE,
                     "staging_max_bytes": 32 * PAGE,
                     "quarantine_max": 2 * PAGE,
                     "timeout_s": 0.5,
                 }
             ],
-            "budgets": {
+            "budgets": {}
+            if store_batches
+            else {
                 "credit_max_bytes": 4 * PAGE,
                 "credit_total_max_bytes": 8 * PAGE,
             },
@@ -203,6 +217,59 @@ def test_worker_writer_commits_and_another_worker_reads_without_a_copy_cache(pai
     assert second is not None and bytes(second.view) == b"a" * PAGE
     assert len(reader._rdma.transport.agent.released) > posts
     reader.release_retrieved([second])
+
+
+@pytest.mark.parametrize("pair", ["store_batches"], indirect=True)
+def test_remote_credit_keeps_up_with_consecutive_store_steps(pair, monkeypatch):
+    grants = []
+    reserve = pair.memory.role.ops.reserve
+
+    def record_reserve(origin, request, done):
+        def granted(response):
+            grants.append(len(response.credits))
+            done(response)
+
+        reserve(origin, request, granted)
+
+    monkeypatch.setattr(pair.memory.role.ops, "reserve", record_reserve)
+    writer = pair.client()
+    assert grants == [16]
+    assert writer.config.credit_wait_s == 0
+    for step in range(12):
+        keys = [f"{step}-{i}" for i in range(4)]
+        writer.want_credit(len(keys))
+        handles = [writer.alloc(PAGE) for _ in keys]
+        assert writer.batch_store(keys, handles) == [True] * len(keys)
+    assert writer.stats["store_skipped_no_credit"] == 0
+    assert sum(grants) >= 48
+    assert max(grants[1:]) >= 4
+    assert pair.memory.pools.bytes_in(PageState.READY) == 48 * PAGE
+
+
+@pytest.mark.parametrize("pair", ["store_batches"], indirect=True)
+def test_worker_can_use_its_last_step_of_credit_while_reserve_is_in_flight(
+    pair, monkeypatch
+):
+    writer = pair.client()
+    handles = [writer.alloc(PAGE) for _ in range(8)]
+    assert writer.batch_store([f"first-{i}" for i in range(8)], handles) == [True] * 8
+
+    started, release = threading.Event(), threading.Event()
+    reserve = pair.memory.role.ops.reserve
+
+    def hold_reserve(origin, request, done):
+        started.set()
+        assert release.wait(5)
+        reserve(origin, request, done)
+
+    monkeypatch.setattr(pair.memory.role.ops, "reserve", hold_reserve)
+    try:
+        handles = [writer.alloc(PAGE) for _ in range(4)]
+        assert started.wait(5)
+        handles.extend(writer.alloc(PAGE) for _ in range(4))
+    finally:
+        release.set()
+    assert writer.batch_store([f"next-{i}" for i in range(8)], handles) == [True] * 8
 
 
 def test_catalog_publication_waits_for_memory_commit(pair, monkeypatch):

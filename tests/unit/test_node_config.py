@@ -407,8 +407,34 @@ def test_remote_uses_worker_staging_and_no_local_pool():
     assert config.top.options["write_wait_ms"] == 50
     assert config.top.size is None
     assert config.top.options["staging_size"] == max(1 << 30, 64 * config.page_size)
-    assert config.budgets.credit_total_max_bytes == 2 * config.page_size
     assert config.budgets.transfer_reserve_bytes == {}
+
+
+@pytest.mark.parametrize(
+    "page_mib,total_mib,worker_mib", [(3, 512, 510), (32, 512, 512), (64, 1024, 1024)]
+)
+def test_remote_credit_defaults(page_mib, total_mib, worker_mib):
+    page = page_mib * M
+    raw = with_tier(REMOTE_NODE, 0, staging_size=32 * page)
+    budgets = parse_node_config(edit(raw, page_size=page)).budgets
+    assert (
+        budgets.credit_total_max_bytes
+        == budgets.commit_pending_max_bytes
+        == total_mib * M
+    )
+    assert budgets.credit_max_bytes == budgets.credit_refill_high == worker_mib * M
+    assert budgets.credit_refill_low == worker_mib * M // 2
+
+
+def test_remote_credit_overrides_still_bound_the_refill():
+    raw = edit(
+        REMOTE_NODE,
+        budgets={"credit_total_max_bytes": "256M", "credit_max_bytes": "128M"},
+    )
+    assert parse_node_config(raw).budgets.credit_refill_high == 128 * M
+    raw["budgets"].update(credit_refill_low="32M", credit_refill_high="64M")
+    budgets = parse_node_config(raw).budgets
+    assert budgets.credit_refill_low == 32 * M and budgets.credit_refill_high == 64 * M
 
 
 @pytest.mark.parametrize(
@@ -491,9 +517,19 @@ def test_remote_server_refuses_unserved_keys(key):
 
 def test_remote_server_settings_are_not_silently_ignored():
     raw = edit(
-        MEMORY_NODE, remote_server={"listen": "localhost:5600", "key_file": "/tmp/key"}
+        MEMORY_NODE,
+        tiers=[{"store": "local_cxl", "size": "4G"}],
+        remote_server={"listen": "localhost:5600", "key_file": "/tmp/key"},
     )
-    check_servable(parse_node_config(raw, role="memory"))
+    config = parse_node_config(raw, role="memory")
+    check_servable(config)
+    assert config.budgets.credit_max_bytes == G
+    assert config.remote_server.peer_quarantine_max == 2 * G
+    raw["remote_server"]["peer_quarantine_max"] = "64M"
+    assert (
+        parse_node_config(raw, role="memory").remote_server.peer_quarantine_max
+        == 64 * M
+    )
 
 
 def test_a_registered_store_is_parsed_by_its_spec(monkeypatch):
