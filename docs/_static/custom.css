@@ -169,7 +169,7 @@ table.maru-supported-models tbody td:nth-child(4) {
     text-align: center;
 }
 
-/* Supported Models: keep model names in "Tested with" on one line */
+/* Supported Models: keep each model name in "Supported models" on one line */
 table.maru-supported-models tbody td:nth-child(5) {
     white-space: nowrap;
 }
