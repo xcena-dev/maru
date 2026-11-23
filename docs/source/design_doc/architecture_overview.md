@@ -41,9 +41,22 @@ flowchart LR
     S <-.->|"allocate / free"| R["Resource Manager"]
     W <-.->|"mapping authorization"| R
     W <==>|"GPU copy"| P[("shared CXL")]
+
+    subgraph Filesystem["Shared Filesystem Mode (proposal)"]
+        FS["MaruFs"]
+    end
+    W <-.->|"store / retrieve"| FS
+    FS -.->|"allocate / free regions"| P
 ```
 
 The CXL pool can span hosts attached through a CXL switch. Host-cache visibility depends on the platform; see {doc}`consistency_and_safety` and {doc}`../getting_started/bios_setup`.
+
+**Control-plane proposal.** The current shared-pool control plane uses MaruServer and MaruResourceManager. The proposed MaruFs design would replace their directly mapped `cxl` control path with filesystem operations. It is not a shipping backend or an RDMA transport; kernel-mediated permissions are a design goal, not a demonstrated security comparison with RPC.
+
+| Layer | Role | Components |
+|-------|------|------------|
+| **Metadata** | Key registry, allocation lifecycle | MaruServer (Remote) / marufs (Filesystem) |
+| **Memory** | Shared memory pool, capability issuance, crash recovery | MaruResourceManager (Remote) / marufs (Filesystem) |
 
 ## Node-owned stores
 
@@ -71,4 +84,5 @@ Remote services mutually authenticate with a deployment key, and workers receive
 Maru Handler <maru_handler>
 Maru Server <maru_server>
 Maru Resource Manager <maru_resource_manager>
+Maru FS <maru_fs>
 ```
