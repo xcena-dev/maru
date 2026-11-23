@@ -8530,6 +8530,8 @@ class MaruWorkerConnector:
         reads: list[Any] = []
 
         def walk(item: Any) -> None:
+            if isinstance(item, torch.Tensor):
+                return
             if isinstance(item, ReadLease):
                 reads.append(item)
             elif isinstance(item, list | tuple | deque):
