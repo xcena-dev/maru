@@ -136,6 +136,7 @@ class FakeOps:
         self.hold: set[Code] = set()
         self.lost: list[str] = []
         self.retired: list[str] = []
+        self.received: list[str] = []
         self.available: tuple[int, RoomLimit | None] = (32768, None)
 
     def _run(self, code, origin, req, done, response, deadline=None):
@@ -180,6 +181,9 @@ class FakeOps:
 
     def room(self, origin) -> tuple[int, RoomLimit | None]:
         return self.available
+
+    def peer_received(self, origin):
+        self.received.append(origin)
 
     def peer_lost(self, origin):
         with self.cv:
@@ -306,6 +310,7 @@ def test_ready_and_registered_metadata_and_progress(make_server):
     h.ops.available = (0, RoomLimit.QUARANTINE)
     conn, accepted = h.open()
     assert accepted.status == Status.OK
+    assert h.ops.received == [ORIGIN]
     assert (accepted.node_id, accepted.node_epoch, accepted.server_epoch) == (
         "memory",
         "m1",
@@ -319,6 +324,7 @@ def test_ready_and_registered_metadata_and_progress(make_server):
     assert h.progress.expecting() == set()
     h.progress.drain.reset_mock()
     assert (ping(conn).room, ping(conn).limit) == h.ops.available
+    assert h.ops.received == [ORIGIN] * 3
     h.progress.drain.assert_called()
 
 
@@ -352,6 +358,7 @@ def test_slow_hints_keep_a_bounded_ordered_queue(make_server, monkeypatch, fails
         )
         assert overflow.get().status == Status.BUSY
         assert ping(conn).status == Status.OK
+        assert h.ops.received == [ORIGIN] * 5
         assert not active.event.is_set() and not queued.event.is_set()
     finally:
         release.set()
@@ -578,6 +585,7 @@ def test_hello_must_be_first(make_server, code):
     assert header.sequence == 17 and response.status == Status.REJECTED
     assert sock.recv(1) == b""
     assert not h.ops.calls
+    assert not h.ops.received
 
 
 def test_same_epoch_reconnect_keeps_ledger_and_drops_old_waiters(make_server):

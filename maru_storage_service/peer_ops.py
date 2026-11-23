@@ -63,9 +63,7 @@ class WriteRegistrations(Protocol):
 class _Domain:
     tag: str
     state: str = "open"
-    credits: dict[tuple[str, int, int], tuple[Location, float]] = field(
-        default_factory=dict
-    )
+    credits: dict[tuple[str, int, int], Location] = field(default_factory=dict)
 
 
 def _page_key(location: Location) -> tuple[str, int, int]:
@@ -99,6 +97,7 @@ class PeerOps:
         self._lock = threading.Lock()
         self.quarantined: collections.Counter[str] = collections.Counter()
         self._domains: dict[WriteDomain, _Domain] = {}
+        self._last_received: dict[str, float] = {}
         self._reserves: dict[tuple[str, int], tuple[WriteDomain, list[Location]]] = {}
         self._tombstones: dict[tuple[str, int], WriteDomain] = {}
         self._retired: set[str] = set()
@@ -168,6 +167,7 @@ class PeerOps:
         if not self._valid(origin, domain) or not 0 < request.pages <= MAX_BATCH:
             return ReserveResponse(Status.REJECTED, error="invalid reserve/domain")
         assert domain is not None
+        self._last_received[origin] = self._clock()
         self._acked(origin, request.op.ack)
         if (origin, request.op.seq) in self._tombstones:
             return ReserveResponse(Status.OK)
@@ -184,9 +184,8 @@ class PeerOps:
             self._fence(domain, entry)
             return ReserveResponse(Status.REJECTED, error="write registration failed")
         credits = self.pools.credit(origin, request.pages * self.page_size)
-        deadline = self._clock() + self.reserve_ttl_s
         for credit in credits:
-            entry.credits[_page_key(credit)] = credit, deadline
+            entry.credits[_page_key(credit)] = credit
         self._reserves[origin, request.op.seq] = domain, list(credits)
         room, limit = self._room(origin)
         return ReserveResponse(
@@ -194,8 +193,7 @@ class PeerOps:
         )
 
     def _owns(self, entry: _Domain, location: Location) -> bool:
-        credit = entry.credits.get(_page_key(location))
-        return credit is not None and credit[0] == location
+        return entry.credits.get(_page_key(location)) == location
 
     def write_done(
         self,
@@ -311,7 +309,7 @@ class PeerOps:
         entry.state = "fencing"
         origin = peer_origin(domain.node_id, domain.node_epoch)
         # Keep only unconfirmed credits in Q2; PENDING is never reclaimed here.
-        for location, _ in entry.credits.values():
+        for location in entry.credits.values():
             if self.pools.quarantine_credit(origin, location, entry.tag) is not None:
                 self.quarantined[domain.node_id] += self.page_size
         try:
@@ -370,6 +368,11 @@ class PeerOps:
     ) -> None:
         done(RemoteHintResponse(Status.REJECTED, error="hint action unsupported"))
 
+    def peer_received(self, origin: str) -> None:
+        with self._lock:
+            if origin not in self._retired and not self._stop.is_set():
+                self._last_received[origin] = self._clock()
+
     def peer_lost(self, origin: str) -> None:
         with self._lock:
             for domain, entry in self._domains.items():
@@ -389,19 +392,23 @@ class PeerOps:
                 ):
                     self._fence(domain, entry)
             self._acked(origin, float("inf"))
+            self._last_received.pop(origin, None)
             self.registrations.forget_agents(origin)
         self.pools.forget_holder(origin)
 
     def sweep(self) -> int:
         if not self.check_memory():
             return 0
-        now = self._clock()
         with self._lock:
+            now = self._clock()
             expired = [
                 (domain, entry)
                 for domain, entry in self._domains.items()
                 if entry.state == "open"
-                and any(at <= now for _, at in entry.credits.values())
+                and entry.credits
+                and now
+                - self._last_received[peer_origin(domain.node_id, domain.node_epoch)]
+                >= self.reserve_ttl_s
             ]
             count = sum(len(entry.credits) for _, entry in expired)
             for domain, entry in expired:

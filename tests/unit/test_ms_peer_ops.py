@@ -10,6 +10,8 @@ from maru_common.remote_protocol import (
     CancelRequest,
     FenceDomainRequest,
     FenceResult,
+    PingRequest,
+    RemoteMessageType,
     RemoteWriteDoneRequest,
     ReserveRequest,
     RoomLimit,
@@ -207,13 +209,18 @@ def test_commit_response_loss_during_fence_never_frees_published_page(memory):
         assert future.result(5).items[0].result == ItemResult.ADDED
 
 
+@pytest.mark.parametrize("trigger", ["explicit", "ttl"])
 def test_fence_failure_is_q2_and_time_or_late_done_never_releases_it(
-    memory, monkeypatch
+    memory, monkeypatch, trigger
 ):
     (credit,) = memory.reserve().credits
     with monkeypatch.context() as patch:
         fail_fence(memory, patch)
-        assert fence(memory).result == FenceResult.FAILURE
+        if trigger == "ttl":
+            memory.ops._clock = lambda: 10**20
+            assert memory.ops.sweep() == 1
+        else:
+            assert fence(memory).result == FenceResult.FAILURE
         assert state(memory, credit) == PageState.QUARANTINED
         memory.ops._clock = lambda: 10**20
         assert memory.ops.sweep() == 0
@@ -268,17 +275,115 @@ def test_unknown_fences_the_entire_domain_but_preserves_accepted_done(memory):
 
 
 @pytest.mark.parametrize("trigger", ["lost", "retired", "ttl"])
-def test_connection_loss_retirement_and_ttl_fence_instead_of_using_time_as_proof(
-    memory, trigger
+def test_connection_loss_retirement_and_silence_fence_before_reuse(
+    memory, monkeypatch, trigger
 ):
+    now = 0.0
+    monkeypatch.setattr(memory.ops, "_clock", lambda: now)
     (credit,) = memory.reserve().credits
+    original = memory.parts.fence
+    observed = []
+
+    def checked(domain):
+        observed.append(state(memory, credit))
+        original(domain)
+
+    monkeypatch.setattr(memory.parts, "fence", checked)
     if trigger == "ttl":
-        memory.ops._clock = lambda: 10**20
+        now = memory.ops.reserve_ttl_s - 1
+        assert memory.ops.sweep() == 0
+        now += 1
         assert memory.ops.sweep() == 1
     else:
         getattr(memory.ops, f"peer_{trigger}")(A)
+    assert observed == [PageState.QUARANTINED]
     assert state(memory, credit) == PageState.FREE
     assert memory.reserve().status == Status.REJECTED
+
+
+def test_pings_preserve_idle_domains_and_later_write_succeeds(memory, monkeypatch):
+    now = 0.0
+    monkeypatch.setattr(memory.ops, "_clock", lambda: now)
+    conn, hello = memory.connect()
+    assert hello.status == Status.OK
+    first = memory.send(
+        conn,
+        RemoteMessageType.RESERVE,
+        ReserveRequest(memory.op(), 1, domain=DOMAIN),
+    )
+    other_domain = dataclasses.replace(DOMAIN, instance="other")
+    other = memory.send(
+        conn,
+        RemoteMessageType.RESERVE,
+        ReserveRequest(memory.op(), 1, domain=other_domain),
+    )
+    (credit,) = first.credits
+    (idle,) = other.credits
+    for _ in range(8):
+        now += memory.ops.reserve_ttl_s / 2
+        assert conn.call(RemoteMessageType.PING, PingRequest(), 3).status == Status.OK
+        assert memory.ops.sweep() == 0
+        assert state(memory, credit) == state(memory, idle) == PageState.CREDITED
+
+    worker = FakeTransport("idle-writer")
+    data, addr = mapped(PAGE, 7)
+    try:
+        worker.register(addr, PAGE)
+        peer = worker.add_peer(first.write_agent.agent_metadata)
+        remote = first.write_agent.pools[0].base + credit.offset
+        assert (
+            worker.post("WRITE", peer, [(addr, remote, PAGE)]).poll_state()
+            == TransferState.DONE
+        )
+        answer = memory.send(
+            conn,
+            RemoteMessageType.WRITE_DONE,
+            RemoteWriteDoneRequest(
+                memory.op(),
+                [Written(Key("ns", "after-idle"), credit, PAGE, TransferEnd.DONE)],
+                DOMAIN,
+            ),
+        )
+        assert answer.status == Status.OK
+        assert answer.items[0].result == ItemResult.ADDED
+        assert state(memory, credit) == PageState.READY
+        pool = memory.parts._maps[credit.pool_id]
+        assert pool[credit.offset : credit.offset + PAGE] == bytes([7]) * PAGE
+    finally:
+        worker.close()
+        data.close()
+
+    now += memory.ops.reserve_ttl_s - 1
+    assert memory.ops.sweep() == 0
+    now += 1
+    assert memory.ops.sweep() == 1
+    assert state(memory, idle) == PageState.FREE
+    assert state(memory, credit) == PageState.READY
+
+
+def test_requests_from_another_peer_do_not_extend_a_silent_peers_ttl(
+    memory, monkeypatch
+):
+    now = 0.0
+    monkeypatch.setattr(memory.ops, "_clock", lambda: now)
+    (silent,) = memory.reserve().credits
+    domain = dataclasses.replace(DOMAIN, node_id="gpu-b")
+    conn, hello = memory.connect(node_id=domain.node_id)
+    assert hello.status == Status.OK
+    reserved = memory.send(
+        conn,
+        RemoteMessageType.RESERVE,
+        ReserveRequest(
+            memory.op(peer_origin(domain.node_id, domain.node_epoch)), 1, domain=domain
+        ),
+    )
+    assert reserved.status == Status.OK
+    (active,) = reserved.credits
+    now = memory.ops.reserve_ttl_s
+    assert conn.call(RemoteMessageType.PING, PingRequest(), 3).status == Status.OK
+    assert memory.ops.sweep() == 1
+    assert state(memory, silent) == PageState.FREE
+    assert state(memory, active) == PageState.CREDITED
 
 
 def test_late_packets_cannot_write_a_reused_page_after_fence(memory):

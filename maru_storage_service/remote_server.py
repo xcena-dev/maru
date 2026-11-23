@@ -114,6 +114,10 @@ class RemoteOps(Protocol):
         """Bytes this peer could reserve now, and any quarantine limit."""
         ...
 
+    def peer_received(self, origin: str) -> None:
+        """An authenticated peer sent a control request."""
+        ...
+
     def peer_lost(self, origin: str) -> None:
         """The peer run has no live connection; outstanding pages need fencing."""
         ...
@@ -500,6 +504,7 @@ class TcpRemoteServer(RemoteServer):
                 if old.connection is not None:
                     old.connection.close()
             self._ack(origin, req.ack)
+            self.ops.peer_received(origin)
             self.progress.drain()
             room, limit = self.ops.room(origin)
             conn.post_response(
@@ -538,6 +543,8 @@ class TcpRemoteServer(RemoteServer):
         with self._cv:
             if self._stopped.is_set() or conn.closed.is_set():
                 return
+            if conn.hello is not None:
+                self.ops.peer_received(conn.origin)
         if not self.check_memory():
             fields = {"boot": self.boot} if code == RemoteMessageType.HELLO else {}
             conn.post_response(
