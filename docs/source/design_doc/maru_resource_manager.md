@@ -64,7 +64,8 @@ All messages use a fixed-size binary header (12 bytes) containing protocol magic
 | `FREE_REQ` / `FREE_RESP` | client ↔ server | Free allocation (requires valid auth token) |
 | `GET_ACCESS_REQ` / `GET_ACCESS_RESP` | client ↔ server | Request device path + offset + length for an existing allocation |
 | `HOLD_REQ` / `HOLD_RESP` | client ↔ server | `GET_ACCESS` that also records a hold: a remote CXL agent holds every region it registers with its NIC (§5) |
-| `UNHOLD_REQ` / `UNHOLD_RESP` | client ↔ server | The holder deregistered the region (requires the handle) |
+| `MAP_HOLD_REQ` / `MAP_HOLD_RESP` | client ↔ server | `GET_ACCESS` that also records a hold with the caller's process identity: a process holds every region it maps (§5) |
+| `UNHOLD_REQ` / `UNHOLD_RESP` | client ↔ server | The holder deregistered or unmapped the region (requires the handle) |
 | `RESET_HOLDS_REQ` / `RESET_HOLDS_RESP` | client ↔ server | A restarted holder drops the holds of its earlier process |
 | `STATS_REQ` / `STATS_RESP` | client ↔ server | Query per-pool statistics |
 | `ERROR_RESP` | server → client | Error with status code and message |
@@ -155,6 +156,8 @@ Local vs. remote is determined by comparing the client's hostname (from `client_
 
 **Held regions.** A remote CXL agent registers the regions it maps with its node's NIC, and a late RDMA WRITE through such a registration would land in whatever region next gets the range. So the agent holds each region it registers (`HOLD`, named by its node and process instance) and unholds it once deregistered. A region freed while held, by its owner, the reaper, `maru-rm-ctl release` or recovery, becomes *draining*: it is freed for its owner and `GET_ACCESS` refuses it, but its range stays out of the free list until the last holder unholds it. A restarted agent drops the holds of its earlier process (`RESET_HOLDS`), whose registrations ended with it. Holds and draining marks are kept in `holds` in the state directory (rewritten atomically on every change), so a restart keeps the range out of use too. A pool with a held region is never reset by recovery. If a memory node is gone for good, `maru-rm-ctl drop-holds NODE --confirm` drops its holds. The RM trusts its network for `RESET_HOLDS`, as for `ALLOC`.
 
+**Mapped regions.** A process that maps a region, such as a `cxl` Handler, can write through that mapping for as long as it lives, whatever happens to the region's owner: the owner is usually `maru-server`, and a Handler stores KV into its region before it registers the key there. So `MaruShmClient.mmap()` takes a hold first (`MAP_HOLD`) and `munmap()`, `free()` and `close()` drop it once the mapping is closed. A region that is freed or reclaimed while mapped drains as above, and its range goes to no other owner before every such process has unmapped it or has ended. Each hold is named after its client (`mmap:<host>:<pid>:<id>`) and records the process: host, boot ID, PID, start time and pid namespace. The reaper drops the hold of a process it sees gone, `--hold-grace` (5 s by default) after it first saw that, which it can tell only for a process on its own host, in the same boot and pid namespace. The hold of a process on another host or in another pid namespace (a container without the host's pid namespace) that ended without unmapping stays until an operator drops it with `maru-rm-ctl drop-holds HOLDER --confirm`; `maru-rm-ctl allocations` lists the holders. A mapping whose exported buffers keep it from closing keeps its hold until the process exits. A mapping that a forked child inherits is not covered: its hold is the parent's, and ends with the parent. A client of this version maps without a hold, with a warning, when the RM predates `MAP_HOLD`.
+
 ---
 
 ## 6. Security
@@ -165,7 +168,7 @@ The secret is generated on first start and persisted to the state directory. On 
 
 **Owner verification** ensures that clients can only free their own allocations — the `client_id` (`hostname:pid`) is recorded at allocation time and must match the freeing client's identity. Note that `client_id` is self-reported by the client; it provides ownership tracking rather than authentication. The auth token is cryptographically bound to the `client_id`, so forging a valid token requires knowing both the Handle fields and the server-side secret.
 
-**PID reuse tracking:** The Reaper compares local process start times and uses a disconnect grace period for remote clients. This controls allocation ownership; valid handles may also be held by metadata services or readers. NIC registrations have the separate RM hold/draining lifetime described in §5.
+**PID reuse tracking:** The Reaper compares local process start times and uses a disconnect grace period for remote clients. This controls allocation ownership; valid handles may also be held by metadata services or readers. NIC registrations and mappings have the separate RM hold/draining lifetime described in §5.
 
 **Device permissions:** Since clients open device paths directly (instead of receiving FDs from the server), client processes must have read/write access to the CXL device files. Configure via `chmod` or group-based permissions.
 

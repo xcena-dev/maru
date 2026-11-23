@@ -34,10 +34,11 @@ own user only):
                                (e.g. before handing it over, or to reset it for
                                tests); waits until done, which can take minutes
   drop-holds HOLDER [--confirm]
-                               list the regions a remote agent (node HOLDER)
-                               holds; --confirm drops those holds once that
-                               node's agent is gone for good, releasing the
-                               regions freed while held
+                               list the regions HOLDER holds: a remote agent
+                               (its node), or a process that maps them (as
+                               `allocations` names it); --confirm drops those
+                               holds once that agent or process is gone for
+                               good, releasing the regions freed while held
   release-node NODE [--confirm]
                                list the regions node NODE's StorageService
                                owns; --confirm frees them (held ones drain)
@@ -221,9 +222,10 @@ def parser() -> argparse.ArgumentParser:
     )
     drop = commands.add_parser(
         "drop-holds",
-        help="list or drop a remote agent's region holds",
-        description="List the regions the remote agent of node HOLDER holds. "
-        "Freed regions stay out of use while held; --confirm drops the holds.",
+        help="list or drop a holder's region holds",
+        description="List the regions HOLDER holds: the remote agent of a node, "
+        "or a process that maps them. Freed regions stay out of use while held; "
+        "--confirm drops the holds.",
     )
     drop.add_argument("holder", type=holder_name)
     drop.add_argument(

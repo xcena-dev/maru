@@ -102,7 +102,7 @@ void printUsage(const char *prog) {
         "  -m, --max-clients N       Maximum concurrent client connections (default: 256)\n"
         "  -N, --node-lease SEC      Free a node's regions after SEC seconds without a claim,\n"
         "                            alloc or renew from its current run (default: 900)\n"
-        "  -G, --hold-grace SEC      Drop a worker's hold SEC seconds after its process is\n"
+        "  -G, --hold-grace SEC      Drop a process's hold SEC seconds after that process is\n"
         "                            seen gone on this host (default: 5)\n"
         "  -h, --help                Show this help\n",
         prog);

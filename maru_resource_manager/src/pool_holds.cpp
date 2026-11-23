@@ -1,7 +1,8 @@
 // Region holds: a remote CXL agent holds each region it registers with its
-// NIC, and the RM keeps a freed region's range out of use until every holder
-// has unheld it, so a late RDMA WRITE through that registration cannot land in
-// the range's next owner. Holds are persisted in <stateDir>/holds
+// NIC, and a process holds each region it maps. The RM keeps a freed region's
+// range out of use until every holder has unheld it (or, for a process, is
+// seen gone), so a late write through that registration or mapping cannot
+// land in the range's next owner. Holds are persisted in <stateDir>/holds
 // (region_holds.cpp); the WAL and free list change only when a region is
 // released for real.
 #include <signal.h>
@@ -29,8 +30,8 @@ std::string PoolManager::holdState(uint64_t regionId) const
         for (const auto &[holder, hold] : it->second)
         {
             state += (state.size() > 9 ? "," : "") + holder;
-            if (hold.worker())
-                state += "[epoch=" + hold.nodeEpoch + ",host=" + hold.host +
+            if (hold.ofProcess())
+                state += "[epoch=" + (hold.nodeEpoch.empty() ? "-" : hold.nodeEpoch) + ",host=" + hold.host +
                          ",boot=" + (hold.bootId.empty() ? "-" : hold.bootId) +
                          ",pid=" + std::to_string(hold.pid) +
                          ",start=" + std::to_string(hold.pidStart) +
@@ -143,16 +144,25 @@ int PoolManager::hold(const Handle &handle, const std::string &holder,
     {
         return rc;
     }
-    auto &holders = holds_[handle.regionId];
-    auto previous = holders.find(holder);
+    // A newer instance of the holder replaces the old one: one agent per node.
     HoldRecord hold;
     hold.instance = instance;
-    if (previous != holders.end() && previous->second == hold)
+    return recordHoldLocked(handle.regionId, holder, hold);
+}
+
+int PoolManager::recordHoldLocked(uint64_t regionId, const std::string &holder,
+                                  const HoldRecord &hold)
+{
+    auto found = holds_.find(regionId);
+    if (found != holds_.end())
     {
+        auto same = found->second.find(holder);
         // A retry after an unsynced save: succeed only once it is durable.
-        return confirmHoldsDurableLocked();
+        if (same != found->second.end() && same->second == hold)
+            return confirmHoldsDurableLocked();
     }
-    // A newer instance of the holder replaces the old one: one agent per node.
+    auto &holders = holds_[regionId];
+    auto previous = holders.find(holder);
     const bool replacing = previous != holders.end();
     const HoldRecord replaced = replacing ? previous->second : HoldRecord{};
     holders[holder] = hold;
@@ -162,14 +172,43 @@ int PoolManager::hold(const Handle &handle, const std::string &holder,
     {
         if (!replacing) holders.erase(holder);
         else holders[holder] = replaced;
-        if (holders.empty()) holds_.erase(handle.regionId);
+        if (holders.empty()) holds_.erase(regionId);
         return saveRc;
     }
-    logf(LogLevel::Debug, "region %llu held by %s (instance %s)",
-         static_cast<unsigned long long>(handle.regionId), holder.c_str(), instance.c_str());
-    // Kept in memory (the file has it), but not durable: the agent must not
-    // register the region yet, and retries.
+    if (hold.ofProcess())
+        logf(LogLevel::Debug, "region %llu held by process %s (host %s, pid %u)",
+             static_cast<unsigned long long>(regionId), holder.c_str(), hold.host.c_str(),
+             hold.pid);
+    else
+        logf(LogLevel::Debug, "region %llu held by %s (instance %s)",
+             static_cast<unsigned long long>(regionId), holder.c_str(), hold.instance.c_str());
+    // Kept in memory (the file has it), but not durable: the holder must not
+    // register or map the region yet, and retries.
     return syncRc;
+}
+
+int PoolManager::mapHold(const Handle &handle, const std::string &holder, const HoldRecord &who,
+                         std::string &outPath)
+{
+    if (!validHoldName(holder) || !validHoldName(who.host) || !who.nodeEpoch.empty() ||
+        (!who.bootId.empty() && (!validHoldName(who.bootId) || who.bootId == "-")))
+    {
+        return -EINVAL;
+    }
+    std::lock_guard<std::mutex> lock(mu_);
+    // The caller proves it was given the handle, as for GET_ACCESS.
+    std::string path;
+    int rc = verifyAndGetPathLocked(handle, path);
+    if (rc != 0)
+    {
+        return rc;
+    }
+    HoldRecord hold = who;
+    hold.instance = holder;
+    rc = recordHoldLocked(handle.regionId, holder, hold);
+    // The path only with a durable hold: the process must not map before.
+    if (rc == 0) outPath = path;
+    return rc;
 }
 
 int PoolManager::unhold(const Handle &handle, const std::string &holder,
@@ -265,7 +304,7 @@ PoolManager::HolderFate PoolManager::holderFate(const HoldRecord &hold) const
 {
     // Only a process this host can see for sure: same host and boot, and the
     // same pid namespace as the RM.
-    if (!hold.worker() || hold.bootId.empty() || bootIdNow_.empty() ||
+    if (!hold.ofProcess() || hold.bootId.empty() || bootIdNow_.empty() ||
         !isLocalHostName(hold.host))
         return HolderFate::Unknown;
     if (hold.bootId != bootIdNow_) return HolderFate::EarlierBoot;
@@ -294,7 +333,7 @@ void PoolManager::reapDeadHoldersLocked()
             auto seen = holdGoneSince_.find(key);
             const auto since = seen != holdGoneSince_.end() ? seen->second : now;
             gone[key] = since;
-            // A worker may still finish its GPU copies just after it exits.
+            // A process may still finish its GPU copies just after it exits.
             if (fate == HolderFate::EarlierBoot || now - since >= holdGrace_) drops.push_back(key);
         }
     }
@@ -317,7 +356,7 @@ void PoolManager::reapDeadHoldersLocked()
     for (const auto &[regionId, holder] : drops)
     {
         holdGoneSince_.erase({regionId, holder});
-        logf(LogLevel::Info, "region %llu: hold of %s dropped, its worker is gone",
+        logf(LogLevel::Info, "region %llu: hold of %s dropped, its process is gone",
              static_cast<unsigned long long>(regionId), holder.c_str());
     }
     // reapExpired frees the draining regions left without holds.
@@ -349,8 +388,9 @@ int PoolManager::adminDropHolds(const std::string &holder, bool confirmed, std::
     }
     if (!confirmed)
     {
-        out = list + "these regions stay out of use while held. Verify that the agent of node " +
-              holder + " is gone for good (its NIC registrations with it), then pass --confirm\n";
+        out = list + "these regions stay out of use while held. Verify that " + holder +
+              " (the agent of that node, or that process) is gone for good, its NIC "
+              "registrations and mappings with it, then pass --confirm\n";
         return -EPERM;
     }
     const auto before = holds_;

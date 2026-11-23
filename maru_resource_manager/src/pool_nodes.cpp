@@ -370,8 +370,9 @@ int PoolManager::nodeFree(const Handle &handle, const std::string &nodeId,
 int PoolManager::nodeHold(const Handle &handle, const std::string &nodeId,
                           const std::string &holder, const HoldRecord &who, std::string &outPath)
 {
-    if (!validNodeId(nodeId) || !validHoldName(who.nodeEpoch) || !validHoldName(holder) ||
-        !validHoldName(who.host) ||
+    // "-" stands for no epoch in the holds file.
+    if (!validNodeId(nodeId) || !validHoldName(who.nodeEpoch) || who.nodeEpoch == "-" ||
+        !validHoldName(holder) || !validHoldName(who.host) ||
         (!who.bootId.empty() && (!validHoldName(who.bootId) || who.bootId == "-")))
     {
         return -EINVAL;
@@ -402,35 +403,11 @@ int PoolManager::nodeHold(const Handle &handle, const std::string &nodeId,
     }
     HoldRecord hold = who;
     hold.instance = holder;
-    auto &holders = holds_[handle.regionId];
-    auto previous = holders.find(holder);
-    if (previous != holders.end() && previous->second == hold)
-    {
-        // The same worker again: succeed only once its hold is durable.
-        const int rc = confirmHoldsDurableLocked();
-        if (rc == 0) outPath = regionPath(*pool, handle.regionId);
-        return rc;
-    }
-    const bool replacing = previous != holders.end();
-    const HoldRecord replaced = replacing ? previous->second : HoldRecord{};
-    holders[holder] = hold;
-    int syncRc = 0;
-    const int rc = saveHoldsLocked(syncRc);
-    if (rc != 0)
-    {
-        if (replacing) holders[holder] = replaced;
-        else holders.erase(holder);
-        if (holders.empty()) holds_.erase(handle.regionId);
-        return rc;
-    }
-    logf(LogLevel::Debug, "region %llu held by worker %s (node %s run %s, pid %u)",
-         static_cast<unsigned long long>(handle.regionId), holder.c_str(), nodeId.c_str(),
-         who.nodeEpoch.c_str(), who.pid);
-    // Kept (the file has it), but the worker must not map the region until
-    // a retry finds it durable.
-    if (syncRc != 0) return syncRc;
-    outPath = regionPath(*pool, handle.regionId);
-    return 0;
+    // Kept even when not durable yet (the file has it), but the worker must
+    // not map the region until a retry finds it durable.
+    const int rc = recordHoldLocked(handle.regionId, holder, hold);
+    if (rc == 0) outPath = regionPath(*pool, handle.regionId);
+    return rc;
 }
 
 int PoolManager::nodeRenew(const std::string &nodeId, const std::string &epoch)

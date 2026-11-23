@@ -104,8 +104,9 @@ public:
     int verifyAndGetPath(const Handle &handle, std::string &outPath);
 
     /// Region holds of remote agents (holder = node ID, instance = the agent
-    /// process's epoch). A region freed while held drains: it stays out of
-    /// the free list, and reads as freed, until its last hold is dropped.
+    /// process's epoch) and of processes that map a region (mapHold,
+    /// nodeHold). A region freed while held drains: it stays out of the free
+    /// list, and reads as freed, until its last hold is dropped.
     ///
     /// Verify the token as verifyAndGetPath, record the hold (replacing an
     /// older instance of the holder) and return the device path. -ENOENT if
@@ -118,6 +119,14 @@ public:
     /// Drop every hold of the holder made by another instance (that process
     /// and its registrations are gone).
     int resetHolds(const std::string &holder, const std::string &instance, uint32_t &dropped);
+    /// A process (holder: a name of its own, unique to it) maps the region:
+    /// verify the token and hold as `hold` does, recording the process's
+    /// identity in `who` (host, boot, pid, start time, pid namespace; no node
+    /// epoch), so that the reaper drops the hold once it sees that process
+    /// gone. UNHOLD with instance = holder drops it. The path is returned
+    /// only once the hold is durable.
+    int mapHold(const Handle &handle, const std::string &holder, const HoldRecord &who,
+                std::string &outPath);
 
     /// Node ownership (pool_nodes.cpp): a StorageService owns regions as its
     /// node, never reaped by the PID check or the grace period. Each request
@@ -302,6 +311,11 @@ private:
     // protection then reports syncRc, one that removes it succeeds (a power
     // loss brings back the older file, which only holds more).
     int saveHoldsLocked(int &syncRc);
+    // Record `hold` as the holder's hold of the region (replacing its earlier
+    // one) and save. 0 once it is durable; -errno of the save with nothing
+    // changed, or of the directory sync with the hold kept: the caller's
+    // holder must not rely on it yet, and retries.
+    int recordHoldLocked(uint64_t regionId, const std::string &holder, const HoldRecord &hold);
     // 0 once the holds file last renamed into place is known durable; else
     // sync the directory again and return the result. An idempotent request
     // (a retried HOLD or FREE) must not report success before this does.
@@ -312,7 +326,7 @@ private:
     // Free draining regions without holds; save the file if anything changed
     // or `save` is set. Returns the number freed.
     size_t finishDrainingLocked(bool save);
-    // Drop the holds of workers known to be gone: on this host, in this boot
+    // Drop the holds of processes known to be gone: on this host, in this boot
     // and pid namespace, process gone for holdGrace_ (or an earlier boot).
     void reapDeadHoldersLocked();
     enum class HolderFate { Unknown, Alive, Gone, EarlierBoot };
@@ -404,15 +418,15 @@ private:
 
     // Global allocation tracking by regionId
     std::map<uint64_t, Allocation> allocations_;
-    // Remote agents' holds: region -> holder -> instance. Every region here
-    // is in allocations_.
+    // Holds of remote agents and of mapping processes: region -> holder ->
+    // hold. Every region here is in allocations_.
     RegionHolds holds_;
     // Freed while held: still in allocations_, so its range stays out of the
     // free list and survives a restart, but freed for everyone else.
     std::set<uint64_t> draining_;
     // -errno while the last holds file renamed into place is not synced.
     int holdsSyncRc_{0};
-    // (region, holder) -> when its worker was first seen gone.
+    // (region, holder) -> when its process was first seen gone.
     std::map<std::pair<uint64_t, std::string>, SteadyClockPoint> holdGoneSince_;
     std::chrono::milliseconds holdGrace_;
     uint64_t ownPidNs_{0};
