@@ -64,6 +64,8 @@ Time alone is not a fence. If revocation fails, unconfirmed pages remain quarant
 
 A GPU-service run change closes the worker's read admission gate before new READs can use old locations. Source pins held by live old workers survive that run change. A CUDA error that leaves a copy unconfirmed stops the worker, which returns no resources; restart the complete vLLM instance and verify that its old worker processes have exited.
 
+A remote worker's connection to its GPU service lasts one incarnation. If the connection ends while the service run continues, the service fences the write domains issued to that incarnation and refuses it afterwards; the worker stops remote loads and stores until its process restarts, keeping in-flight READs, slots and source pins until they finish. After a GPU-service restart the worker attaches to the new run and recovers. A clean close deregisters, unregisters and unmaps the staging buffer before DETACH, and the service then frees that buffer's staging admission; an uncertain teardown keeps the admission until the process exits. DRAM and `local_cxl` workers attach again to the same run and keep their credit.
+
 ## Restarts and memory generations
 
 Catalog metadata is volatile. A `maru-node-server` restart invalidates all keys; services and workers establish new sessions and recompute misses. A DRAM pool ends with its service run. A `local_cxl` store can adopt regions and registered keys from an earlier run when the Catalog, boot and memory generation still match and earlier holds permit access. This is cache reuse, not persistent storage.
