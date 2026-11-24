@@ -546,6 +546,11 @@ the chunkwise format, whose chunk is one object of every layer, stores the
 chunk. A load that overlaps compute (`maru_overlap_load_with_compute`) is
 also awaited for every layer before the drafter runs, so the draft layers do
 not depend on their per-layer hooks to wait for it.
+Engines that share a Maru pool must all run with DSpark or all without it,
+also across restarts. Object keys do not record the draft layers, so a chunk
+stored with one setting is found with the other even though it holds another
+set of layers, and its load can fail. Use a fresh or separate pool when
+switching.
 Other speculative decoding methods store only from the per-layer hooks, as
 without speculative decoding. A method whose draft layers call none, as DFlash's
 likely do since vLLM runs its draft step the way it runs DSpark's, is not
