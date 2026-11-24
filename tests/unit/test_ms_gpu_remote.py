@@ -19,12 +19,19 @@ from maru_common.node_protocol import (
     CreditRequest,
     CreditReturnRequest,
     NodeMessageType,
+    Notify,
     ReadJoinRequest,
     WriteDoneItem,
     WriteDoneRequest,
 )
 from maru_common.remote_protocol import TransferEnd
-from maru_common.storage_types import WORKER_RDMA_CAPABILITY, ItemResult, Key, Status
+from maru_common.storage_types import (
+    WORKER_RDMA_CAPABILITY,
+    ItemResult,
+    Key,
+    NotifyKind,
+    Status,
+)
 from maru_handler.client import AttachRefusedError
 from maru_handler.client.maru_client import MaruClient
 from maru_remote.auth import write_key
@@ -310,6 +317,26 @@ def test_credit_replay_and_return_use_the_same_reservation(pair):
         NodeMessageType.CREDIT_RETURN, CreditReturnRequest(first.credits)
     )
     assert response.items[0].result == ItemResult.OK
+    assert not pair.gpu.store._credits
+    assert pair.memory.pools.bytes_in(PageState.CREDITED) == 0
+
+
+def test_returning_remote_credit_releases_128_worker_bindings(pair, monkeypatch):
+    monkeypatch.setattr(MaruClient, "_refill_loop", lambda self: None)
+    worker = pair.client()
+    returned = set()
+    for batch in range(32):
+        if batch:
+            worker._refill_once()
+        wait_until(lambda: worker.credits.unused_bytes == 4 * PAGE)
+        assert len(worker._rdma._credit_agents) == 4
+        returned.update(worker._rdma._credit_agents)
+        worker._on_notify(
+            Notify(NotifyKind.CREDIT_RETURN, bytes=4 * PAGE), worker._storage
+        )
+        wait_until(lambda: not worker._rdma._credit_agents)
+    assert len(returned) == 128
+    assert worker.credits.unused_bytes == 0
     assert not pair.gpu.store._credits
     assert pair.memory.pools.bytes_in(PageState.CREDITED) == 0
 

@@ -749,8 +749,9 @@ class MaruClient:
             closed = self._closing.is_set()
             if not closed:
                 if not same_run:
+                    self.credits.reset(response.node_epoch)
                     if self._rdma is not None:
-                        self._rdma.advance()
+                        self._rdma.advance(drop_credits=True)
                     if self.node_epoch is not None:
                         logger.warning(
                             "the StorageService restarted (node epoch %s -> %s); "
@@ -763,7 +764,6 @@ class MaruClient:
                         self.identity.incarnation, response.node_epoch
                     )
                     self._returns.clear()
-                    self.credits.reset(response.node_epoch)
                 self.attach_info = response
                 self._storage = conn
                 self._count("attach")
@@ -1023,8 +1023,8 @@ class MaruClient:
                     raise StaleRunError("credit run ended")
                 remote = self._rdma.alloc_write(credit, size)
                 if remote is None:
-                    if self._rdma.credit_retired(credit):
-                        self.credits.discard(self._rdma.credit_retired)
+                    if self._rdma.discard_retired_credit(credit):
+                        self.credits.discard(self._rdma.discard_retired_credit)
                         self._refill_wake.set()
                         raise CreditUnavailableError("write domain ended")
                     self.credits.put([credit], node_epoch)
@@ -1438,7 +1438,7 @@ class MaruClient:
             return False  # one CREDIT at a time; that one is resent until known
         budgets = info.budgets
         if self._rdma is not None:
-            self.credits.discard(self._rdma.credit_retired)
+            self.credits.discard(self._rdma.discard_retired_credit)
         unused = self.credits.unused_bytes
         with self._lock:
             demand = max(0, self._demand - self._demand_taken)
@@ -1495,6 +1495,8 @@ class MaruClient:
                 return
             if self.credits.put(mapped, epoch):
                 got.extend(mapped)
+            elif remote_credits:
+                self._rdma.forget_credits(remote_credits)
 
         reply = self._send_op(NodeMessageType.CREDIT, request, on_result, ops)
         try:
@@ -1600,6 +1602,10 @@ class MaruClient:
                 except Exception:
                     with self._lock:
                         self._returns.extend(batch)  # sent again after reconnect
+                else:
+                    # Returned or refused, these pages are out of the worker cache.
+                    if self._rdma is not None:
+                        self._rdma.forget_credits(batch)
 
             reply.add_done_callback(done)
 

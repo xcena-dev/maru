@@ -195,6 +195,36 @@ def test_batched_reads_share_a_transfer_and_keep_each_gpu_slot(env, monkeypatch)
     assert env.reader.capacity() == 4
 
 
+@pytest.mark.parametrize("with_live", [False, True])
+def test_expired_reserved_reads_are_not_posted(env, monkeypatch, with_live):
+    now = 100
+    monkeypatch.setattr(time, "monotonic", lambda: now)
+    batch, posts = [], []
+    expired = env.start(deadline=101, batch=batch)
+    if with_live:
+        live = env.start(env.outcome(PAGE), deadline=105, batch=batch)
+    post = env.reader.transport.post_nowait
+
+    def record(op, peer, pairs):
+        posts.append((op, len(pairs)))
+        return post(op, peer, pairs)
+
+    monkeypatch.setattr(env.reader.transport, "post_nowait", record)
+    now = 102
+    env.reader.post_reads(batch)
+    assert posts == ([("READ", 1)] if with_live else [])
+    assert env.reader.capacity() == env.reader.slot_count - int(with_live)
+    assert expired.ready.is_set()
+    assert expired.result() is None and expired.reason == "timeout"
+    if with_live:
+        env.reader.progress()
+        read = live.result()
+        assert bytes(read.view) == b"b" * PAGE
+        read.release()
+    assert len(env.unpins) == len(batch)
+    assert env.reader.capacity() == env.reader.slot_count
+
+
 def test_a_consumer_does_not_hide_an_undecided_joiners_invalidation(env):
     env.agent.stall = True
     first, second = env.start(), env.start()
@@ -790,9 +820,13 @@ def test_err_keeps_its_slot_until_the_staging_registration_ends(env):
     assert env.reader.transport._registrations
 
 
-def test_deadline_keeps_the_slot_until_the_late_done(env):
+def test_deadline_keeps_the_slot_until_the_late_done(env, monkeypatch):
+    now = 100
+    monkeypatch.setattr(time, "monotonic", lambda: now)
     env.agent.stall = True
-    request = env.start(deadline=time.monotonic())
+    request = env.start(deadline=now + 1)
+    assert request.flight.pending is not None
+    now += 1
     assert request.result() is None
     assert env.reader.capacity() == 3
     env.agent.finish_stalled()
@@ -800,10 +834,14 @@ def test_deadline_keeps_the_slot_until_the_late_done(env):
     assert env.reader.capacity() == 4
 
 
-def test_kept_limit_misses_then_recovers_on_late_done(env):
+def test_kept_limit_misses_then_recovers_on_late_done(env, monkeypatch):
+    now = 100
+    monkeypatch.setattr(time, "monotonic", lambda: now)
     env.agent.stall = True
     for offset in (0, PAGE):
-        request = env.start(env.outcome(offset), deadline=time.monotonic())
+        request = env.start(env.outcome(offset), deadline=now + 1)
+        assert request.flight.pending is not None
+        now += 1
         assert request.result() is None
     request = env.start()
     assert request.result() is None and request.reason == "kept_limit"
@@ -1094,6 +1132,7 @@ def test_client_write_done_waits_for_memory_node_commit(env, client, writer):
     client._storage.commit()
     assert stored.result() == [True]
     assert client._storage.published == {Key("ns", "written")}
+    assert not env.reader._credit_agents
     assert env.reader.capacity() == 4
 
 
@@ -1137,6 +1176,7 @@ def test_client_keeps_credit_when_staging_is_temporarily_full(env, client):
             env.reader._free.extend(slots)
     handle = client.alloc(PAGE)
     client.free(handle)
+    assert env.reader.owns_credit(handle.location)
     assert env.reader.capacity() == env.reader.slot_count
 
 
@@ -1153,6 +1193,7 @@ def test_client_discards_remaining_credit_of_a_retired_domain(env, client, write
         client.alloc(PAGE)
     assert client.credits.unused_bytes == 0
     assert client._refill_wake.is_set()
+    assert not env.reader._credit_agents
     assert env.reader.capacity() == env.reader.slot_count
     assert len(client._storage.requests) == 1
 

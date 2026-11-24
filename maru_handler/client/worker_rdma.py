@@ -231,10 +231,12 @@ class WorkerRdma:
         finally:
             self.gate.release()
 
-    def advance(self):
+    def advance(self, *, drop_credits=False):
         """Invalidate reads before a lifecycle operation drops their pins."""
         with self.gate:
             self.generation += 1
+            if drop_credits:
+                self._credit_agents.clear()
             for flight in self._flights:
                 for request in flight.waiters:
                     request.reason = "generation"
@@ -453,15 +455,27 @@ class WorkerRdma:
     def _post_reads(self, flights):
         valid = []
         for flight in flights:
-            if flight.state != "reserved":
+            if flight.state != "reserved" or flight not in self._flights:
                 continue
-            if self._valid(flight):
+            current = self._valid(flight)
+            waiting = []
+            now = time.monotonic()
+            for request in flight.waiters:
+                if not current:
+                    request.reason = "generation"
+                elif not request.reason and now >= request.deadline:
+                    request.reason = "timeout"
+                if request.reason or request.decided:
+                    request.flight = None
+                    request.ready.set()
+                else:
+                    waiting.append(request)
+            flight.waiters = waiting
+            if waiting:
                 valid.append(flight)
             else:
                 flight.state = "done"
-                for request in flight.waiters:
-                    request.reason = "generation"
-                    request.ready.set()
+                self._reclaim(flight)
         if not valid:
             return
         pending = None
@@ -693,9 +707,18 @@ class WorkerRdma:
     def owns_credit(self, credit):
         return credit in self._credit_agents
 
-    def credit_retired(self, credit):
+    def forget_credits(self, credits):
+        with self.gate:
+            for credit in credits:
+                self._credit_agents.pop(credit, None)
+
+    def discard_retired_credit(self, credit):
+        """Called by the exclusive owner of an unused credit."""
         agent = self._credit_agents.get(credit)
-        return agent is not None and agent.domain in self._retired_domains
+        if agent is None or agent.domain not in self._retired_domains:
+            return False
+        self._credit_agents.pop(credit, None)
+        return True
 
     def alloc_write(self, credit, size):
         if not self._acquire_gate():
@@ -733,12 +756,10 @@ class WorkerRdma:
         """Called after D2H completion; UNKNOWN pages require domain fencing."""
         pending = None
         with self.gate:
-            if (
-                self.stopped.is_set()
-                or self.closed
-                or buffer.released
-                or buffer.agent.domain in self._retired_domains
-            ):
+            if self.stopped.is_set() or buffer.released:
+                return TransferEnd.NOT_POSTED
+            self._credit_agents.pop(buffer.location, None)
+            if self.closed or buffer.agent.domain in self._retired_domains:
                 return TransferEnd.NOT_POSTED
             pool = next(
                 p for p in buffer.agent.pools if p.pool_id == buffer.location.pool_id
@@ -779,7 +800,6 @@ class WorkerRdma:
             if not pending.finished:
                 self._write_pending.append(pending)
                 self._wake.set()
-            self._credit_agents.pop(buffer.location, None)
             end = TransferEnd.DONE if pending.completed else TransferEnd.UNKNOWN
             if end == TransferEnd.UNKNOWN:
                 self._retired_domains.add(buffer.agent.domain)
@@ -794,7 +814,7 @@ class WorkerRdma:
             self._free.append(buffer.slot)
 
     def close(self):
-        self.advance()
+        self.advance(drop_credits=not self.stopped.is_set())
         with self.gate:
             self.closed = True
             keep = bool(
