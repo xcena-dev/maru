@@ -254,9 +254,17 @@ def _group(specs, side):
     return KVCacheGroupSpec(list(specs), spec)
 
 
-def dsv41_config(block=DSV41_BLOCK, side="worker", window=None):
+def dsv41_config(
+    block=DSV41_BLOCK, side="worker", window=None, drafts=False, windows=None
+):
     """DSV4.1-Flash's six groups: four sliding windows, the compressed KV and
-    indexer keys, and the KV compressor's circular buffer."""
+    indexer keys, and the KV compressor's circular buffer.
+
+    With ``drafts``, DSpark's draft layers 40-42 each add a sliding window like
+    the target's, and vLLM deals the windows into one more group, as it does on
+    the GPU (seven groups to eight). ``windows`` sets the number of window
+    groups.
+    """
     window = window or _window_mla(block // 4)
     mla = {
         name: MLAAttentionSpec(
@@ -264,9 +272,11 @@ def dsv41_config(block=DSV41_BLOCK, side="worker", window=None):
         )
         for name, size in DSV41_MEMBERS.items()
     }
+    layers = range(43 if drafts else 40)
+    windows = windows or (5 if drafts else 4)
     groups = [
-        _group({f"layers.{i}.attn.swa": window for i in range(g, 40, 4)}, side)
-        for g in range(4)
+        _group({f"layers.{i}.attn.swa": window for i in layers[g::windows]}, side)
+        for g in range(windows)
     ]
     groups.append(_group(mla, side))
     ring = _ring(8)
@@ -279,7 +289,7 @@ def _check_dsv41(config):
         describe_kv_groups(config),
         block_size=DSV41_BLOCK,
         use_layerwise=False,
-        speculative=False,
+        speculative_method=None,
         sync_loads=False,
     )
 
@@ -300,7 +310,7 @@ def test_dsv41_passes_the_support_check_in_the_layerwise_format():
         describe_kv_groups(dsv41_config()),
         block_size=DSV41_BLOCK,
         use_layerwise=True,
-        speculative=False,
+        speculative_method=None,
         sync_loads=False,
     )
 
@@ -381,9 +391,98 @@ def test_dsv41_without_bounded_replay_passes_the_support_check(layerwise):
         describe_kv_groups(dsv41_config(window=window)),
         block_size=DSV41_BLOCK // 4,
         use_layerwise=layerwise,
-        speculative=False,
+        speculative_method=None,
         sync_loads=False,
     )
+
+
+@pytest.mark.parametrize("bounded_replay", [True, False], ids=["replay", "no-replay"])
+@pytest.mark.parametrize("layerwise", [False, True], ids=["chunkwise", "layerwise"])
+def test_dsv41_with_dspark_passes_the_support_check(bounded_replay, layerwise):
+    """DSpark's draft layers keep sliding windows like the target's, in the
+    target's window groups, which Maru skips or copies block by block."""
+    block = DSV41_BLOCK // 4
+    window = _window_mla(block, bounded_replay=bounded_replay)
+    check_multi_group_support(
+        describe_kv_groups(dsv41_config(window=window, drafts=True)),
+        block_size=DSV41_BLOCK if bounded_replay else block,
+        use_layerwise=layerwise,
+        speculative_method="dspark",
+        sync_loads=False,
+    )
+
+
+@pytest.mark.parametrize("method", ["ngram", "eagle3", "mtp", "draft_model", "unknown"])
+def test_dsv41_with_another_speculative_method_is_rejected(method):
+    """Only DSpark has been run with several groups."""
+    with pytest.raises(
+        ValueError, match=f"only with DSpark \\('dspark'\\), not '{method}'"
+    ):
+        check_multi_group_support(
+            describe_kv_groups(dsv41_config()),
+            block_size=DSV41_BLOCK,
+            use_layerwise=False,
+            speculative_method=method,
+            sync_loads=False,
+        )
+
+
+def test_connector_starts_with_dsv41_and_dspark():
+    config = _connector_config(128)
+    config.speculative_config = SimpleNamespace(
+        method="dspark", num_speculative_tokens=5
+    )
+    config.num_lookahead_tokens = 5
+    connector = MaruKVConnector(
+        config,
+        KVConnectorRole.SCHEDULER,
+        dsv41_config(block=128, side="scheduler", drafts=True),
+    )
+    assert connector._scheduler._multi_group
+    assert connector._scheduler._num_lookahead_tokens == 5
+
+
+def _dspark_scheduler(in_flight=2048):
+    """DeepSeek-V4.1 with DSpark as on the GPU: eight 32-token window groups,
+    the 64-token MLA group and the 8-token ring, 5 lookahead tokens, and a
+    model length of 4096."""
+    config = _connector_config(64)
+    config.speculative_config = SimpleNamespace(
+        method="dspark", num_speculative_tokens=5
+    )
+    config.num_lookahead_tokens = 5
+    config.max_in_flight_tokens = in_flight
+    window = _window_mla(32)
+    connector = MaruKVConnector(
+        config,
+        KVConnectorRole.SCHEDULER,
+        dsv41_config(block=64, side="scheduler", window=window, drafts=True, windows=8),
+    )
+    return connector._scheduler, window
+
+
+def _prompt(tokens):
+    return SimpleNamespace(
+        request_id="r", prompt_token_ids=list(range(tokens)), num_tokens=tokens
+    )
+
+
+def test_dspark_admission_counts_the_blocks_of_every_group():
+    """vLLM allocates every group's blocks from one pool, the groups Maru
+    skips included, so a request waiting for KV needs blocks from all of them for
+    its prompt and lookahead: 1,005 tokens take 16 MLA blocks, 32 blocks in
+    each window group, and the ring's one block."""
+    sched, _ = _dspark_scheduler()
+    assert sched._resume_blocks(_prompt(1000)) == 16 + 8 * 32 + 1
+
+
+def test_dspark_admission_caps_the_window_groups_as_vllm_does():
+    """A window group holds at most vLLM's per-request admission cap, the
+    window plus the tokens in flight, however long the prompt."""
+    sched, window = _dspark_scheduler()
+    cap = window.max_admission_blocks_per_request(2048, 4096)
+    assert cap < -(-4005 // 32)
+    assert sched._resume_blocks(_prompt(4000)) == 63 + 8 * cap + 1
 
 
 @pytest.mark.parametrize(
@@ -434,10 +533,9 @@ def test_a_mamba_group_beside_an_mla_group_is_refused(ratio):
 def test_a_refused_model_does_not_first_warn_about_its_chunk(caplog):
     """The support checks run before the chunk is rounded, so a model they
     refuse leaves no warning about its chunk size."""
-    config = _connector_config(128, maru_kv_chunk_tokens=200)
-    config.speculative_config = SimpleNamespace(num_speculative_tokens=1)
+    config = _connector_config(128, maru_kv_chunk_tokens=200, maru_async_load=False)
     with caplog.at_level(logging.WARNING, logger="maru_vllm.connector"):
-        with pytest.raises(ValueError, match="speculative decoding"):
+        with pytest.raises(ValueError, match="maru_async_load=false"):
             MaruKVConnector(
                 config,
                 KVConnectorRole.SCHEDULER,
@@ -1380,13 +1478,17 @@ def test_dsv41_unbounded_lookup_needs_each_windows_chunk_at_the_hit_end():
 
 
 def _check(
-    groups, block_size, use_layerwise=False, speculative=False, sync_loads=False
+    groups,
+    block_size,
+    use_layerwise=False,
+    speculative_method=None,
+    sync_loads=False,
 ):
     check_multi_group_support(
         groups,
         block_size=block_size,
         use_layerwise=use_layerwise,
-        speculative=speculative,
+        speculative_method=speculative_method,
         sync_loads=sync_loads,
     )
 
@@ -1398,7 +1500,7 @@ def test_supported_multi_group_models_pass():
 
 def test_single_group_is_always_accepted():
     single = describe_kv_groups(qwen35_config())[3:]
-    _check(single, 16, use_layerwise=True, speculative=True)
+    _check(single, 16, use_layerwise=True, speculative_method="eagle3")
 
 
 def test_subclass_of_a_supported_spec_is_rejected():
@@ -1421,9 +1523,40 @@ def test_layerwise_is_rejected():
         _check(describe_kv_groups(gpt_oss_config()), 16, use_layerwise=True)
 
 
-def test_speculative_decoding_is_rejected():
-    with pytest.raises(ValueError, match="speculative decoding"):
-        _check(describe_kv_groups(gpt_oss_config()), 16, speculative=True)
+def test_dspark_passes_without_a_mamba_group():
+    _check(describe_kv_groups(gpt_oss_config()), 16, speculative_method="dspark")
+
+
+@pytest.mark.parametrize("method", ["ngram", "eagle3", "mtp", "draft_model"])
+def test_another_speculative_method_is_rejected_with_several_groups(method):
+    with pytest.raises(
+        ValueError, match=f"only with DSpark \\('dspark'\\), not '{method}'"
+    ):
+        _check(describe_kv_groups(gpt_oss_config()), 16, speculative_method=method)
+
+
+def test_dspark_is_rejected_with_a_mamba_group():
+    """vLLM moves an align-mode Mamba state block among a request's last
+    blocks without telling the connector, so a stored state could be a block
+    no kernel wrote."""
+    with pytest.raises(ValueError, match="speculative decoding \\('dspark'\\)"):
+        _check(
+            describe_kv_groups(qwen35_config()),
+            QWEN35_BLOCK,
+            speculative_method="dspark",
+        )
+
+
+def test_another_method_with_a_mamba_group_is_not_told_to_use_dspark():
+    """No speculative decoding works with a Mamba-type group, DSpark
+    included, so the refusal must not point to DSpark."""
+    with pytest.raises(ValueError, match="Mamba-type KV cache group") as refused:
+        _check(
+            describe_kv_groups(qwen35_config()),
+            QWEN35_BLOCK,
+            speculative_method="eagle3",
+        )
+    assert "only with DSpark" not in str(refused.value)
 
 
 @pytest.mark.parametrize("mode", ["none", "all"])
@@ -2704,7 +2837,7 @@ def test_save_kv_layer_leaves_several_groups_to_wait_for_save():
 def test_connector_wait_for_save_hands_several_groups_to_the_worker():
     connector = MaruKVConnector.__new__(MaruKVConnector)
     connector._kv_groups = describe_kv_groups(tiny_config())
-    connector._worker = MagicMock()
+    connector._worker = MagicMock(stores_after_forward=False)
     meta = MaruConnectorMetadata()
     connector._connector_metadata = meta
     connector.wait_for_save()
@@ -2714,6 +2847,11 @@ def test_connector_wait_for_save_hands_several_groups_to_the_worker():
     connector._worker.reset_mock()
     connector.wait_for_save()
     connector._worker.wait_for_save.assert_not_called()
+
+    # One group with DSpark stores after the forward too.
+    connector._worker.stores_after_forward = True
+    connector.wait_for_save()
+    connector._worker.wait_for_save.assert_called_once_with(meta)
 
 
 def test_a_later_step_stores_the_state_at_its_own_end():

@@ -520,7 +520,12 @@ or EAGLE decoding), Maru retains its budget: the upstream reservation counts
 prompt tails but can leave too little room for the oldest request's lookahead.
 Methods without lookahead slots, such as ngram, use the ordinary version rule.
 vLLM 0.31+ reserves the draft slots of every speculative method itself, so a
-load Maru admits can still wait for vLLM's own reservation.
+load Maru admits can still wait for vLLM's own reservation. With several KV
+cache groups, the budget counts a request's blocks in every group, the groups
+Maru does not store included, because vLLM allocates them all from one pool: a
+block per `block_size` tokens in a full-attention or MLA group, at most vLLM's
+per-request admission cap in a sliding-window group, and one block in a
+circular buffer.
 
 This budget counts GPU blocks; `maru_load_admission_window` below counts loads
 in flight.
@@ -528,6 +533,28 @@ in flight.
 `maru_async_store` lets the store finish after the forward pass returns, so
 the first token of the current step is not delayed by the GPU→CXL copy and
 the metadata registration.
+
+With DSpark speculative decoding (`"method": "dspark"`), a model with one KV
+cache group, such as Qwen3-4B with `deepseek-ai/dspark_qwen3_4b_block7`, also
+stores after the drafter runs: vLLM's V2 model runner replays DSpark's draft
+step as a full CUDA graph unless `--enforce-eager`, and a replay calls no
+per-layer connector hook for the draft layers. The target's layers store from
+their hooks as usual, and the layers that called none in the step are stored
+after the drafter, so each chunk holds the draft layers too. The layerwise
+format then stores the draft layers' objects and the chunk's `_DONE` marker;
+the chunkwise format, whose chunk is one object of every layer, stores the
+chunk. A load that overlaps compute (`maru_overlap_load_with_compute`) is
+also awaited for every layer before the drafter runs, so the draft layers do
+not depend on their per-layer hooks to wait for it.
+Engines that share a Maru pool must all run with DSpark or all without it,
+also across restarts. Object keys do not record the draft layers, so a chunk
+stored with one setting is found with the other even though it holds another
+set of layers, and its load can fail. Use a fresh or separate pool when
+switching.
+Other speculative decoding methods store only from the per-layer hooks, as
+without speculative decoding. A method whose draft layers call none, as DFlash's
+likely do since vLLM runs its draft step the way it runs DSpark's, is not
+covered and was not run.
 
 `maru_load_admission_window` bounds how many asynchronous loads may be in
 flight at once. The default `0` submits every load immediately. Set a
@@ -804,7 +831,7 @@ The connector refuses to start a model with several groups unless:
 
 - `maru_storage_backend` is `cxl` (the default) or `remote_cxl`. The CPU and mixed backends take one group only, and remote_cxl takes no MLA model, such as DeepSeek-V4.1.
 - `maru_use_layerwise` is `false` (the default), unless every group the connector stores is an MLA group, as DeepSeek-V4.1's are (see {ref}`vllm-deepseek-v41`).
-- Speculative decoding is off.
+- Speculative decoding is off, or is DSpark (`"method": "dspark"`) on a model without a Mamba-type group, as on DeepSeek-V4.1-Flash (see {ref}`vllm-deepseek-v41`). The connector refuses every other method. It refuses DSpark too with a Mamba-type group: in `align` mode vLLM moves a Mamba state block among the request's last blocks without telling the connector.
 - Mamba-type groups use vLLM's `align` Mamba cache mode. vLLM picks it when prefix caching is on, which is the default. Keep prefix caching on: with `--no-enable-prefix-caching`, vLLM sets the mode to `none` even if `--mamba-cache-mode align` is given, and the connector refuses the model. Do not pass `--mamba-cache-mode all`.
 - The model does not have both Mamba-type groups and MLA groups, as GLM-5.3-Flash does.
 - Every group uses vLLM's one `block_size`, except MLA groups, which may use other block sizes, as DeepSeek-V4.1's do; `maru_kv_chunk_tokens` is then rounded to a multiple of every group's block size. vLLM normally sets the groups up this way.
@@ -847,7 +874,7 @@ vLLM splits the model's KV cache into several groups, how many depending on the 
 - **The sliding-window groups.** With SWA bounded replay (`--swa-bounded-replay`, the default on CUDA with vLLM's V2 model runner), vLLM keeps them out of its prefix cache and, after a hit, recomputes the hit's last 128 tokens to rebuild them; Maru does not store them. With bounded replay off (`--no-swa-bounded-replay`, the V1 model runner, or ROCm), vLLM prefix-caches them, and Maru stores for each chunk the window blocks that a hit at the chunk's end needs.
 - **The KV compressor's circular buffer** is not stored, since vLLM does not prefix-cache it.
 
-Both formats work. The model calls no per-layer connector method, so the layerwise format also stores after the forward and loads before it, without overlapping transfers with compute. With bounded replay on, a 256-token chunk takes one 467,712-byte page on SM120 in the chunkwise format, and about 2.9 times that in the layerwise format, which gives each KV cache and the `_DONE` marker a page of their own. With bounded replay off, each chunk also keeps the sliding windows' last blocks, several times the bytes of the MLA group's. Speculative decoding, which runs the DSpark draft layers in the model's checkpoint, is not supported yet, as for any model with several groups.
+Both formats work. The model calls no per-layer connector method, so the layerwise format also stores after the forward and loads before it, without overlapping transfers with compute. With bounded replay on, a 256-token chunk takes one 467,712-byte page on SM120 in the chunkwise format, and about 2.9 times that in the layerwise format, which gives each KV cache and the `_DONE` marker a page of their own. With bounded replay off, each chunk also keeps the sliding windows' last blocks, several times the bytes of the MLA group's. Speculative decoding works with the DSpark draft layers in the model's checkpoint (`--speculative-config '{"method": "dspark", "num_speculative_tokens": 5}'`; vLLM 0.33.0 does not start without `num_speculative_tokens`); the connector refuses every other speculative decoding method. Each draft layer keeps a sliding window like the target's, and vLLM deals the draft windows into the target's sliding-window groups, splitting the windows into one more group, so Maru skips or stores them with the target's windows. The groups then hold other layers under the same group ids, and object keys do not tell the two layouts apart: run every engine that shares a Maru pool with the same speculative decoding setting.
 
 ```bash
 vllm serve deepseek-ai/DeepSeek-V4.1-Flash-1017 \
