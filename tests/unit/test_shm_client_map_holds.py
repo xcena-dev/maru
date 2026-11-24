@@ -38,7 +38,7 @@ class HoldingRm:
 
     ``requests`` lists what arrived, in order: ("map_hold", region, holder,
     boot_id, pid, pid_start, pid_ns, client_id), ("unhold", region, holder,
-    instance), ("get_access", region), ("free", region).
+    instance), ("get_access", region), ("free", region), ("node_free", region).
     """
 
     def __init__(self, tmp_path, map_hold_status=0, supports_holds=True):
@@ -124,6 +124,9 @@ class HoldingRm:
             elif hdr.msg_type == MsgType.FREE_REQ:
                 self._record("free", region)
                 self._reply(sock, MsgType.FREE_RESP, FreeResp(status=0).pack())
+            elif hdr.msg_type == MsgType.NODE_FREE_REQ:
+                self._record("node_free", region)
+                self._reply(sock, MsgType.NODE_FREE_RESP, FreeResp(status=0).pack())
 
 
 @pytest.fixture
@@ -187,6 +190,18 @@ def test_close_and_free_drop_the_holds(rm):
     assert rm.kinds()[5:] == ["unhold", "unhold"]
     client.close()
     assert len(rm.requests) == 7
+
+
+def test_node_free_drops_the_hold(rm):
+    client = MaruShmClient(address=rm.address)
+    try:
+        client.mmap(_handle(), _RW)
+        client.node_free("gpu-node", "epoch-1", _handle())
+        assert rm.kinds() == ["map_hold", "node_free", "unhold"]
+        client.close()
+        assert len(rm.requests) == 3
+    finally:
+        client.close()
 
 
 def test_two_clients_of_one_process_hold_separately(rm):
@@ -273,15 +288,69 @@ def test_a_resource_manager_without_map_holds_is_asked_once(tmp_path, caplog):
 def test_unhold_failure_does_not_fail_munmap(rm, caplog):
     client = MaruShmClient(address=rm.address)
     mm = client.mmap(_handle(), _RW)
-    # The resource manager goes away: nothing listens at its address.
-    client._address = "127.0.0.1:1"
-    with client._conn_lock:
-        client._close_conn()
+    _lose_rm(client)
     with caplog.at_level(logging.WARNING, logger="maru_shm.client"):
         client.munmap(_handle())
         client.close()
     assert mm.closed
     assert any("could not drop the hold" in r.message for r in caplog.records)
+
+
+def _lose_rm(client):
+    """The resource manager goes away: nothing listens at its address."""
+    address = client._address
+    client._address = "127.0.0.1:1"
+    with client._conn_lock:
+        client._close_conn()
+    return address
+
+
+def test_unholds_the_rm_missed_follow_its_next_answer(rm):
+    client = MaruShmClient(address=rm.address)
+    try:
+        for region in (1, 2, 3):
+            client.mmap(_handle(region), _RW)
+        address = _lose_rm(client)
+        client.munmap(_handle(1))  # Fails, and starts the back-off.
+        client.munmap(_handle(2))  # Within the back-off: not even tried.
+        assert rm.kinds() == ["map_hold"] * 3
+        client._address = address
+        # Still within the back-off, but the resource manager answers again.
+        client.get_access(_handle(3))
+        assert rm.kinds()[3:] == ["get_access", "unhold", "unhold"]
+        assert sorted(r[1] for r in rm.requests[4:]) == [1, 2]
+        client.get_access(_handle(3))  # Nothing pending any more.
+        assert len(rm.requests) == 7
+    finally:
+        client.close()
+
+
+def test_close_drops_the_holds_the_rm_missed(rm):
+    client = MaruShmClient(address=rm.address)
+    client.mmap(_handle(1), _RW)
+    client.mmap(_handle(2), _RW)
+    address = _lose_rm(client)
+    client.munmap(_handle(1))
+    client._address = address
+    client.close()
+    assert rm.kinds()[2:] == ["unhold", "unhold"]
+    assert sorted(r[1] for r in rm.requests[2:]) == [1, 2]
+
+
+def test_a_missed_unhold_is_dropped_when_the_region_is_mapped_again(rm):
+    client = MaruShmClient(address=rm.address)
+    try:
+        client.mmap(_handle(), _RW)
+        address = _lose_rm(client)
+        client.munmap(_handle())
+        client._address = address
+        client.mmap(_handle(), _RW)
+        client.get_access(_handle())
+        # The region is mapped: its hold was asked for again, never dropped.
+        assert rm.kinds() == ["map_hold", "map_hold", "get_access"]
+    finally:
+        client.close()
+    assert rm.kinds()[3:] == ["unhold"]
 
 
 def test_a_forked_child_does_not_drop_the_parents_hold(rm):
