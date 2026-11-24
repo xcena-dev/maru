@@ -6,6 +6,7 @@ import errno
 import json
 import mmap
 import os
+import select
 import socket
 import subprocess
 import sys
@@ -1266,12 +1267,18 @@ def test_writer_recovers_on_new_run_with_same_staging(pair):
     assert writer.batch_exists(["old", "new"]) == [False, True]
 
 
+@pytest.mark.parametrize("return_credit", [False, True])
 def test_reserve_finishing_after_exit_never_grants_or_fences_siblings_domain(
-    pair, monkeypatch
+    pair, monkeypatch, return_credit
 ):
     service = pair.gpu.store
     sibling, _ = pair.raw()
     grant = sibling.credit(PAGE)
+    if return_credit:
+        returned = sibling.request(
+            NodeMessageType.CREDIT_RETURN, CreditReturnRequest(grant.credits)
+        )
+        assert returned.items[0].result == ItemResult.OK
     worker, _ = pair.raw()
     with pause_call(
         monkeypatch,
@@ -1287,7 +1294,7 @@ def test_reserve_finishing_after_exit_never_grants_or_fences_siblings_domain(
         service.workers._worker_exited(worker.incarnation)
         resume.set()
     wait_until(lambda: worker.incarnation not in service._agents)
-    assert set(service._credits) == set(grant.credits)
+    assert set(service._credits) == (set() if return_credit else set(grant.credits))
     assert service.workers.domains["instance"] == grant.write_agent.domain
     assert grant.write_agent.domain not in pair.memory.role.parts._closed_domains
     assert sibling.credit(PAGE).credits
@@ -1513,3 +1520,84 @@ def test_mixed_write_done_keeps_rejected_credit_until_fenced(
     assert pair.memory.pools.bytes_in(PageState.QUARANTINED) == (
         len(retained) * PAGE if fence_fails else 0
     )
+
+
+def test_exit_before_first_grant_releases_writer_capacity(pair, monkeypatch):
+    service = pair.gpu.store
+    parts = pair.memory.role.parts
+    monkeypatch.setattr(parts, "domains_max", 1)
+    reserved, resume = threading.Event(), threading.Event()
+    call = service.remote.call
+    cancelled = []
+
+    def hold_reply(code, request, **kwargs):
+        answer = call(code, request, **kwargs)
+        if code == RemoteMessageType.RESERVE and not reserved.is_set():
+            assert len(answer.credits) == 4
+            reserved.set()
+            assert resume.wait(10)
+        if code == RemoteMessageType.CANCEL:
+            assert answer.freed == len(request.locations)
+            cancelled.extend(request.locations)
+        return answer
+
+    monkeypatch.setattr(service.remote, "call", hold_reply)
+    script = """
+import json, sys
+from types import SimpleNamespace
+from maru_common.config import MaruConfig
+from maru_handler.client import worker_rdma
+from maru_handler.client.maru_client import MaruClient
+
+def transport(config, name):
+    print(json.dumps([name, client.identity.incarnation]), flush=True)
+    metadata = bytes.fromhex(input())
+    return SimpleNamespace(
+        register=lambda *args: None, metadata=lambda: metadata,
+        add_peer=lambda metadata, *, peer: peer,
+    )
+
+worker_rdma._transport = transport
+config = MaruConfig(
+    maru_node=sys.argv[1], instance_id="child", engine_id="child",
+    cache_namespace="ns", chunk_size_bytes=int(sys.argv[2]), pin_pools=False,
+    auto_connect=False,
+)
+client = MaruClient(config, rpc_timeout_s=10)
+client.connect()
+"""
+    with subprocess.Popen(
+        [sys.executable, "-c", script, pair.config.socket, str(PAGE)],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        text=True,
+    ) as child:
+        try:
+            assert select.select([child.stdout], [], [], 10)[0]
+            name, incarnation = json.loads(child.stdout.readline())
+            # The fake NIC resolves metadata within one process.
+            agent = FakeTransport(name)
+            try:
+                child.stdin.write(agent.metadata().hex() + "\n")
+                child.stdin.flush()
+                assert reserved.wait(5)
+                (domain,) = parts._writers
+                rec = service.workers.get(incarnation)
+                child.kill()
+                child.wait(5)
+                wait_until(lambda: rec.exited)
+                resume.set()
+                wait_until(lambda: incarnation not in service._agents)
+            finally:
+                agent.close()
+        finally:
+            resume.set()
+            if child.poll() is None:
+                child.kill()
+    assert len(set(cancelled)) == 4
+    assert not service._credits
+    assert pair.memory.pools.bytes_in(PageState.CREDITED) == 0
+    assert domain in parts._closed_domains and not parts._writers
+    later = pair.client("next")
+    assert later.credits.unused_bytes == 4 * PAGE
+    assert later.batch_store(["next"], [later.alloc(PAGE)]) == [True]

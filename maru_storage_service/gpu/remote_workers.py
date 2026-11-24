@@ -91,6 +91,12 @@ class RemoteWorkers(WorkerRegistry):
             del self.domains[domain.instance]
             return True
 
+    def withdraw_unissued(self, domain):
+        with self._lock:
+            if any(domain in worker.issued for worker in self._workers.values()):
+                return False
+            return self.withdraw(domain)
+
     def _terminal(self, rec):
         if rec.detached:
             return

@@ -403,6 +403,8 @@ class RemoteWorkerOps(WorkerOps):
                 self._cancel(rec, got.credits)
                 if not any(c in self._credits for c in got.credits):
                     self._reserves.pop(key, None)
+                    if self.workers.withdraw_unissued(domain):
+                        self._fence(domain)
                 return CreditResponse(Status.REJECTED, error="write domain ended")
         else:
             self._reserves.pop(key, None)
