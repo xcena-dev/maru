@@ -367,6 +367,24 @@ def test_namespace_tracks_revision_and_kv_dtype():
     assert a != _node_engine_config(node_extra(), config)["maru_cache_namespace"]
 
 
+@pytest.mark.parametrize("dtype", ["fp8", "fp8_e4m3", "fp8_e5m2"])
+def test_node_requires_fixed_fp8_kv_scales(dtype):
+    config = node_vllm_config()
+    config.cache_config.cache_dtype = dtype
+    fixed = _node_engine_config(node_extra(), config)
+    config.cache_config.calculate_kv_scales = False
+    assert _node_engine_config(node_extra(), config) == fixed
+    config.cache_config.calculate_kv_scales = True
+    with pytest.raises(ValueError, match="calculate_kv_scales"):
+        _node_engine_config(node_extra(), config)
+
+
+def test_node_accepts_non_fp8_kv_with_scale_calculation_enabled():
+    config = node_vllm_config()
+    config.cache_config.calculate_kv_scales = True
+    assert _node_engine_config(node_extra(), config)["maru_cache_namespace"]
+
+
 def test_namespace_tracks_quantization():
     config = engine_config()
     plain = _node_engine_config(node_extra(), config)["maru_cache_namespace"]

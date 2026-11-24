@@ -971,6 +971,14 @@ def _node_engine_config(
         )
     # No key names a pipeline stage's layers or a context-parallel rank's tokens
     _validate_cxl_parallelism(getattr(config, "parallel_config", None))
+    cache = config.cache_config
+    if cache.cache_dtype.startswith("fp8") and getattr(
+        cache, "calculate_kv_scales", False
+    ):
+        raise ValueError(
+            "maru_node requires calculate_kv_scales=False for FP8 KV caches: "
+            "runtime scales can differ between engines"
+        )
     digest = _namespace_digest(extra, config, kv_groups, "maru_node")
     return {
         **extra,
