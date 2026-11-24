@@ -47,6 +47,9 @@ enum class MsgType : uint16_t {
   NODE_HOLD_RESP = 28,
   NODE_HOLDS_REQ = 29,
   NODE_HOLDS_RESP = 30,
+  // A process holds a region it maps. An RM without it answers -ENOSYS.
+  MAP_HOLD_REQ = 31,
+  MAP_HOLD_RESP = 32,
   ERROR_RESP = 255
 };
 
@@ -166,6 +169,22 @@ struct NodeHoldReq {
   uint64_t pidNs;
 };
 
+/// A process maps a region (a node's workers send NODE_HOLD instead, which
+/// also checks the node's run). Followed by the holder (a name of that process, unique to it)
+/// and boot ID bytes, then client_id (required: its host part is the
+/// process's host) and request id. pid, pidStart and pidNs as in NodeHoldReq.
+/// Answered with a GetAccessResp payload (MAP_HOLD_RESP), as HOLD; UNHOLD
+/// with instance = holder drops the hold.
+struct MapHoldReq {
+  Handle handle;
+  uint32_t holderLen;
+  uint32_t bootIdLen;
+  uint32_t pid;
+  uint32_t reserved;
+  uint64_t pidStart;
+  uint64_t pidNs;
+};
+
 /// Followed by the RM ID bytes, then numRegions NodeRegionInfo entries.
 struct NodeClaimResp {
   int32_t status;
@@ -252,6 +271,7 @@ static_assert(sizeof(NodeAllocReq) == 24, "NodeAllocReq must be 24 bytes (fixed 
 static_assert(sizeof(NodeFreeReq) == 40, "NodeFreeReq must be 40 bytes (fixed part)");
 static_assert(sizeof(NodeClaimResp) == 24, "NodeClaimResp must be 24 bytes (fixed part)");
 static_assert(sizeof(NodeHoldReq) == 72, "NodeHoldReq must be 72 bytes (fixed part)");
+static_assert(sizeof(MapHoldReq) == 64, "MapHoldReq must be 64 bytes (fixed part)");
 static_assert(sizeof(NodeRegionInfo) == 56, "NodeRegionInfo must be 56 bytes (fixed part)");
 static_assert(sizeof(NodeHolderInfo) == 40, "NodeHolderInfo must be 40 bytes (fixed part)");
 static_assert(sizeof(NodeRenewResp) == 16, "NodeRenewResp must be 16 bytes");

@@ -122,11 +122,11 @@ sequenceDiagram
 
 ### 3.2 Client Crash Recovery
 
-Process exit, session expiry and network loss are different events. The legacy `cxl` region owner tracked by the RM is usually MaruServer, not each GPU worker. Local owners can be checked by PID/start time; remote owners use connection state and a grace period. A timeout alone does not prove that NIC access or a worker's exported views have ended.
+Process exit, session expiry and network loss are different events. The legacy `cxl` region owner tracked by the RM is usually MaruServer. The RM checks local owners by PID and start time and tracks remote owners through their connections and a grace period. A worker can still use its mapping after the owner loses the allocation. The RM keeps the range out of use while any mapping or NIC registration holds it (see {doc}`maru_resource_manager`, §5).
 
 | Component | Detection | Reclamation |
 |-----------|-----------|-------------|
-| Resource Manager | Local liveness or remote disconnect/grace period | Ends allocation ownership; a held range remains draining until deregistration is confirmed |
+| Resource Manager | Local liveness or remote disconnect/grace period | Ends allocation ownership; a held range remains draining until every NIC registration is confirmed gone and every process that maps it has unmapped it or ended |
 | Legacy `cxl` registry | Owner disconnect and KV ref counts | Defers return while registered keys still reference the region |
 | Node Catalog | Worker/run identity and source pins | Keeps orphan pins while old workers can still read |
 | Memory node | Worker loss, uncertain write, lost connection or a silent GPU-node run | Revokes the instance's write registration within its GPU-node run before reclaiming that domain's pages; failed revocation quarantines them |

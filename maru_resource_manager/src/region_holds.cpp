@@ -49,7 +49,7 @@ static bool parseNumber(const std::string &text, uint64_t max, uint64_t &out) {
     return true;
 }
 
-// " <node_epoch> <host> <boot_id|-> <pid> <pid_start> <pid_ns>" of a worker.
+// " <node_epoch|-> <host> <boot_id|-> <pid> <pid_start> <pid_ns>" of a process.
 static bool parseWorkerFields(const std::vector<std::string> &fields, HoldRecord &hold) {
     uint64_t pid = 0;
     if (!validHoldName(fields[4]) || !validHoldName(fields[5]) || !validHoldName(fields[6]) ||
@@ -57,7 +57,7 @@ static bool parseWorkerFields(const std::vector<std::string> &fields, HoldRecord
         !parseNumber(fields[8], UINT64_MAX, hold.pidStart) ||
         !parseNumber(fields[9], UINT64_MAX, hold.pidNs))
         return false;
-    hold.nodeEpoch = fields[4];
+    hold.nodeEpoch = fields[4] == "-" ? "" : fields[4];
     hold.host = fields[5];
     hold.bootId = fields[6] == "-" ? "" : fields[6];
     hold.pid = static_cast<uint32_t>(pid);
@@ -107,7 +107,7 @@ int loadRegionHolds(const std::string &stateDir, RegionHolds &holds,
         if (!valid) {
             logf(LogLevel::Error,
                  "%s:%zu: malformed record '%s'; fix or restore the file (removing a hold "
-                 "lets a remote agent's late write reach the region's next owner)",
+                 "lets its holder's late write reach the region's next owner)",
                  path.c_str(), number, line.c_str());
             return -EINVAL;
         }
@@ -126,9 +126,9 @@ int saveRegionHolds(const std::string &stateDir, const RegionHolds &holds,
     for (const auto &[region, holders] : holds)
         for (const auto &[holder, hold] : holders) {
             text += "hold " + std::to_string(region) + " " + holder + " " + hold.instance;
-            if (hold.worker())
-                text += " " + hold.nodeEpoch + " " + hold.host + " " +
-                        (hold.bootId.empty() ? "-" : hold.bootId) + " " +
+            if (hold.ofProcess())
+                text += " " + (hold.nodeEpoch.empty() ? "-" : hold.nodeEpoch) + " " +
+                        hold.host + " " + (hold.bootId.empty() ? "-" : hold.bootId) + " " +
                         std::to_string(hold.pid) + " " + std::to_string(hold.pidStart) + " " +
                         std::to_string(hold.pidNs);
             text += "\n";

@@ -261,6 +261,30 @@ GetAccessResult RequestHandler::handleNodeHold(const NodeHoldReq &req, const std
     return result;
 }
 
+GetAccessResult RequestHandler::handleMapHold(const MapHoldReq &req, const std::string &holder,
+                                              const std::string &bootId,
+                                              const std::string &clientId) {
+    GetAccessResult result;
+    HoldRecord who;
+    who.host = hostOf(clientId);
+    who.bootId = bootId;
+    who.pid = req.pid;
+    who.pidStart = req.pidStart;
+    who.pidNs = req.pidNs;
+    std::string path;
+    result.status = pm_.mapHold(req.handle, holder, who, path);
+    if (result.status == 0) {
+        result.devicePath = path;
+        result.deviceUuid = pm_.getDeviceUuidForRegion(req.handle.regionId);
+        result.offset = req.handle.offset;
+        result.length = req.handle.length;
+    } else {
+        logf(LogLevel::Warn, "[MAP_HOLD] region_id=%llu holder=%s -> FAILED (status=%d)",
+             (unsigned long long)req.handle.regionId, holder.c_str(), result.status);
+    }
+    return result;
+}
+
 AllocResult RequestHandler::handleNodeAlloc(const NodeAllocReq &req, const std::string &nodeId,
                                             const std::string &epoch,
                                             const std::string &daxPath) {

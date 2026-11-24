@@ -6,6 +6,7 @@ Tests use a mock TCP server with ephemeral ports to verify client behavior
 without requiring a running Maru Resource Manager.
 """
 
+import errno
 import os
 import socket
 import tempfile
@@ -76,10 +77,22 @@ class MockResourceManagerServer:
 
 
 def _recv_request(sock):
-    """Read request header + payload from socket. Returns (MsgHeader, bytes)."""
-    hdr = MsgHeader.unpack(read_full(sock, HEADER_SIZE))
-    payload = read_full(sock, hdr.payload_len) if hdr.payload_len > 0 else b""
-    return hdr, payload
+    """Read request header + payload from socket. Returns (MsgHeader, bytes).
+
+    The mock resource managers of this file predate MAP_HOLD and refuse it as
+    such a resource manager does, so mmap() gets its access the earlier way;
+    test_shm_client_map_holds.py covers a resource manager that holds.
+    """
+    while True:
+        hdr = MsgHeader.unpack(read_full(sock, HEADER_SIZE))
+        payload = read_full(sock, hdr.payload_len) if hdr.payload_len > 0 else b""
+        if hdr.msg_type != MsgType.MAP_HOLD_REQ:
+            return hdr, payload
+        _send_response(
+            sock,
+            MsgType.ERROR_RESP,
+            ErrorResp(status=-errno.ENOSYS, message="unknown request"),
+        )
 
 
 def _send_response(sock, msg_type, resp):

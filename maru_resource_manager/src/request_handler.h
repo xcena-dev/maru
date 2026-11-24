@@ -63,6 +63,9 @@ public:
     /// Region holds of a remote agent: holder = node ID, instance = epoch.
     GetAccessResult handleHold(const HoldReq &req, const std::string &holder,
                                const std::string &instance);
+    /// A process's hold of a region it maps; its host is client_id's.
+    GetAccessResult handleMapHold(const MapHoldReq &req, const std::string &holder,
+                                  const std::string &bootId, const std::string &clientId);
     UnholdResp handleUnhold(const UnholdReq &req, const std::string &holder,
                             const std::string &instance);
     ResetHoldsResp handleResetHolds(const std::string &holder, const std::string &instance);

@@ -63,8 +63,10 @@ All messages use a fixed-size binary header (12 bytes) containing protocol magic
 | `ALLOC_REQ` / `ALLOC_RESP` | client ↔ server | Allocate shared memory; response includes handle + device path |
 | `FREE_REQ` / `FREE_RESP` | client ↔ server | Free allocation (requires valid auth token) |
 | `GET_ACCESS_REQ` / `GET_ACCESS_RESP` | client ↔ server | Request device path + offset + length for an existing allocation |
-| `HOLD_REQ` / `HOLD_RESP` | client ↔ server | `GET_ACCESS` that also records a hold: a memory-node service holds every CXL region it registers with its NIC (§5) |
-| `UNHOLD_REQ` / `UNHOLD_RESP` | client ↔ server | The holder deregistered the region (requires the handle) |
+| `HOLD_REQ` / `HOLD_RESP` | client ↔ server | Get access and record a hold for a named holder and instance |
+| `NODE_HOLD_REQ` / `NODE_HOLD_RESP` | client ↔ server | Get access for a node service or worker and record its process identity and current node run (§5) |
+| `MAP_HOLD_REQ` / `MAP_HOLD_RESP` | client ↔ server | Get access and record the mapping client's process identity (§5) |
+| `UNHOLD_REQ` / `UNHOLD_RESP` | client ↔ server | Drop the holder's hold after deregistration or unmapping (requires the handle) |
 | `RESET_HOLDS_REQ` / `RESET_HOLDS_RESP` | client ↔ server | A restarted holder drops the holds of its earlier process |
 | `STATS_REQ` / `STATS_RESP` | client ↔ server | Query per-pool statistics |
 | `ERROR_RESP` | server → client | Error with status code and message |
@@ -143,7 +145,7 @@ An owner counts as gone only when it is a local process whose PID no longer exis
 
 ## 5. Reaper
 
-The Reaper periodically checks the liveness of each allocation's owner process. If the process no longer exists, its allocations are reclaimed — extents are returned to the free list and the allocation is removed from the map.
+The Reaper periodically checks the liveness of each allocation's owner process. When the process exits, the RM reclaims its allocations. A held allocation drains before its extent returns to the free list.
 
 To defend against **PID reuse**, the server caches each client's process start time at allocation time. If the OS reports the process as alive but the current start time differs from the cached value, the PID has been recycled by the kernel, and the allocations are reclaimed.
 
@@ -155,6 +157,12 @@ Local vs. remote is determined by comparing the client's hostname (from `client_
 
 **Held regions.** A node service or worker holds CXL regions while mappings or NIC registrations can access them. Returning an allocation does not override a hold: the region becomes *draining*, `GET_ACCESS` refuses it, and its range stays out of the free list until the final hold ends. Services remove NIC registrations before releasing their holds, so late RDMA writes cannot target reused ranges. Node ownership and process identity protect restart adoption; a live old worker can keep an earlier run's range held. Holds survive Resource Manager restart. If a holder is gone permanently, `maru-rm-ctl drop-holds HOLDER --confirm` removes its holds. See {doc}`node_storage_service` for source pins and write-domain fencing.
 
+**Mapped regions.** A `cxl` Handler can still access a region after MaruServer returns it. `MaruShmClient.mmap()` takes a durable `MAP_HOLD` before opening the device. Each client in a process has its own holder name (`mmap:<host>:<pid>:<id>`). `munmap()`, `free()` and `close()` drop the hold after the mapping closes. If exported buffers prevent closure, the hold stays until process exit. A Handler keeps mappings it opened to read other instances' regions until it closes. A forked child inherits the mapping, but its protection ends when the parent's hold ends. A child needs its own client for new mappings.
+
+A map hold records the host, boot ID, PID, process start time and PID namespace. On the same boot, the reaper drops a local process's hold after confirming exit and observing `--hold-grace` (default 5 s). A container must share the RM's hostname and PID namespace for this check. The RM also recognizes holds from an earlier local boot. For a process the RM cannot check, use the holder name from `maru-rm-ctl allocations` with `drop-holds` once the process is gone. A client retries an unconfirmed drop when it communicates with the RM again and when it closes.
+
+With an RM that predates `MAP_HOLD`, the client logs a warning and maps without a hold. When opening a new mapping, it checks for support at most once every 60 s. Once an upgraded RM accepts a map hold, the client also requests holds for its existing unprotected mappings. A client that only reuses cached mappings stays unprotected until it opens a new mapping or restarts.
+
 ---
 
 ## 6. Security
@@ -165,7 +173,7 @@ The secret is generated on first start and persisted to the state directory. On 
 
 **Owner verification** ensures that clients can only free their own allocations — the `client_id` (`hostname:pid`) is recorded at allocation time and must match the freeing client's identity. Note that `client_id` is self-reported by the client; it provides ownership tracking rather than authentication. The auth token is cryptographically bound to the `client_id`, so forging a valid token requires knowing both the Handle fields and the server-side secret.
 
-**PID reuse tracking:** The Reaper compares local process start times and uses a disconnect grace period for remote clients. This controls allocation ownership; valid handles may also be held by metadata services or readers. NIC registrations have the separate RM hold/draining lifetime described in §5.
+**PID reuse tracking:** The Reaper compares local process start times and uses a disconnect grace period for remote clients. This controls allocation ownership; valid handles may also be held by metadata services or readers. NIC registrations and mappings have the separate RM hold/draining lifetime described in §5.
 
 **Device permissions:** Since clients open device paths directly (instead of receiving FDs from the server), client processes must have read/write access to the CXL device files. Configure via `chmod` or group-based permissions.
 

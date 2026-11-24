@@ -727,6 +727,44 @@ bool TcpServer::handleOneRequest(int clientFd) {
                 return false;
             }
         }
+    } else if (type == MsgType::MAP_HOLD_REQ) {
+        // Holder and boot ID follow the fixed part, then client_id (required:
+        // it names the process's host) and request id. Idempotent, as HOLD.
+        MapHoldReq req{};
+        if (payload.size() < sizeof(req)) {
+            sendError(clientFd, -EPROTO, "bad map hold req");
+            return false;
+        }
+        std::memcpy(&req, payload.data(), sizeof(req));
+        std::string holder, bootId;
+        size_t namesEnd = 0;
+        if (!parseHoldNames(payload, sizeof(req), req.holderLen, req.bootIdLen, holder, bootId,
+                            namesEnd)) {
+            sendError(clientFd, -EPROTO, "bad map hold req: holder or boot ID truncated");
+            return false;
+        }
+        size_t cidEnd = 0;
+        std::string cid = parseClientId(payload, namesEnd, cidEnd);
+        if (cid.empty()) {
+            sendError(clientFd, -EINVAL, "missing client_id");
+            return true;
+        }
+        if (!trackClientId(clientFd, cid)) {
+            sendError(clientFd, -EPERM, "client_id mismatch on connection");
+            return false;
+        }
+        auto result = handler_.handleMapHold(req, holder, bootId, cid);
+        if (result.status == -EACCES) {
+            sendError(clientFd, -EACCES, "invalid auth token");
+            return true;  // protocol error, but keep connection open
+        }
+        auto respPayload = serializeGetAccessResp(
+            result.status, result.devicePath, result.offset, result.length,
+            result.deviceUuid);
+        if (sendResp(clientFd, MsgType::MAP_HOLD_RESP,
+                     respPayload.data(), respPayload.size()) != 0) {
+            return false;
+        }
     } else if (type == MsgType::NODE_CLAIM_REQ || type == MsgType::NODE_ALLOC_REQ ||
                type == MsgType::NODE_FREE_REQ || type == MsgType::NODE_RENEW_REQ ||
                type == MsgType::NODE_RELEASE_REQ || type == MsgType::NODE_HOLD_REQ ||
