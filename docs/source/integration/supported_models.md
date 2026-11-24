@@ -14,46 +14,41 @@ On the `cxl` storage backend (the default) and the `remote_cxl` backend:
    :class: maru-supported-models
    :widths: auto
 
-   +--------------------------------+------------------------------------+-----------------+-----------------+-----------------------------------+
-   | KV cache structure             | Models                             | Supported status                  | Supported models                  |
-   |                                |                                    +-----------------+-----------------+                                   |
-   |                                |                                    | Single GPU      | Tensor parallel |                                   |
-   +================================+====================================+=================+=================+===================================+
-   | Full attention (MHA, GQA), one | Llama 3.1, Qwen3 (dense and MoE)   | 🟢              | 🟢              | | Llama-3.1-8B                    |
-   | KV cache group                 |                                    |                 |                 | | Qwen3-0.6B                      |
-   |                                |                                    |                 |                 | | Qwen3-30B-A3B                   |
-   +--------------------------------+------------------------------------+-----------------+-----------------+-----------------------------------+
-   | Sliding window + full          | gpt-oss                            | 🟢              | 🟢              | | gpt-oss-20b                     |
-   | attention                      |                                    |                 |                 |                                   |
-   +--------------------------------+------------------------------------+-----------------+-----------------+-----------------------------------+
-   | Gated DeltaNet (Mamba-type) +  | Qwen3.5, Qwen3.6, Qwen3.8 (except  | 🟢              | 🟢              | | Qwen3.5-0.8B                    |
-   | full attention                 | Flash-Next), Qwen3-Next            |                 |                 | | Qwen3.6-35B-A3B-FP8             |
-   |                                |                                    |                 |                 | | Qwen3.8-27B-FP8                 |
-   |                                |                                    |                 |                 | | Qwen3-Next-80B-A3B-Instruct-FP8 |
-   +--------------------------------+------------------------------------+-----------------+-----------------+-----------------------------------+
-   | Sliding-window MLA +           | DeepSeek-V4.1-Flash                | 🟢              | 🟢              | | DeepSeek-V4.1-Flash             |
-   | compressed MLA latent and      |                                    |                 |                 |                                   |
-   | indexer cache                  |                                    |                 |                 |                                   |
-   +--------------------------------+------------------------------------+-----------------+-----------------+-----------------------------------+
-   | Attention groups whose KV      | Gemma 4, MiMo-V2                   | ❌              | ❌              |                                   |
-   | heads differ in count or size  |                                    |                 |                 |                                   |
-   +--------------------------------+------------------------------------+-----------------+-----------------+-----------------------------------+
-   | DSA: MLA latent + indexer      | DeepSeek-V3.2, GLM-5               | ❌              | ❌              |                                   |
-   | cache                          |                                    |                 |                 |                                   |
-   +--------------------------------+------------------------------------+-----------------+-----------------+-----------------------------------+
-   | Kimi Delta Attention           | GLM-5.3-Flash                      | ❌              | ❌              |                                   |
-   | (Mamba-type) + DSA             |                                    |                 |                 |                                   |
-   +--------------------------------+------------------------------------+-----------------+-----------------+-----------------------------------+
-   | Chunked local + full attention | Llama 4                            | ❌              | ❌              |                                   |
-   +--------------------------------+------------------------------------+-----------------+-----------------+-----------------------------------+
+   +--------------------------------+------------------------------------+-----------------+-----------------+
+   | KV cache structure             | Models                             | Supported status                  |
+   |                                |                                    +-----------------+-----------------+
+   |                                |                                    | Single GPU      | Tensor parallel |
+   +================================+====================================+=================+=================+
+   | Full attention (MHA, GQA), one | Llama 3.1, Qwen3 (dense and MoE)   | 🟢              | 🟢              |
+   | KV cache group                 |                                    |                 |                 |
+   +--------------------------------+------------------------------------+-----------------+-----------------+
+   | Sliding window + full          | gpt-oss                            | 🟢              | 🟢              |
+   | attention                      |                                    |                 |                 |
+   +--------------------------------+------------------------------------+-----------------+-----------------+
+   | Gated DeltaNet (Mamba-type) +  | Qwen3.5, Qwen3.6, Qwen3.8 (except  | 🟢              | 🟢              |
+   | full attention                 | Flash-Next), Qwen3-Next            |                 |                 |
+   +--------------------------------+------------------------------------+-----------------+-----------------+
+   | Sliding-window MLA +           | DeepSeek-V4.1-Flash                | 🟢              | 🟢              |
+   | compressed MLA latent and      |                                    |                 |                 |
+   | indexer cache                  |                                    |                 |                 |
+   +--------------------------------+------------------------------------+-----------------+-----------------+
+   | Attention groups whose KV      | Gemma 4, MiMo-V2                   | ❌              | ❌              |
+   | heads differ in count or size  |                                    |                 |                 |
+   +--------------------------------+------------------------------------+-----------------+-----------------+
+   | DSA: MLA latent + indexer      | DeepSeek-V3.2, GLM-5               | ❌              | ❌              |
+   | cache                          |                                    |                 |                 |
+   +--------------------------------+------------------------------------+-----------------+-----------------+
+   | Kimi Delta Attention           | GLM-5.3-Flash                      | ❌              | ❌              |
+   | (Mamba-type) + DSA             |                                    |                 |                 |
+   +--------------------------------+------------------------------------+-----------------+-----------------+
+   | Chunked local + full attention | Llama 4                            | ❌              | ❌              |
+   +--------------------------------+------------------------------------+-----------------+-----------------+
 
 ```
 
 🟢 means that Maru stores and loads the KV cache of such models, and ❌ that
-the connector refuses them at startup. "Supported models" lists the models
-that have been run with their own weights while Maru stored and loaded their
-KV cache. The other models of a row share its KV cache structure but have not
-been run. Models with
+the connector refuses them at startup. Each model family in a 🟢 row has been
+run with its own weights while Maru stored and loaded its KV cache. Models with
 several KV cache groups also need the settings in {ref}`vllm-hybrid-models`;
 DeepSeek-V4.1-Flash has notes of its own in {ref}`vllm-deepseek-v41`.
 
