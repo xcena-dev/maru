@@ -11,7 +11,7 @@ import sys
 import pytest
 
 from maru_common.protocol import MessageType
-from maru_common.storage_types import CloseMode, Key
+from maru_common.storage_types import CloseMode, Key, Status
 from maru_storage_service.cli import EXIT_START
 from maru_storage_service.drivers import dram
 from maru_storage_service.pool_manager import PageState
@@ -206,8 +206,22 @@ def test_storage_service_restart(fake, sockdir, agents):
         assert x.call("retrieve", key="x1", timeout=2) is None
         assert len(fake.requests(MessageType.LOOKUP_AND_PIN)) == requests
         assert x.call("state")["session_node_epoch"] == first.node_epoch
+        with fake._lock:
+            beats = len(fake.requests(MessageType.WORKER_HEARTBEAT))
+            opens = len(fake.requests(MessageType.WORKER_OPEN))
+            fake.fail_requests(MessageType.WORKER_HEARTBEAT, Status.EPOCH, count=2)
+        wait_until(
+            lambda: (
+                len(fake.requests(MessageType.WORKER_HEARTBEAT)) >= beats + 3
+                or len(fake.requests(MessageType.WORKER_OPEN)) > opens
+            )
+        )
+        assert len(fake.requests(MessageType.WORKER_OPEN)) == opens
         x.call("free_held", name="copy")
         wait_until(lambda: x.call("state")["session_node_epoch"] == second.node_epoch)
+        assert [
+            r.node_epoch for r in fake.requests(MessageType.WORKER_OPEN)[opens:]
+        ] == [second.node_epoch]
         assert x.call("retrieve", key="x1", hold=False) == value("x1")
         second.pools.check()
     finally:

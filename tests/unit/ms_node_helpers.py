@@ -53,6 +53,25 @@ def wait_until(pred, timeout: float = 10.0, interval: float = 0.01, what: str = 
         time.sleep(interval)
 
 
+def exit_before_orphan_drain(node, child, incarnation, monkeypatch):
+    """Exit the child and return the callback scheduled for the drain grace."""
+    workers = node.store.workers
+    orphans = node.role.orphans
+    timers = []
+    monkeypatch.setattr(
+        workers, "_after", lambda delay, fn, *args: timers.append((delay, fn, args))
+    )
+    assert workers.get(incarnation) is None
+    child.kill()
+    child.wait(5)
+    wait_until(lambda: incarnation not in orphans.pending)
+    with orphans.lock:
+        assert len(timers) == 1
+        delay, fn, args = timers[0]
+    assert delay == workers.gpu_drain_grace_s > 0
+    return lambda: fn(*args)
+
+
 def listening(path: str) -> bool:
     """A probe connect succeeds (the file exists before listen())."""
     probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)

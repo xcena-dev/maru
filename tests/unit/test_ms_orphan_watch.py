@@ -9,10 +9,12 @@ import threading
 from contextlib import ExitStack
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 
 from maru_common.node_protocol import process_identity
+from maru_common.protocol import MessageType
 from maru_common.storage_types import (
     ItemResult,
     KeptCause,
@@ -27,6 +29,7 @@ from tests.unit.ms_node_helpers import (
     Agent,
     FakeRm,
     MetadataServer,
+    exit_before_orphan_drain,
     node_config,
     publish,
     remove_tree,
@@ -40,8 +43,11 @@ from tests.unit.ms_node_helpers import (
 def test_orphan_uses_three_way_process_evidence(evidence):
     boot, pid, start, ns = process_identity()
     reports = []
+    drains = []
     workers = SimpleNamespace(
-        watch_process=lambda *args: evidence, on_process_exit=lambda key: set()
+        watch_process=lambda *args: evidence,
+        on_process_exit=lambda key: set(),
+        after_gpu_drain=lambda fn, orphan: drains.append((fn, orphan)),
     )
     watch = OrphanWatch(
         SimpleNamespace(_queue_exit=reports.append, workers=workers), boot
@@ -58,6 +64,9 @@ def test_orphan_uses_three_way_process_evidence(evidence):
         assert not reports
         watch.on_process_exit(process_key(pid, start))
         watch.on_process_exit(process_key(pid, start))
+    assert not reports
+    for fn, orphan in drains:
+        fn(orphan)
     assert sorted(r.incarnation for r in reports) == ["a", "b"]
 
 
@@ -98,30 +107,39 @@ def test_node_open_orphans_are_read_through_every_cursor():
 
 
 @pytest.mark.parametrize("attach_probe", [False, True])
-def test_local_cxl_orphan_pin_is_kept_until_the_old_worker_exits(attach_probe):
+def test_local_cxl_orphan_pin_is_kept_through_drain(
+    attach_probe, monkeypatch, tmp_path
+):
     directory = short_tmpdir()
     catalog = MetadataServer()
     rm = FakeRm()
-    config = node_config(catalog.address, f"{directory}/node.sock", cxl_pages=16)
+    config = node_config(
+        catalog.address, f"{directory}/node.sock", cxl_pages=16, region_pages=16
+    )
     nodes = []
     child = None
     script = """
 import json, sys
 sys.path.insert(0, sys.argv[2])
-from ms_node_helpers import RawWorker
+from ms_node_helpers import PAGE, RawWorker
+from ms_worker_agent import _map_cxl_from
+from maru_common.config import MaruConfig
 from maru_common.node_protocol import DetachRequest, NodeMessageType
-from maru_common.storage_types import Key, SessionRole
-from maru_handler.client.server_conn import ServerConn, WorkerIdentity
-w = RawWorker(sys.argv[1])
-a = w.attach()
-assert a.status.value == "OK"
-s = ServerConn(a.server, WorkerIdentity("raw", 0, 0, w.incarnation, "ns"), node_id=a.node_id, node_epoch=a.node_epoch, pid=a.pid, pid_start=a.pid_start, timeout_s=1)
-s.open()
-hit = s.lookup_and_pin([Key("ns", "kv")])[0][0]
-assert hit.result.value == "HIT"
-print(json.dumps({"pin": hit.pin_id, "incarnation": w.incarnation}), flush=True)
+from maru_common.storage_types import SessionRole
+from maru_handler import MaruHandler
+_map_cxl_from(json.loads(sys.argv[3]))
+handler = MaruHandler(MaruConfig(
+    maru_node=sys.argv[1], engine_id="raw", cache_namespace="ns",
+    chunk_size_bytes=PAGE, pin_pools=False, load_only=True, auto_connect=False,
+))
+handler.connect()
+hit = handler.retrieve("kv")
+assert hit is not None
+incarnation = handler._cpu.identity.incarnation
+handler.stop()
+print(json.dumps({"pin": hit.pin_id, "incarnation": incarnation}), flush=True)
 if sys.stdin.readline().strip() == "probe":
-    probe = RawWorker(sys.argv[1], w.incarnation)
+    probe = RawWorker(sys.argv[1], incarnation)
     assert probe.attach(role=SessionRole.PROBE).status.value == "OK"
     idle = RawWorker(sys.argv[1])
     assert idle.attach().status.value == "OK"
@@ -133,6 +151,10 @@ sys.stdin.read()
         first = start_node(config, region_source=rm)
         nodes.append(first)
         assert publish(first, "kv").result == ItemResult.ADDED
+        (region,) = rm.regions[config.node_id]
+        backing = tmp_path / "region"
+        with backing.open("wb") as f:
+            f.truncate(region.handle.length)
         child = subprocess.Popen(
             [
                 sys.executable,
@@ -140,6 +162,7 @@ sys.stdin.read()
                 script,
                 config.socket,
                 str(Path(__file__).resolve().parent),
+                json.dumps({region.handle.region_id: str(backing)}),
             ],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
@@ -166,8 +189,12 @@ sys.stdin.read()
         location = service.catalog.locations(Key("ns", "kv"))[0].location
         item = KeyLocation(Key("ns", "kv"), location)
         assert second.server.retire([item]).items[0].result == ItemResult.KEPT
-        child.kill()
-        child.wait(5)
+        resume = exit_before_orphan_drain(
+            second, child, info["incarnation"], monkeypatch
+        )
+        assert service.pins.get(info["pin"]) is not None
+        assert second.server.retire([item]).items[0].result == ItemResult.KEPT
+        resume()
         wait_until(lambda: service.pins.get(info["pin"]) is None)
         assert second.server.retire([item]).items[0].result == ItemResult.RETIRED
     finally:
@@ -239,6 +266,10 @@ def test_reattached_local_worker_keeps_pins_through_copy_and_drain(
             # The new run has its own DRAM memfd.
             wait_until(lambda: service.pins.count(old.key, old.location) == 0)
         assert child.call("retrieve", key="current", timeout=2) is None
+        probe = Mock(wraps=service.probe)
+        monkeypatch.setitem(catalog.rpc._ms_handlers, MessageType.PROBE, probe)
+        assert child.call("exists", keys=["current"]) == [False]
+        probe.assert_not_called()
         assert child.call("held", key="old") == old_bytes
         assert child.call("state")["session_node_epoch"] == first.node_epoch
 
@@ -250,6 +281,8 @@ def test_reattached_local_worker_keeps_pins_through_copy_and_drain(
             wait_until(lambda: service.pins.count(old.key, old.location) == 0)
             assert second.server.retire([old]).items[0].result == ItemResult.RETIRED
         assert child.call("retrieve", key="current") is not None
+        assert child.call("exists", keys=["current"]) == [True]
+        probe.assert_called_once()
         key = Key("ns", "current")
         location = service.catalog.locations(key)[0].location
         assert service.pins.count(key, location) == 1

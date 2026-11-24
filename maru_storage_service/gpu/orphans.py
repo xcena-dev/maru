@@ -68,7 +68,7 @@ class OrphanWatch:
         for key in keys:
             orphan = self.pending.pop(key)
             if key not in reported:
-                self._report_exit(orphan)
+                self.store.workers.after_gpu_drain(self._report_exit, orphan)
 
     def _report_exit(self, orphan):
         self.store._queue_exit(

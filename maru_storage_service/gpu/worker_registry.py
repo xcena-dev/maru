@@ -328,7 +328,7 @@ class WorkerRegistry:
             len(refs),
             self.gpu_drain_grace_s,
         )
-        self._after(self.gpu_drain_grace_s, self._grace_over, incarnation, rec.ref())
+        self.after_gpu_drain(self._grace_over, incarnation, rec.ref())
         self._ledger.drop(incarnation)
         return True
 
@@ -351,6 +351,9 @@ class WorkerRegistry:
                 return rec.detached
             ends = self._settles_at.get(incarnation)
         return ends is not None and time.monotonic() >= ends
+
+    def after_gpu_drain(self, fn: Callable, *args) -> None:
+        self._after(self.gpu_drain_grace_s, fn, *args)
 
     def _after(self, delay: float, fn: Callable, *args) -> None:
         def run() -> None:

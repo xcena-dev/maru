@@ -28,7 +28,7 @@ from tests.unit.ms_node_helpers import wait_until
 KEYS = [Key("ns", "k")]
 
 
-def make_conn(call, *, heartbeat_s: float = 30.0) -> ServerConn:
+def make_conn(call, *, heartbeat_s: float = 30.0, **kwargs) -> ServerConn:
     """A conn with an open session s1 at server epoch "old"; ``call`` stands
     in for the RPC."""
     identity = WorkerIdentity("e", 0, 0, "inc", "ns")
@@ -40,7 +40,7 @@ def make_conn(call, *, heartbeat_s: float = 30.0) -> ServerConn:
         pid=os.getpid(),
         pid_start=1,
         timeout_s=2.0,
-        role=SessionRole.WORKER,
+        **kwargs,
     )
     conn.session, conn.server_epoch, conn.session_node_epoch = "s1", "old", "node"
     conn.heartbeat_s = heartbeat_s
@@ -158,6 +158,27 @@ def test_lookups_and_probes_miss_without_an_rpc_while_a_reopen_is_due(op):
         conn._reopen = True
         result = conn.lookup_and_pin(KEYS) if op == "lookup" else conn.probe(KEYS)
         assert result is None and not calls
+    finally:
+        conn._rpc.close()
+
+
+@pytest.mark.parametrize("role", [SessionRole.WORKER, SessionRole.PROBE])
+def test_location_probe_after_reattach(role):
+    requests = []
+
+    def call(code, request, timeout_s):
+        assert code == MessageType.PROBE
+        requests.append(request)
+        return ProbeResponse(status=Status.OK, items=[ItemOutcome(ItemResult.HIT)])
+
+    conn = make_conn(call, role=role, attached_epoch=lambda: "next")
+    try:
+        result = conn.probe(KEYS, with_locations=True)
+        if role == SessionRole.WORKER:
+            assert result is None and not requests
+        else:
+            assert result[0].result == ItemResult.HIT
+            assert len(requests) == 1 and requests[0].with_locations
     finally:
         conn._rpc.close()
 

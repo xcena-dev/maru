@@ -39,6 +39,7 @@ from maru_common.storage_types import (
     WORKER_RDMA_CAPABILITY,
     ItemResult,
     Key,
+    KeyLocation,
     NotifyKind,
     Status,
 )
@@ -53,6 +54,7 @@ from tests.unit.ms_node_helpers import (
     FakeRm,
     MetadataServer,
     RawWorker,
+    exit_before_orphan_drain,
     free_port,
     node_config,
     remove_tree,
@@ -60,7 +62,7 @@ from tests.unit.ms_node_helpers import (
     wait_until,
 )
 from tests.unit.remote_fakes import reset_fake_agents
-from tests.unit.remote_transport_fakes import FakeTransport
+from tests.unit.remote_transport_fakes import FakeTransport, mapped
 
 
 @pytest.fixture
@@ -662,6 +664,7 @@ def test_pidfd_exit_releases_credit_and_pins_across_gpu_runs(pair, monkeypatch, 
     store(pair)
     # The fake NIC lives in this process; the UDS and pidfd identify the child.
     agent = FakeTransport("child-reader")
+    staging = read = None
     script = """
 import json, sys
 sys.path.insert(0, sys.argv[3])
@@ -708,6 +711,21 @@ elif command == "reattach":
         service = pair.catalog.server.ms_service
         assert service.pins.get(info["pin"]) is not None
         domain = pair.gpu.store.workers.domains["child-instance"]
+        if after == "restart":
+            pin = service.pins.get(info["pin"])
+            item = KeyLocation(pin.key, pin.location)
+            (peer,) = pair.gpu.store.remote.peers
+            pool = next(p for p in peer.pools if p.pool_id == pin.location.pool_id)
+            staging, address = mapped(PAGE)
+            agent.register(address, PAGE, "staging")
+            agent.add_peer(peer.agent_metadata, peer=peer.agent_name)
+            agent.stall()
+            read = agent.post_nowait(
+                "READ",
+                peer.agent_name,
+                [(address, pool.base + pin.location.offset, PAGE)],
+            )
+            assert read is not None and not read.completed
         if after in ("restart", "reattach"):
             pair.gpu.stop()
             pair.gpu = pair.start_gpu()
@@ -755,10 +773,23 @@ elif command == "reattach":
                     assert not orphan_reports
                 assert service.pins.get(info["pin"]) is not None
                 resume.set()
+        elif after == "restart":
+            resume = exit_before_orphan_drain(
+                pair.gpu, child, info["incarnation"], monkeypatch
+            )
+            assert service.pins.get(info["pin"]) is not None
+            assert pair.memory.server.retire([item]).items[0].result == ItemResult.KEPT
+            assert agent.finish_stalled() == 1
+            assert agent.poll_nowait(read) and read.completed
+            resume()
         else:
             child.kill()
             child.wait(5)
         wait_until(lambda: service.pins.get(info["pin"]) is None)
+        if after == "restart":
+            assert (
+                pair.memory.server.retire([item]).items[0].result == ItemResult.RETIRED
+            )
         wait_until(lambda: domain in pair.memory.role.parts._closed_domains)
         assert pair.memory.pools.bytes_in(PageState.QUARANTINED) == 0
     finally:
@@ -767,7 +798,12 @@ elif command == "reattach":
             child.wait(5)
         child.stdin.close()
         child.stdout.close()
+        if read is not None and not read.finished:
+            agent.fail_stalled()
+            assert agent.poll_nowait(read)
         agent.close()
+        if staging is not None:
+            staging.close()
 
 
 def test_reserve_reply_loss_cancels_by_sequence_and_keeps_the_gpu_run_closed(

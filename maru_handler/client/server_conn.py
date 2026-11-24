@@ -14,6 +14,7 @@ import dataclasses
 import logging
 import threading
 import time
+from collections.abc import Callable
 
 from maru_common.ms_rpc import PLACEHOLDER_OP, MsRpcClient, OpOrigin, RpcUnknownError
 from maru_common.protocol import (
@@ -78,6 +79,7 @@ class ServerConn:
         timeout_s: float,
         lookup_timeout_s: float = 0.1,
         role: SessionRole = SessionRole.WORKER,
+        attached_epoch: Callable[[], str | None] | None = None,
     ):
         self.url = url
         self.identity = identity
@@ -85,6 +87,7 @@ class ServerConn:
         self.role = role
         self.node_id = node_id
         self.node_epoch = node_epoch
+        self._attached_epoch = attached_epoch if role == SessionRole.WORKER else None
         self.pid = pid
         self.pid_start = pid_start
         self._rpc = MsRpcClient(url, timeout_s=timeout_s, name=f"maru-{role.value}-rpc")
@@ -143,6 +146,8 @@ class ServerConn:
     def _open(self) -> None:
         if self._frozen.is_set():
             raise StorageUnavailableError("worker stopped")
+        if not self._on_attached_run(self.node_epoch):
+            raise StorageUnavailableError("waiting for the attached node run")
         self.prepare_read_thread()
         if self._no_reopen:
             raise StorageUnavailableError("the session is not opened again")
@@ -217,11 +222,15 @@ class ServerConn:
 
     def move_to(self, node_epoch: str, pid: int, pid_start: int) -> None:
         """Reopen under a new node epoch (pins move); retried until it works."""
-        with self._lock:
-            self.node_epoch, self.pid, self.pid_start = node_epoch, pid, pid_start
-            self._reopen = True
         try:
-            self.open()
+            with self._open_lock:
+                if self.node_epoch == node_epoch:
+                    return
+                with self._lock:
+                    self.node_epoch = node_epoch
+                    self.pid, self.pid_start = pid, pid_start
+                    self._reopen = True
+                self._open()
         except NodeRunUnknownError as e:
             logger.info("the node run is not open at MaruServer yet: %s", e)
         except StorageUnavailableError as e:
@@ -288,6 +297,17 @@ class ServerConn:
         self._rpc.close()
         return ended
 
+    def _on_attached_run(self, epoch: str | None) -> bool:
+        return self._attached_epoch is None or epoch == self._attached_epoch()
+
+    def _reopen_due(self) -> bool:
+        return self._reopen and self._on_attached_run(self.node_epoch)
+
+    def _reopen_if_due(self) -> None:
+        with self._open_lock:
+            if self._reopen_due():
+                self._open()
+
     def _loop(self) -> None:
         """Heartbeat only; lookups and UNPINs are resolved on their own thread.
         Polls faster while MaruServer is down or the session is to reopen."""
@@ -297,7 +317,9 @@ class ServerConn:
         last_logged: dict[type, float] = {}
         while True:
             self._beat.wait(
-                DOWN_POLL_S if self._down or self._reopen else self.heartbeat_s or 1.0
+                DOWN_POLL_S
+                if self._down or self._reopen_due()
+                else self.heartbeat_s or 1.0
             )
             self._beat.clear()
             if self._stop.is_set():
@@ -305,8 +327,7 @@ class ServerConn:
             if self._no_reopen and self._reopen:
                 return  # the session is gone and is not opened again
             try:
-                if self._reopen:
-                    self.open()
+                self._reopen_if_due()
                 failing = False
                 unknown_since, warned = None, False
                 session, epoch = self._ids()
@@ -320,13 +341,8 @@ class ServerConn:
                     continue
                 self._set_down(False)
                 if response.status == Status.EPOCH:
-                    with self._open_lock:  # the check and the open are one step
-                        with self._lock:
-                            moved = self.session != session
-                            if not moved:
-                                self._reopen = True
-                        if not moved:
-                            self.open()  # expired, or MaruServer restarted
+                    self._reopen_soon(session)
+                    self._reopen_if_due()
             except (RpcUnknownError, StorageUnavailableError) as e:
                 if isinstance(e, NodeRunUnknownError):
                     now = time.monotonic()
@@ -423,12 +439,14 @@ class ServerConn:
         with self._lock:
             return self.server_epoch == epoch
 
-    def _reopen_soon(self) -> None:
-        """EPOCH to a lookup or probe: the heartbeat thread reopens the
-        session; until then they miss without an RPC."""
+    def _reopen_soon(self, session: str) -> None:
+        """Wake the heartbeat for EPOCH on the current session and node run."""
         with self._lock:
+            if self.session != session:
+                return
             self._reopen = True
-        self._poll_soon()
+            if self._reopen_due():
+                self._poll_soon()
 
     # ----------------------------------------------------------------- lookup
 
@@ -497,7 +515,7 @@ class ServerConn:
             if response.status == Status.EPOCH and not background:
                 # Not run, so it holds no pins
                 origin.resolved(seq)
-                self._reopen_soon()
+                self._reopen_soon(request.session)
                 return None
             if response.status == Status.EPOCH:
                 try:
@@ -596,7 +614,12 @@ class ServerConn:
         resent, never waits for a reopen."""
         if not 0 < len(keys) <= MAX_BATCH:
             raise ValueError(f"{len(keys)} keys; a probe carries 1..{MAX_BATCH}")
-        if self._down or self._refused or self._reopen:
+        if (
+            self._down
+            or self._refused
+            or self._reopen
+            or not self._on_attached_run(self.session_node_epoch)
+        ):
             return None
         try:
             session, epoch = self._ids()
@@ -617,7 +640,7 @@ class ServerConn:
             logger.warning("PROBE: %s", e)
             return None
         if response.status == Status.EPOCH:
-            self._reopen_soon()
+            self._reopen_soon(session)
             return None
         if response.status != Status.OK or len(response.items) != len(keys):
             logger.error("PROBE: %s %s", response.status, response.error)
