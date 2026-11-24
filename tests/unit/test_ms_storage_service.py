@@ -44,6 +44,7 @@ from maru_common.storage_types import (
 from maru_handler import MaruHandler
 from maru_handler.client import CreditUnavailableError
 from maru_storage_service.gpu.local_server import LocalServerError
+from maru_storage_service.gpu.worker_registry import process_key
 from maru_storage_service.pool_manager import PageState
 from maru_storage_service.service import StorageService
 from tests.unit.ms_fake_server import FakeMaruServer
@@ -447,7 +448,9 @@ class TestClientLifecycle:
             )
             rec = node.manager.workers.get(raw.incarnation)
             assert rec is not None and rec.detached
-            assert node.manager.watcher.watching(f"worker:{raw.incarnation}")
+            assert node.manager.watcher.watching(
+                process_key(rec.ident.pid, rec.ident.pid_start)
+            )
             # a detached record gets no credit
             assert raw.credit(PAGE).status == Status.REJECTED
         finally:
@@ -459,8 +462,8 @@ class TestClientLifecycle:
         node = nodes()
         manager = node.manager
         first = RawWorker(node.config.socket)
-        first.attach()
-        key = f"worker:{first.incarnation}"
+        response = first.attach()
+        key = process_key(response.pid, response.pid_start)
         second = RawWorker(node.config.socket, incarnation=first.incarnation)
         attached = threading.Event()
         unwatch = manager.watcher.unwatch
@@ -754,19 +757,23 @@ class TestClientLifecycle:
 class TestStaleRuns:
     def test_exit_between_watch_and_record_is_not_lost(self, fake, nodes, monkeypatch):
         node = nodes()
-        # watch() succeeds, then the process ends before the record exists
-        monkeypatch.setattr(node.manager.watcher, "watch", lambda *a: True)
+
+        def exit_during_watch(key, pid, pid_start):
+            threading.Thread(target=node.manager._on_process_exit, args=(key,)).start()
+            return True
+
+        monkeypatch.setattr(node.manager.watcher, "watch", exit_during_watch)
         raw = RawWorker(node.config.socket)
         try:
             with pytest.raises(StorageUnavailableError):
                 raw.attach()
-            assert node.manager.workers.get(raw.incarnation) is None
             wait_until(
                 lambda: any(
                     r.incarnation == raw.incarnation for r, _ in fake.worker_exits
                 ),
                 what="WORKER_EXIT",
             )
+            assert node.manager.workers.get(raw.incarnation) is None
         finally:
             raw.close()
 

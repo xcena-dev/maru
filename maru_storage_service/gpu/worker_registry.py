@@ -13,7 +13,7 @@ import logging
 import threading
 import time
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TypeVar, cast
 
 from maru_common.node_protocol import DetachResponse
@@ -72,8 +72,10 @@ class WorkerRecord:
         )
 
 
-def _worker_key(incarnation: str) -> str:
-    return f"worker:{incarnation}"
+@dataclass
+class _ProcessWatch:
+    incarnations: set[str] = field(default_factory=set)
+    has_orphans: bool = False
 
 
 def process_key(pid: int, pid_start: int) -> str:
@@ -109,6 +111,7 @@ class WorkerRegistry:
         self._lock = threading.RLock()
         self._workers: dict[str, WorkerRecord] = {}
         self._probes: dict[str, WorkerRecord] = {}
+        self._processes: dict[str, _ProcessWatch] = {}
 
         self._stopping = False
         self._timers: set[threading.Timer] = set()
@@ -124,12 +127,27 @@ class WorkerRegistry:
 
     # ------------------------------------------------------- attach, detach
 
-    def watch_process(self, pid: int, pid_start: int) -> bool | None:
+    def watch_process(
+        self, pid: int, pid_start: int, worker: WorkerRecord | None = None
+    ) -> bool | None:
+        """Share a pidfd with the process's workers and retained orphans."""
         key = process_key(pid, pid_start)
         with self._lock:
-            return self._watcher.watching(key) or self._watcher.watch(
-                key, pid, pid_start
-            )
+            watch = self._processes.get(key)
+            if watch is None:
+                evidence = self._watcher.watch(key, pid, pid_start)
+                if not evidence:
+                    return evidence
+                watch = self._processes[key] = _ProcessWatch()
+            elif not self._watcher.watching(key):
+                return False
+            if worker is None:
+                watch.has_orphans = True
+            else:
+                # A pending pidfd callback must find the worker even if ATTACH fails.
+                watch.incarnations.add(worker.incarnation)
+                self._workers[worker.incarnation] = worker
+            return self._watcher.watching(key)
 
     def attach(
         self, conn: WorkerEndpoint, ident: AttachIdentity
@@ -141,21 +159,10 @@ class WorkerRegistry:
             rec = self._workers.get(ident.incarnation)
             if rec is not None:
                 return self._rebind(rec, conn, ident)
-        # pidfd_open and /proc reads happen outside the lock
-        key = _worker_key(ident.incarnation)
-        if not self._watcher.watch(key, ident.pid, ident.pid_start):
-            return None, "the process has ended"
-        with self._lock:
-            rec = self._workers.get(ident.incarnation)
-            if rec is not None:  # attached meanwhile on another connection
-                return self._rebind(rec, conn, ident)
             rec = WorkerRecord(ident=ident, conn=conn)
-            self._workers[ident.incarnation] = rec
-        if not self._watcher.watching(key):
-            # It ended between watch() and the record: its exit found no record
-            self._worker_exited(ident.incarnation)
-            return None, "the process has ended"
-        return rec, ""
+            if not self.watch_process(ident.pid, ident.pid_start, rec):
+                return None, "the process has ended"
+            return rec, ""
 
     def attach_probe(
         self, conn: WorkerEndpoint, ident: AttachIdentity
@@ -249,7 +256,12 @@ class WorkerRegistry:
             # Under the lock, so a re-attach of the incarnation (which takes
             # it) never loses its new watch or op records; neither the
             # watcher nor the ledger calls back while holding its own lock
-            self._watcher.unwatch(_worker_key(incarnation))
+            key = process_key(rec.ident.pid, rec.ident.pid_start)
+            watch = self._processes[key]
+            watch.incarnations.remove(incarnation)
+            if not watch.incarnations and not watch.has_orphans:
+                self._watcher.unwatch(key)
+                del self._processes[key]
             self._ledger.drop(incarnation)
         logger.info("worker %s detached and is forgotten", incarnation)
 
@@ -282,16 +294,27 @@ class WorkerRegistry:
 
     def on_process_exit(self, key: str) -> set[str]:
         """Incarnations whose exit report follows their GPU drain grace."""
-        kind, _, incarnation = key.partition(":")
-        if kind == "worker" and self._worker_exited(incarnation):
-            return {incarnation}
-        return set()
-
-    def _worker_exited(self, incarnation: str) -> bool:
         with self._lock:
-            rec = self._workers.pop(incarnation, None)
+            watch = self._processes.get(key)
+            if watch is None:
+                return set()
+            incarnations = watch.incarnations.intersection(self._workers)
+        reported = {inc for inc in incarnations if self._worker_exited(inc, key)}
+        with self._lock:
+            self._processes.pop(key, None)
+        return reported
+
+    def _worker_exited(self, incarnation: str, key: str | None = None) -> bool:
+        with self._lock:
+            rec = self._workers.get(incarnation)
             if rec is None or rec.exited:
                 return False
+            if (
+                key is not None
+                and process_key(rec.ident.pid, rec.ident.pid_start) != key
+            ):
+                return False
+            del self._workers[incarnation]
             self._mark_exited(rec)
             self._settles_at[incarnation] = time.monotonic() + self.gpu_drain_grace_s
             conn, rec.conn = rec.conn, None

@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 from maru_common.node_protocol import DetachResponse
 from maru_common.storage_types import SessionRole, Status, WriteDomain
 
-from .worker_registry import WorkerRecord, WorkerRegistry, process_key
+from .worker_registry import WorkerRecord, WorkerRegistry
 
 
 @dataclass(eq=False)
@@ -29,14 +29,12 @@ class RemoteWorkers(WorkerRegistry):
         self._number = 0
         self.domains = {}
         self.admissions = {}
-        # A single pidfd owns the process's live and terminal incarnation IDs.
-        self._processes: dict[str, set[str]] = {}
 
     def attach(self, conn, ident):
-        key = process_key(ident.pid, ident.pid_start)
         with self._lock:
             if ident.incarnation in self._probes or any(
-                ident.incarnation in seen for seen in self._processes.values()
+                ident.incarnation in watch.incarnations
+                for watch in self._processes.values()
             ):
                 return None, "remote incarnation already attached in this run"
             rec = RemoteWorker(ident, conn)
@@ -45,15 +43,9 @@ class RemoteWorkers(WorkerRegistry):
                 and len(self.admissions) >= self._staging_limit
             ):
                 return None, "worker staging budget exhausted"
-            if key not in self._processes:
-                if not self.watch_process(ident.pid, ident.pid_start):
-                    return None, "the process has ended"
-                self._processes[key] = set()
-            if not self._watcher.watching(key):
+            if not self.watch_process(ident.pid, ident.pid_start, rec):
                 return None, "the process has ended"
-            self._processes[key].add(rec.incarnation)
             self.admissions.setdefault(rec.staging_key, set()).add(rec.incarnation)
-            self._workers[rec.incarnation] = rec
             return rec, ""
 
     def begin_op(self, rec, op, digest):
@@ -153,11 +145,3 @@ class RemoteWorkers(WorkerRegistry):
         super()._mark_exited(rec)
         self._release_staging(rec)
         self._terminal(rec)
-
-    def on_process_exit(self, key):
-        with self._lock:
-            incarnations = self._processes.get(key, set()).intersection(self._workers)
-        reported = {inc for inc in incarnations if self._worker_exited(inc)}
-        with self._lock:
-            self._processes.pop(key, None)
-        return reported
