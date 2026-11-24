@@ -1306,6 +1306,7 @@ def test_memory_lru_preserves_a_read_pin_then_reclaims_it(sockdir, store):
 
         reader.capabilities = [WORKER_RDMA_CAPABILITY]
         reader.open(pools=[], pid_ns=101)
+        reader.heartbeat(memory_peer=(config.node_id, node.node_epoch))
         worker = FakeWorker(reader.wire, reader)
         worker.open()
         ref, page = page_of(node, "k0")

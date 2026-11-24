@@ -113,6 +113,7 @@ class NodeSession:
     pid_ns: int = 0
     orphans: tuple[OrphanWorker, ...] = ()
     capabilities: tuple[str, ...] = ()
+    memory_peer: tuple[str, str] | None = None
     closed_at: float | None = None  # NODE_CLOSE restart
     ended: bool = False  # renewed, replaced, left or given up
 
@@ -267,20 +268,19 @@ class NodeRegistry:
                 session = self._workers.get(token)
         return session
 
-    def node_online(self, node_id: str, now: float) -> bool:
+    def _live_session(self, node_id: str, now: float) -> NodeSession | None:
         node = self.nodes.get(node_id)
-        return bool(node and node.session and node.session.valid(now))
+        if node and node.session and node.session.valid(now):
+            return node.session
+        return None
+
+    def node_online(self, node_id: str, now: float) -> bool:
+        return self._live_session(node_id, now) is not None
 
     def capabilities_of(self, node_id: str) -> tuple[str, ...]:
         """Accepted capabilities of the node's live session."""
-        node = self.nodes.get(node_id)
-        if (
-            node is None
-            or node.session is None
-            or not node.session.valid(self._clock())
-        ):
-            return ()
-        return node.session.capabilities
+        session = self._live_session(node_id, self._clock())
+        return session.capabilities if session else ()
 
     def stale_run(self, worker: WorkerSession) -> bool:
         """A worker attached to a node run that has been replaced."""
@@ -312,13 +312,16 @@ class NodeRegistry:
         return pool.since_epoch_seq <= worker.node_epoch_seq
 
     def can_rdma(self, worker: WorkerSession, pool: PoolRecord, now: float) -> bool:
+        if pool.node_id == worker.node_id or pool.state != PoolState.ACTIVE:
+            return False
+        gpu = self._live_session(worker.node_id, now)
+        memory = self._live_session(pool.node_id, now)
         return (
-            WORKER_RDMA_CAPABILITY in self.capabilities_of(worker.node_id)
-            and MEMORY_CAPABILITY in self.capabilities_of(pool.node_id)
-            and pool.node_id != worker.node_id
-            and pool.state == PoolState.ACTIVE
-            and self.node_online(worker.node_id, now)
-            and self.node_online(pool.node_id, now)
+            gpu is not None
+            and memory is not None
+            and gpu.memory_peer == memory.creator
+            and WORKER_RDMA_CAPABILITY in gpu.capabilities
+            and MEMORY_CAPABILITY in memory.capabilities
         )
 
     @staticmethod
@@ -692,6 +695,7 @@ class NodeRegistry:
         self, session: NodeSession, req: NodeHeartbeatRequest, now: float
     ) -> NodeHeartbeatResponse:
         session.deadline = now + self.session_ttl_s
+        session.memory_peer = req.memory_peer
         node = self.nodes[session.node_id]
         for usage in req.usage:
             pool = self.catalog.pool(usage.pool_id)

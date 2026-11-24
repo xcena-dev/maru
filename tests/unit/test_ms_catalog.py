@@ -56,6 +56,7 @@ def gpu_and_memory(wire, cxl=False):
     """GPU node a, which reads memory nodes over RDMA, and memory node m."""
     a = open_node(wire, "a", cxl=cxl, caps=[WORKER_RDMA_CAPABILITY])
     m = open_node(wire, "m", caps=[MEMORY_CAPABILITY])
+    assert a.heartbeat(memory_peer=(m.node_id, m.epoch)).status == Status.OK
     return a, m
 
 

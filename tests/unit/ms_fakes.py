@@ -269,10 +269,12 @@ class FakeNode(_OpSender):
         epoch = self.server_epoch or self.wire.service.server_epoch
         return {"session": self.token, "server_epoch": epoch}
 
-    def heartbeat(self, usage=()):
+    def heartbeat(self, usage=(), *, memory_peer=None):
         return self.wire.call(
             MessageType.NODE_HEARTBEAT,
-            NodeHeartbeatRequest(**self.envelope(), usage=list(usage)),
+            NodeHeartbeatRequest(
+                **self.envelope(), usage=list(usage), memory_peer=memory_peer
+            ),
         )
 
     def close(self, mode: CloseMode):

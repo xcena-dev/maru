@@ -57,5 +57,7 @@ def test_remote_fetch_requires_the_workers_node_capability(server):
     add(server, "b", "cxl:memory:1", PoolKind.CXL)
     server.nodes["a"].capabilities = [WORKER_RDMA_CAPABILITY]
     server.nodes["b"].capabilities = [MEMORY_CAPABILITY]
+    assert server._find(KEY, worker()) == (ItemResult.MISS, MissReason.OFFLINE)
+    server.nodes["a"].memory_peer = ("b", "run")
     result, found = server._find(KEY, worker())
     assert result == ItemResult.HIT and found.node_id == "b"

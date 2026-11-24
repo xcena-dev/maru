@@ -435,6 +435,16 @@ def test_orphan_requests_decode_strictly(code, field, value):
         ser.decode_request_payload(ser.encode(code, payload))
 
 
+def test_heartbeat_memory_peer_is_optional_and_strict():
+    ser = Serializer()
+    code = MessageType.NODE_HEARTBEAT
+    payload = {"session": "s", "server_epoch": "e"}
+    assert ser.decode_request(ser.encode(code, payload))[1].memory_peer is None
+    for invalid in (["memory"], ["memory", 1]):
+        with pytest.raises(MessageDecodeError, match="memory_peer"):
+            ser.decode_request(ser.encode(code, dict(payload, memory_peer=invalid)))
+
+
 def test_node_open_orphan_response_decodes_strictly_and_defaults_for_legacy():
     ser = Serializer()
     header, _ = ser.decode_request(

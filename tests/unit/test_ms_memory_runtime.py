@@ -270,6 +270,7 @@ def test_real_catalog_exposes_only_committed_remote_locations_and_keeps_orphan_p
     gpu = FakeNode(wire, "gpu-reader")
     gpu.capabilities = [REMOTE_CAPABILITY, WORKER_RDMA_CAPABILITY]
     assert gpu.open(pools=[gpu.dram()], pid_ns=101).status == Status.OK
+    gpu.heartbeat(memory_peer=(node.config.node_id, node.node_epoch))
     worker = FakeWorker(wire, gpu)
     assert worker.open().status == Status.OK
     offered = memory.reserve().credits

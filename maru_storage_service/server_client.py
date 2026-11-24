@@ -96,6 +96,7 @@ class ServerClient:
         self.session: str | None = None
         self.server_epoch: str | None = None
         self.epoch_seq: int | None = None
+        self.memory_peer: tuple[str, str] | None = None
         self.heartbeat_s = 0.0
         self.session_ttl_s = 0.0
         self._heartbeat: threading.Thread | None = None
@@ -275,7 +276,7 @@ class ServerClient:
         session, epoch = self._ids()
         response: NodeHeartbeatResponse = self._rpc.call(
             MessageType.NODE_HEARTBEAT,
-            NodeHeartbeatRequest(session=session, server_epoch=epoch, usage=usage),
+            NodeHeartbeatRequest(session, epoch, usage, memory_peer=self.memory_peer),
         )
         return response
 

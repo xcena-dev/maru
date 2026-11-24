@@ -32,6 +32,8 @@ For a local store, the worker obtains credit, fills its page, and reports write 
 
 For a remote store, the GPU service reserves memory-node pages and obtains the instance's write registration for that GPU-node run. The worker copies GPU bytes into its registered staging, issues RDMA WRITE to those pages, and reports completion. The memory node publishes the key with Catalog COMMIT. A staging write or an RDMA completion alone does not publish a key.
 
+The GPU service reports its connected memory node’s ID and epoch to the Catalog on each heartbeat, starting before workers attach. For both PROBE and LOOKUP_AND_PIN, a remote HIT requires a committed copy in an active pool of that memory-node run and live sessions on both nodes. If a key has several copies, the Catalog chooses among the readable ones.
+
 For a remote read, the worker performs LOOKUP_AND_PIN and validates the pool registration and generation. It issues RDMA READ directly into its staging, then copies the bytes to the GPU. The source pin protects the memory-node page during the READ; staging stays owned until the GPU copy finishes. Reads already in progress for the same location can be joined within one worker. Different workers use separate staging and READs. Read bytes are never published or retained as cached copies.
 
 Unavailable keys, stale locations and lack of a staging slot produce a MISS and recomputation. The read path does not wait for capacity or retry a failed read. Synchronous loads use the same direct reader on the engine thread. Deferred loads use the loader thread.

@@ -92,8 +92,6 @@ class GpuNode:
         self.orphans = OrphanWatch(run.store, run.server.host_boot_id)
         run.store.orphans = self.orphans
         self.orphans.start(run.server.orphans(run.opened))
-        if self.remote:
-            run.store.remote.open()
         # memfd indexes the fds sent with ATTACH
         attach: list[tuple[PoolDescriptor, int | None]] = []
         for tier in run._tiers.values():

@@ -674,6 +674,7 @@ class NodeHeartbeatRequest:
     session: str
     server_epoch: str
     usage: list[PoolUsage] = field(default_factory=list)
+    memory_peer: tuple[str, str] | None = None  # connected node_id and node_epoch
 
 
 @dataclass

@@ -110,6 +110,9 @@ class ExtensionEnv(MemoryEnv):
     def start_cxl(self, **options):
         self.node = self.start(region_source=self.rm, map_region=anon_region, **options)
         self.parts, self.ops = self.node.role.parts, self.node.role.ops
+        self.reader_node.heartbeat(
+            memory_peer=(self.config.node_id, self.node.node_epoch)
+        )
         return self.node
 
     def lookup(self, key="k0"):

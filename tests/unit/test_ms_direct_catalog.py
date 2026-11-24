@@ -20,6 +20,7 @@ from maru_common.storage_types import (
     CloseMode,
     ExitCause,
     ItemResult,
+    SessionRole,
     Status,
 )
 from maru_server.pin_manager import HolderKind
@@ -51,6 +52,7 @@ def env():
     assert (
         memory.open(pools=[memory.dram(), memory.cxl(region_id=8)]).status == Status.OK
     )
+    assert gpu.heartbeat(memory_peer=(memory.node_id, memory.epoch)).status == Status.OK
     worker = FakeWorker(wire, gpu)
     assert worker.open().status == Status.OK
     targets = {}
@@ -309,6 +311,43 @@ def test_worker_rdma_hit_owns_a_worker_pin_and_pool_registration(env, name):
     assert pin.holder_kind == HolderKind.WORKER and pin.keep_on_departure
 
 
+def test_remote_lookups_select_only_the_connected_memory_node(env):
+    other = FakeNode(env.wire, "other")
+    other.capabilities = [MEMORY_CAPABILITY]
+    assert other.open().status == Status.OK
+    only, both = key("other-only"), key("both")
+    first, second = (other.loc(other.dram(), i) for i in (1, 2))
+    reachable = env.memory.loc(env.memory.dram(), 2)
+    assert all(
+        i.result == ItemResult.ADDED
+        for i in other.commit((only, first), (both, second)).items
+    )
+    assert env.memory.commit((both, reachable)).items[0].result == ItemResult.ADDED
+    probe = FakeWorker(env.wire, env.gpu, role=SessionRole.PROBE)
+    assert probe.open().status == Status.OK
+
+    def check(expected):
+        hints = probe.probe(only, both, with_locations=True).items
+        reads = env.worker.lookup(only, both).items
+        for hint, read, location in zip(hints, reads, expected, strict=True):
+            assert hint.location == read.location == location
+            assert (
+                hint.result
+                == read.result
+                == (ItemResult.HIT if location else ItemResult.MISS)
+            )
+            assert hint.pin_id is None
+            assert bool(read.pin_id) == bool(location)
+            if read.pin_id:
+                env.worker.unpin(read.pin_id)
+
+    check([None, reachable])
+    env.gpu.heartbeat(memory_peer=(other.node_id, other.epoch))
+    check([first, second])
+    env.gpu.heartbeat()
+    check([None, None])
+
+
 def test_memory_role_is_required_for_direct_hit(env):
     env.memory.capabilities = []
     env.memory.open(pools=[env.memory.dram(), env.memory.cxl(region_id=8)])
@@ -320,6 +359,10 @@ def test_same_pool_new_registration_has_a_new_number(env):
     env.memory.restart()
     response = env.memory.open(pools=[env.memory.dram(), env.memory.cxl(region_id=8)])
     assert response.adopted
+    k = key("remote_cxl")
+    assert env.worker.lookup(k).items[0].result == ItemResult.MISS
+    assert env.worker.probe(k).items[0].result == ItemResult.MISS
+    env.gpu.heartbeat(memory_peer=(env.memory.node_id, env.memory.epoch))
     new = env.worker.lookup(key("remote_cxl")).items[0]
     assert new.location == old.location
     assert new.pool_registration > old.pool_registration
@@ -390,6 +433,7 @@ def test_replayed_lookup_keeps_the_original_pool_registration(env):
     env.memory.restart()
     env.memory.open(pools=[env.memory.dram(), env.memory.cxl(region_id=8)])
     assert env.wire.call(MessageType.LOOKUP_AND_PIN, request) == first
+    env.gpu.heartbeat(memory_peer=(env.memory.node_id, env.memory.epoch))
     current = env.worker.lookup(key("remote_cxl")).items[0]
     assert current.pool_registration != first.items[0].pool_registration
 
@@ -454,6 +498,8 @@ def test_same_pool_registration_never_repeats_when_its_owner_changes(env):
     assert successor.epoch_seq == env.memory.epoch_seq == 1
     loc = successor.loc(pool, 1)
     successor.commit((key("successor"), loc))
+    assert env.worker.lookup(key("successor")).items[0].result == ItemResult.MISS
+    env.gpu.heartbeat(memory_peer=(successor.node_id, successor.epoch))
     hit = env.worker.lookup(key("successor")).items[0]
     assert hit.location.pool_id == old.location.pool_id
     assert hit.pool_registration != old.pool_registration
@@ -464,4 +510,5 @@ def test_same_pool_registration_never_repeats_when_its_owner_changes(env):
 def test_capability_absence_is_a_remote_miss(env):
     env.gpu.capabilities = [REMOTE_CAPABILITY]
     env.gpu.open(pools=[env.gpu.dram(), env.gpu.cxl()], pid_ns=101)
+    env.gpu.heartbeat(memory_peer=(env.memory.node_id, env.memory.epoch))
     assert env.worker.lookup(key("remote_dram")).items[0].result == ItemResult.MISS

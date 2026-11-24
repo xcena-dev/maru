@@ -110,6 +110,7 @@ class NodeRec:
     usage: list = field(default_factory=list)
     heartbeats: int = 0
     capabilities: list[str] = field(default_factory=list)  # accepted
+    memory_peer: tuple[str, str] | None = None
 
 
 @dataclass
@@ -536,6 +537,7 @@ class FakeMaruServer:
             old.session = uuid.uuid4().hex
             old.last_seen = now
             old.online = True
+            old.memory_peer = None
             self.node_sessions[old.session] = req.node_id
             return self._open_response(old, list(self._adopted_of(old)))
         if old is not None:
@@ -594,6 +596,7 @@ class FakeMaruServer:
         )
 
     def _node_heartbeat(self, node: NodeRec, req):
+        node.memory_peer = req.memory_peer
         node.usage = list(req.usage)
         node.heartbeats += 1
         # A block is sent again every heartbeat until its items are gone
@@ -787,6 +790,7 @@ class FakeMaruServer:
             requester is not None
             and WORKER_RDMA_CAPABILITY in requester.capabilities
             and node is not None
+            and requester.memory_peer == (node.node_id, node.node_epoch)
             and MEMORY_CAPABILITY in node.capabilities
             and POOL_KINDS[entry.location.kind].mappable
         )

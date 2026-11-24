@@ -101,6 +101,8 @@ class RemoteControl:
         if (
             hello.status != Status.OK
             or hello.server_epoch != run.server.server_epoch
+            or not hello.node_id
+            or not hello.node_epoch
             or MEMORY_CAPABILITY not in hello.capabilities
             or not hello.pools
             or not hello.boot
@@ -122,6 +124,7 @@ class RemoteControl:
                 True,
             )
         ]
+        run.server.memory_peer = (hello.node_id, hello.node_epoch)
         conn.on_close(self.lost)
         self.thread = threading.Thread(
             target=self._ping, name="maru-remote-ping", daemon=True
@@ -129,6 +132,7 @@ class RemoteControl:
         self.thread.start()
 
     def lost(self):
+        self.run.server.memory_peer = None
         self.peers = []
         self.hint_actions = []
         self.notify(Peers([]))
@@ -212,6 +216,14 @@ class RemoteWorkerOps(WorkerOps):
         self._control_tasks = ThreadPoolExecutor(
             max_workers=1, thread_name_prefix="maru-remote-control"
         )
+
+    def start_heartbeat(self):
+        self.remote.open()
+        response = self.remote.run.server.heartbeat(self.pools.usage())
+        if response.status != Status.OK:
+            raise ConnectionError("Catalog refused memory peer")
+        self.on_heartbeat(response)
+        super().start_heartbeat()
 
     def hint(self, rec, request):
         if request.action not in (
