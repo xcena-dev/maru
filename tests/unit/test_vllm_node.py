@@ -258,8 +258,8 @@ def test_read_hint_keys_go_with_maru_node(caplog):
     extra = node_extra(maru_read_hints=True, maru_read_hint_on_arrival=True)
     assert _validate_storage_config(extra) is False
     config = node_vllm_config()
-    with caplog.at_level("WARNING", logger="maru_vllm.connector"):
-        _node_engine_config(extra, config)
+    caplog.set_level("WARNING", logger="maru_vllm.connector")
+    _node_engine_config(extra, config)
     assert "read hints" not in caplog.text
     from maru_vllm.connector import _check_node_modes
 
@@ -272,9 +272,8 @@ def test_read_hint_keys_go_with_maru_node(caplog):
     handler._cpu.attach_info.capabilities = ["worker_rdma_v1"]
     _check_node_modes(handler, extra)
     assert "read hints" not in caplog.text
-    with caplog.at_level("WARNING", logger="maru_vllm.connector"):
-        caplog.clear()
-        _node_engine_config(node_extra(), config)
+    caplog.clear()
+    _node_engine_config(node_extra(), config)
     assert "read hints" not in caplog.text
 
 
