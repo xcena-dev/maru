@@ -75,9 +75,7 @@ class WorkerOps(NodeStore):
         traits: dict[str, TierTraits] | None = None,
         on_worker_settled: Callable[[str], None] = lambda incarnation: None,
         on_end: Callable[[str], None] = lambda reason: None,
-        on_worker_ended: Callable[[str], None] = lambda incarnation: None,
-        retain_detached: bool = False,
-        on_worker_lost: Callable[[str], None] = lambda incarnation: None,
+        registry_factory=WorkerRegistry,
     ):
         """``on_end`` ends a run whose metadata result stays unknown."""
         super().__init__(
@@ -92,16 +90,13 @@ class WorkerOps(NodeStore):
         )
         self.ledger = OpLedger(op_window)
         self.watcher = watcher
-        self.workers = WorkerRegistry(
+        self.workers = registry_factory(
             node_epoch=node_epoch,
             pools=pool_manager,
             ledger=self.ledger,
             watcher=self.watcher,
             on_exit=self._queue_exit,
             on_settled=on_worker_settled,
-            on_ended=on_worker_ended,
-            retain_detached=retain_detached,
-            on_disconnected=on_worker_lost,
             gpu_drain_grace_s=gpu_drain_grace_s,
         )
 
@@ -173,7 +168,10 @@ class WorkerOps(NodeStore):
         digest, reason = self._check_op(rec, op, decoded)
         if digest is None:
             return response_cls(status=Status.REJECTED, error=reason)
-        verdict, entry = self.ledger.begin(rec.incarnation, op, digest)
+        begun = self.workers.begin_op(rec, op, digest)
+        if begun is None:
+            return response_cls(status=Status.REJECTED, error="worker has ended")
+        verdict, entry = begun
         if verdict == Verdict.NEW and entry is not None:
             return entry
         if verdict == Verdict.REPLAY and entry is not None:

@@ -492,9 +492,9 @@ class LocalServer:
                 join(rec, request) if join else ReadJoinResponse(Status.DISABLED),
             )
         elif code == NodeMessageType.DETACH:
-            if hasattr(manager, "remote_detach"):
-                manager.remote_detach(rec)
-            conn.respond(header, manager.workers.detach(rec))
+            conn.respond(
+                header, manager.workers.detach(rec, conn, request.staging_released)
+            )
             manager.workers.after_detach_reply(rec)
         else:  # every code of the table is handled above
             conn.respond(header, response_cls(status=Status.REJECTED, error="unknown"))
@@ -554,20 +554,17 @@ class LocalServer:
             pid_start=pid_start,
             namespace=req.namespace,
             instance=req.instance,
+            staging_id=req.staging_id,
         )
         manager = self._manager()
         if WORKER_RDMA_CAPABILITY in self.capabilities:
             if not probe and WORKER_RDMA_CAPABILITY not in req.capabilities:
                 return reject("remote requires worker_rdma_v1")
-            if not probe and not manager.admit(ident):
-                return reject("worker staging budget exhausted")
         if probe:
             rec, why = manager.workers.attach_probe(conn, ident)
         else:
             rec, why = manager.workers.attach(conn, ident)
         if rec is None:
-            if hasattr(manager, "refuse_admission"):
-                manager.refuse_admission(ident.incarnation)
             return reject(why)
         agreed = [c for c in req.capabilities if c in self.capabilities]
         rec.capabilities = frozenset(agreed)

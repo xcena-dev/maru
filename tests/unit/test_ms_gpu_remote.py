@@ -418,7 +418,7 @@ def test_unknown_write_fences_the_shared_instance_before_reclaim(pair):
 def test_worker_resumes_storing_after_its_cached_domain_is_fenced(pair, failure):
     writer = pair.client()
     wait_until(lambda: writer.credits.unused_bytes == 4 * PAGE)
-    original = pair.gpu.store._domains["instance"]
+    original = pair.gpu.store.workers.domains["instance"]
     if failure == "idle_ttl":
         ops = pair.memory.role.ops
         now = time.monotonic()
@@ -433,7 +433,7 @@ def test_worker_resumes_storing_after_its_cached_domain_is_fenced(pair, failure)
     assert writer._rdma.capacity() == writer._rdma.slot_count
     wait_until(
         lambda: (
-            pair.gpu.store._domains.get("instance", original) != original
+            pair.gpu.store.workers.domains.get("instance", original) != original
             and writer.credits.unused_bytes >= PAGE
         )
     )
@@ -449,8 +449,8 @@ def test_worker_exit_fences_only_its_instance_domain(pair):
     first = pair.client("first")
     second = pair.client("second")
     wait_until(lambda: len(pair.gpu.store._credits) >= 2)
-    domain = pair.gpu.store._domains["first"]
-    other = pair.gpu.store._domains["second"]
+    domain = pair.gpu.store.workers.domains["first"]
+    other = pair.gpu.store.workers.domains["second"]
     pair.gpu.store.workers._worker_exited(first.identity.incarnation)
     wait_until(lambda: domain in pair.memory.role.parts._closed_domains)
     assert other not in pair.memory.role.parts._closed_domains
@@ -461,11 +461,13 @@ def test_cuda_stop_fences_writes_and_keeps_worker_ownership(pair):
     writer = pair.client()
     wait_until(lambda: writer.credits.unused_bytes >= PAGE)
     handle = writer.alloc(PAGE)
-    domain = pair.gpu.store._domains["instance"]
+    domain = pair.gpu.store.workers.domains["instance"]
     writer.stop()
     wait_until(lambda: domain in pair.memory.role.parts._closed_domains)
     assert handle in writer._handles and handle.state == "writing"
-    assert writer.identity.incarnation in pair.gpu.store._admitted
+    assert writer.identity.incarnation in next(
+        iter(pair.gpu.store.workers.admissions.values())
+    )
 
 
 def test_inflight_read_keeps_its_orphan_pin_while_the_gpu_ss_restarts(pair):
@@ -686,7 +688,7 @@ sys.stdin.read()
         info = json.loads(child.stdout.readline())
         service = pair.catalog.server.ms_service
         assert service.pins.get(info["pin"]) is not None
-        domain = pair.gpu.store._domains["child-instance"]
+        domain = pair.gpu.store.workers.domains["child-instance"]
         if restart:
             pair.gpu.stop()
             pair.gpu = pair.start_gpu()

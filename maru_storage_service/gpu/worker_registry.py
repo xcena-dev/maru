@@ -40,6 +40,7 @@ class AttachIdentity:
     pid_start: int
     namespace: str
     instance: str = ""
+    staging_id: str = ""
 
 
 @dataclass(eq=False)
@@ -89,11 +90,7 @@ class WorkerRegistry:
         on_exit: Callable[[WorkerRef], None],
         gpu_drain_grace_s: float,
         on_settled: Callable[[str], None] = lambda incarnation: None,
-        on_ended: Callable[[str], None] = lambda incarnation: None,
-        retain_detached: bool = False,
-        on_disconnected: Callable[[str], None] = lambda incarnation: None,
     ):
-        self.retain_detached = retain_detached
         self.node_epoch = node_epoch
         self.gpu_drain_grace_s = gpu_drain_grace_s
         self._pools = pools
@@ -103,9 +100,6 @@ class WorkerRegistry:
         # A worker whose exit is confirmed and whose GPU drain grace is over:
         # nothing of it touches the pools any more, so its region holds can go
         self._on_settled = on_settled
-        # Its process ended: what it waits for is answered now
-        self._on_ended = on_ended
-        self._on_disconnected = on_disconnected
         # incarnation -> when its exit's GPU drain grace ends
         self._settles_at: dict[str, float] = {}
         self._lock = threading.RLock()
@@ -200,19 +194,17 @@ class WorkerRegistry:
     def connection_lost(self, rec: WorkerRecord, conn: WorkerEndpoint) -> None:
         """The UDS closed; the credit stays until the process exits. A probe
         is forgotten."""
-        disconnected = False
         with self._lock:
             if rec.role == SessionRole.PROBE:
                 self._forget_probe(rec, conn)
                 return
             if rec.conn is conn:
                 rec.conn = None
-                disconnected = not rec.detached
         self._ledger.forget_waiter(rec.incarnation, conn)
-        if disconnected:
-            self._on_disconnected(rec.incarnation)
 
-    def detach(self, rec: WorkerRecord) -> DetachResponse:
+    def detach(
+        self, rec: WorkerRecord, conn=None, staging_released=False
+    ) -> DetachResponse:
         with self._lock:
             if rec.role == SessionRole.PROBE:
                 self._forget_probe(rec, None)
@@ -231,8 +223,6 @@ class WorkerRegistry:
         """Forget a worker that detached holding nothing: its record, pidfd
         and op records go. One with credit or an op running waits for its
         exit."""
-        if self.retain_detached:
-            return
         incarnation = rec.incarnation
         with self._lock:
             if (
@@ -262,6 +252,9 @@ class WorkerRegistry:
             rec = self._workers.get(incarnation)
             return rec.conn if rec is not None else None
 
+    def begin_op(self, rec, op, digest):
+        return self._ledger.begin(rec.incarnation, op, digest)
+
     def while_attached(self, rec: WorkerRecord, fn: Callable[[], R]) -> R | None:
         """``fn()`` under the lock, or None if ``rec`` ended or detached. An
         exit sets ``exited`` under the lock before it quarantines, so credit
@@ -287,13 +280,12 @@ class WorkerRegistry:
             rec = self._workers.pop(incarnation, None)
             if rec is None or rec.exited:
                 return
-            rec.exited = True
+            self._mark_exited(rec)
             self._settles_at[incarnation] = time.monotonic() + self.gpu_drain_grace_s
             conn, rec.conn = rec.conn, None
             refs = self._pools.quarantine_holder(incarnation)
         if conn is not None:
             conn.close()
-        self._on_ended(incarnation)
         logger.info(
             "worker %s (pid %d) ended: %d credited pages quarantined for %.1f s",
             incarnation,
@@ -303,6 +295,9 @@ class WorkerRegistry:
         )
         self._after(self.gpu_drain_grace_s, self._grace_over, incarnation, rec.ref())
         self._ledger.drop(incarnation)
+
+    def _mark_exited(self, rec):
+        rec.exited = True
 
     def _grace_over(self, incarnation: str, ref: WorkerRef) -> None:
         self._on_exit(ref)  # its pins at MaruServer go now

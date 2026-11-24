@@ -5,7 +5,9 @@ import logging
 import os
 import threading
 import time
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
+from functools import partial
 
 from maru_common.ms_rpc import PLACEHOLDER_OP, OpOrigin, RpcUnknownError
 from maru_common.node_protocol import (
@@ -45,7 +47,6 @@ from maru_common.storage_types import (
     ItemResult,
     ReadPeer,
     Status,
-    WriteDomain,
 )
 from maru_handler.hints import MAX_HINT_RANGES, MemoryHints
 from maru_remote.auth import load_key
@@ -53,6 +54,7 @@ from maru_remote.auth import load_key
 from ..op_ledger import LedgerEntry
 from ..ports import ServerStopped
 from ..remote_client import RemoteConnection
+from .remote_workers import RemoteWorkers
 from .workers import WorkerOps
 
 logger = logging.getLogger(__name__)
@@ -198,19 +200,19 @@ class RemoteControl:
 
 class RemoteWorkerOps(WorkerOps):
     def __init__(self, *, run, **kwargs):
+        self.remote = RemoteControl(run, self._notify)
         super().__init__(
             **kwargs,
-            on_worker_ended=self._worker_ended,
-            retain_detached=True,
-            on_worker_lost=self._worker_lost,
+            registry_factory=partial(
+                RemoteWorkers,
+                staging_limit=self.remote.options["staging_max_bytes"]
+                // self.remote.staging.size,
+                node_id=run.config.node_id,
+                on_terminal=self._queue_cleanup,
+            ),
         )
-        self.remote = RemoteControl(run, self._notify)
         self._hints = MemoryHints(lambda keys: [], self._hint_send)
-        self._admitted = {}
         self._agents = {}
-        self._domains = {}
-        self._closed_domains = set()
-        self._number = 0
         # Location -> (worker incarnation, write domain); PENDING stays charged.
         self._credits = {}
         self._reserves = {}
@@ -276,21 +278,6 @@ class RemoteWorkerOps(WorkerOps):
         )
         return answer.status == Status.OK
 
-    def admit(self, ident):
-        with self.remote.lock:
-            if ident.incarnation in self._admitted:
-                return self._admitted[ident.incarnation] == ident
-            limit = self.remote.options["staging_max_bytes"]
-            if (len(self._admitted) + 1) * self.remote.staging.size > limit:
-                return False
-            self._admitted[ident.incarnation] = ident
-            return True
-
-    def refuse_admission(self, incarnation):
-        with self.remote.lock:
-            if self.workers.get(incarnation) is None:
-                self._admitted.pop(incarnation, None)
-
     def _notify(self, notice):
         for conn in self.workers.mapping().values():
             if conn is not None:
@@ -298,13 +285,18 @@ class RemoteWorkerOps(WorkerOps):
 
     def read_join(self, rec, request):
         with self.remote.lock:
-            old = self._agents.get(rec.incarnation)
-            if old is not None and old != request.agent_name:
-                return ReadJoinResponse(Status.REJECTED, error="read agent changed")
-            if request.agent_name in self._agents.values() and old is None:
-                return ReadJoinResponse(
-                    Status.REJECTED, error="read agent already owned"
-                )
+
+            def register():
+                old = self._agents.get(rec.incarnation)
+                if old not in (None, request.agent_name):
+                    return False
+                if old is None and request.agent_name in self._agents.values():
+                    return False
+                self._agents[rec.incarnation] = request.agent_name
+                return True
+
+            if not self.workers.while_attached(rec, register):
+                return ReadJoinResponse(Status.REJECTED, error="read agent refused")
             try:
                 answer = self.remote.call(
                     Code.AGENTS,
@@ -312,8 +304,8 @@ class RemoteWorkerOps(WorkerOps):
                         add=[AgentMetadata(request.agent_name, request.agent_metadata)]
                     ),
                 )
-                if answer.status == Status.OK:
-                    self._agents[rec.incarnation] = request.agent_name
+                if answer.status != Status.OK:
+                    self._agents.pop(rec.incarnation, None)
                 return ReadJoinResponse(answer.status, error=answer.error)
             except (ConnectionError, TimeoutError):
                 return ReadJoinResponse(
@@ -324,17 +316,6 @@ class RemoteWorkerOps(WorkerOps):
         for key in list(self._reserves):
             if key[0] == rec.incarnation and key[1] <= op.ack:
                 del self._reserves[key]
-
-    def _domain(self, rec):
-        instance = rec.ident.instance
-        domain = self._domains.get(instance)
-        if domain is None:
-            self._number += 1
-            domain = WriteDomain(
-                self.remote.run.config.node_id, self.node_epoch, instance, self._number
-            )
-            self._domains[instance] = domain
-        return domain
 
     def credit(self, rec, decoded):
         req = decoded.request
@@ -372,57 +353,65 @@ class RemoteWorkerOps(WorkerOps):
                     if pages <= 0:
                         answer = CreditResponse(Status.OK)
                     else:
-                        domain = self._domain(rec)
-                        # Keep the worker op paired with the RESERVE sequence before sending.
-                        hint = self.remote.reserve_hint()
-                        request = self.remote.origin.stamp(
-                            ReserveRequest(
-                                PLACEHOLDER_OP,
-                                pages,
-                                hint=hint,
-                                wait_ms=self.remote.options["write_wait_ms"]
-                                if hint == HintAction.WRITE_WAIT
-                                else 0,
-                                domain=domain,
-                            )
-                        )
-                        locations = []
-                        self._reserves[rec.incarnation, req.op.seq] = (
-                            request.op.seq,
-                            domain,
-                            locations,
-                        )
-                        started = time.monotonic()
-                        try:
-                            got = self.remote.call(Code.RESERVE, request)
-                        finally:
-                            if (
-                                hint == HintAction.WRITE_WAIT
-                                and time.monotonic() - started >= request.wait_ms / 1000
-                            ):
-                                self.remote._wait_retry_at = time.monotonic() + 5.0
-                        self.remote.origin.resolved(request.op.seq)
-                        locations.extend(got.credits)
-                        if got.status == Status.OK and got.credits:
-                            if (
-                                got.write_agent is None
-                                or got.write_agent.domain != domain
-                            ):
-                                self.remote.connection.close()
-                                raise ConnectionError("invalid write agent")
-                            self._credits.update(
-                                (c, (rec.incarnation, domain)) for c in got.credits
-                            )
-                        answer = CreditResponse(
-                            got.status,
-                            error=got.error,
-                            credits=got.credits,
-                            write_agent=got.write_agent,
-                        )
+                        answer = self._reserve(rec, req.op.seq, pages)
         except (ConnectionError, TimeoutError):
             pass
-        self.ledger.finish(rec.incarnation, entry, answer)
-        return answer
+        return self._finish_op(rec, entry, answer)
+
+    def _reserve(self, rec, seq, pages):
+        domain = self.workers.reserve_domain(rec)
+        if domain is None:
+            return CreditResponse(Status.REJECTED, error="worker has ended")
+        # Keep the worker op paired with the RESERVE sequence before sending.
+        hint = self.remote.reserve_hint()
+        request = self.remote.origin.stamp(
+            ReserveRequest(
+                PLACEHOLDER_OP,
+                pages,
+                hint=hint,
+                wait_ms=self.remote.options["write_wait_ms"]
+                if hint == HintAction.WRITE_WAIT
+                else 0,
+                domain=domain,
+            )
+        )
+        key = (rec.incarnation, seq)
+        locations = []
+        self._reserves[key] = (
+            request.op.seq,
+            domain,
+            locations,
+        )
+        started = time.monotonic()
+        try:
+            got = self.remote.call(Code.RESERVE, request)
+        finally:
+            if (
+                hint == HintAction.WRITE_WAIT
+                and time.monotonic() - started >= request.wait_ms / 1000
+            ):
+                self.remote._wait_retry_at = time.monotonic() + 5.0
+        self.remote.origin.resolved(request.op.seq)
+        locations.extend(got.credits)
+        if got.status == Status.OK and got.credits:
+            if got.write_agent is None or got.write_agent.domain != domain:
+                self.remote.connection.close()
+                raise ConnectionError("invalid write agent")
+            self._credits.update((c, (rec.incarnation, domain)) for c in got.credits)
+            if not self.workers.grant(rec, domain):
+                # Only unexposed pages of a still-open domain can be cancelled.
+                self._cancel(rec, got.credits)
+                if not any(c in self._credits for c in got.credits):
+                    self._reserves.pop(key, None)
+                return CreditResponse(Status.REJECTED, error="write domain ended")
+        else:
+            self._reserves.pop(key, None)
+        return CreditResponse(
+            got.status,
+            error=got.error,
+            credits=got.credits,
+            write_agent=got.write_agent,
+        )
 
     def _cancel(self, rec, credits):
         if not credits or len(credits) > MAX_BATCH:
@@ -431,7 +420,11 @@ class RemoteWorkerOps(WorkerOps):
         with self.remote.lock:
             for credit in credits:
                 owner = self._credits.get(credit)
-                if owner is None or owner[0] != rec.incarnation:
+                if (
+                    owner is None
+                    or owner[0] != rec.incarnation
+                    or self.workers.domains.get(owner[1].instance) != owner[1]
+                ):
                     outcomes.append(ItemOutcome(ItemResult.REJECTED))
                     continue
                 try:
@@ -448,7 +441,9 @@ class RemoteWorkerOps(WorkerOps):
                 except (ConnectionError, TimeoutError):
                     ok = False
                 if ok:
-                    del self._credits[credit]
+                    self.workers.while_current(
+                        owner[1], partial(self._credits.pop, credit, None)
+                    )
                 outcomes.append(
                     ItemOutcome(ItemResult.OK if ok else ItemResult.REJECTED)
                 )
@@ -473,8 +468,7 @@ class RemoteWorkerOps(WorkerOps):
         with self.remote.lock:
             self._acked(rec, req.op)
         answer = AbortResponse(Status.OK, items=self._cancel(rec, req.credits))
-        self.ledger.finish(rec.incarnation, entry, answer)
-        return answer
+        return self._finish_op(rec, entry, answer)
 
     def write_done(self, rec, decoded, reply, waiter=None):
         # COMMIT may block. The UDS reader remains available for DETACH.
@@ -496,46 +490,52 @@ class RemoteWorkerOps(WorkerOps):
         try:
             with self.remote.lock:
                 self._acked(rec, req.op)
-                domain = req.items[0].domain if req.items else None
-                valid = (
-                    0 < len(req.items) <= MAX_BATCH
-                    and domain is not None
-                    and all(
-                        i.domain == domain
-                        and self._credits.get(i.credit) == (rec.incarnation, domain)
-                        for i in req.items
-                    )
-                    and len({i.credit for i in req.items}) == len(req.items)
-                )
-                if valid:
-                    got = self.remote.call(
-                        Code.WRITE_DONE,
-                        RemoteWriteDoneRequest(
-                            PLACEHOLDER_OP,
-                            [
-                                Written(i.key, i.credit, i.logical_bytes, i.end)
-                                for i in req.items
-                            ],
-                            domain,
-                        ),
-                        op=True,
-                    )
-                    if got.status == Status.OK and len(got.items) == len(req.items):
-                        outcomes = got.items
-                        for item in req.items:
-                            self._credits.pop(item.credit, None)
-                    if any(i.end == TransferEnd.UNKNOWN for i in req.items):
-                        self._fence(domain)
+                if 0 < len(req.items) <= MAX_BATCH:
+                    counts = Counter(i.credit for i in req.items)
+                    groups = {}
+                    for index, item in enumerate(req.items):
+                        domain = item.domain
+                        if (
+                            counts[item.credit] == 1
+                            and domain is not None
+                            and self._credits.get(item.credit)
+                            == (rec.incarnation, domain)
+                            and self.workers.domains.get(domain.instance) == domain
+                        ):
+                            groups.setdefault(domain, []).append((index, item))
+                    for domain, group in groups.items():
+                        self._write_group(domain, group, outcomes)
         except (ConnectionError, TimeoutError):
             pass
         answer = WriteDoneResponse(Status.OK, items=outcomes)
-        self.ledger.finish(rec.incarnation, entry, answer)
-        reply(answer)
+        reply(self._finish_op(rec, entry, answer))
+
+    def _write_group(self, domain, group, outcomes):
+        got = self.remote.call(
+            Code.WRITE_DONE,
+            RemoteWriteDoneRequest(
+                PLACEHOLDER_OP,
+                [Written(i.key, i.credit, i.logical_bytes, i.end) for _, i in group],
+                domain,
+            ),
+            op=True,
+        )
+        if got.status == Status.OK and len(got.items) == len(group):
+            for (index, _), outcome in zip(group, got.items, strict=True):
+                outcomes[index] = outcome
+
+            def settle():
+                for _, item in group:
+                    if item.end != TransferEnd.UNKNOWN:
+                        self._credits.pop(item.credit, None)
+
+            self.workers.while_current(domain, settle)
+        if any(
+            i.end == TransferEnd.UNKNOWN for _, i in group
+        ) and self.workers.withdraw(domain):
+            self._fence(domain)
 
     def _fence(self, domain):
-        if domain in self._closed_domains:
-            return
-        self._closed_domains.add(domain)
         answer = self.remote.call(
             Code.FENCE_DOMAIN, FenceDomainRequest(PLACEHOLDER_OP, domain), op=True
         )
@@ -545,36 +545,40 @@ class RemoteWorkerOps(WorkerOps):
         for credit, (_, held_domain) in list(self._credits.items()):
             if held_domain == domain:
                 del self._credits[credit]
-        if self._domains.get(domain.instance) == domain:
-            del self._domains[domain.instance]
+        for key, (_, held_domain, _) in list(self._reserves.items()):
+            if held_domain == domain:
+                del self._reserves[key]
 
-    def remote_detach(self, rec):
-        self._control_tasks.submit(self._end_worker, rec.incarnation, False)
+    def _queue_cleanup(self, rec, domains):
+        self._control_tasks.submit(self._end_worker, rec, domains)
 
-    def _worker_lost(self, incarnation):
-        self._control_tasks.submit(self._end_worker, incarnation, False)
-
-    def _worker_ended(self, incarnation):
-        self._control_tasks.submit(self._end_worker, incarnation, True)
-
-    def _end_worker(self, incarnation, exited):
+    def _end_worker(self, rec, domains):
         with self.remote.lock:
-            ident = self._admitted.get(incarnation)
-            if ident is None:
-                return
             try:
-                domain = self._domains.get(ident.instance)
-                if domain is not None:
+                for domain in domains:
                     self._fence(domain)
-                name = self._agents.pop(incarnation, None)
+                name = self._agents.pop(rec.incarnation, None)
                 if name is not None:
                     self.remote.call(Code.AGENTS, AgentsRequest(remove=[name]))
             except (ConnectionError, TimeoutError):
                 pass
-            if exited:
-                self._admitted.pop(incarnation, None)
-                for key in [key for key in self._reserves if key[0] == incarnation]:
-                    del self._reserves[key]
+            self._forget_released(rec)
+
+    def _finish_op(self, rec, entry, answer):
+        self.ledger.finish(rec.incarnation, entry, answer)
+        if rec.staging_released:
+            with self.remote.lock:
+                self._forget_released(rec)
+        return answer
+
+    def _forget_released(self, rec):
+        if (
+            rec.staging_released
+            and rec.incarnation not in self._agents
+            and all(owner != rec.incarnation for owner, _ in self._credits.values())
+            and all(owner != rec.incarnation for owner, _ in self._reserves)
+        ):
+            self.workers.forget_released(rec)
 
     def stats(self):
         result = super().stats()

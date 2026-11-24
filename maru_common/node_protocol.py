@@ -139,6 +139,7 @@ class AttachRequest:
     role: SessionRole = SessionRole.WORKER
     step_objects: int = 0
     instance: str = ""
+    staging_id: str = ""
 
     def __post_init__(self):
         if (
@@ -210,6 +211,8 @@ class PeersAck:
 @dataclass
 class DetachRequest:
     """DETACH (0x02) - Sent after every credit is back and copies are done."""
+
+    staging_released: bool = False
 
 
 @dataclass
