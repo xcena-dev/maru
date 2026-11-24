@@ -47,6 +47,7 @@ class HoldingRm:
             f.write(b"\xa5" * 8192)
         self.map_hold_status = map_hold_status
         self.supports_holds = supports_holds
+        self.unhold_statuses = []  # Answered first, one per UNHOLD; then 0.
         self.requests = []
         self._lock = threading.Lock()
         self._server = MockResourceManagerServer(self._serve)
@@ -117,7 +118,8 @@ class HoldingRm:
                     40 + holder_len : 40 + holder_len + instance_len
                 ].decode()
                 self._record("unhold", region, holder, instance)
-                self._reply(sock, MsgType.UNHOLD_RESP, FreeResp(status=0).pack())
+                status = self.unhold_statuses.pop(0) if self.unhold_statuses else 0
+                self._reply(sock, MsgType.UNHOLD_RESP, FreeResp(status=status).pack())
             elif hdr.msg_type == MsgType.GET_ACCESS_REQ:
                 self._record("get_access", region)
                 self._reply(sock, MsgType.GET_ACCESS_RESP, self._access())
@@ -134,6 +136,14 @@ def rm(tmp_path):
     server = HoldingRm(tmp_path)
     yield server
     server.stop()
+
+
+@pytest.fixture
+def shm_log(caplog, monkeypatch):
+    """Warnings of maru_shm, also after setup_logging() stopped propagation."""
+    monkeypatch.setattr(logging.getLogger("maru_shm"), "propagate", True)
+    with caplog.at_level(logging.WARNING, logger="maru_shm.client"):
+        yield caplog
 
 
 def _handle(region_id=7):
@@ -268,15 +278,17 @@ def test_a_failed_mapping_drops_its_hold(rm):
         client.close()
 
 
-def test_a_resource_manager_without_map_holds_is_asked_once(tmp_path, caplog):
+def test_a_resource_manager_without_map_holds_is_asked_once(tmp_path, shm_log):
     rm = HoldingRm(tmp_path, supports_holds=False)
     client = MaruShmClient(address=rm.address)
     try:
-        with caplog.at_level(logging.WARNING, logger="maru_shm.client"):
-            client.mmap(_handle(1), _RW)
-            client.mmap(_handle(2), _RW)
+        client.mmap(_handle(1), _RW)
+        client.mmap(_handle(2), _RW)
         assert rm.kinds() == ["map_hold", "get_access", "get_access"]
-        warnings = [r for r in caplog.records if "does not hold mapped" in r.message]
+        client._map_holds_retry_at = 0.0  # Later: it is asked once more.
+        client.mmap(_handle(3), _RW)
+        assert rm.kinds()[3:] == ["map_hold", "get_access"]
+        warnings = [r for r in shm_log.records if "does not hold mapped" in r.message]
         assert len(warnings) == 1
         client.munmap(_handle(1))
         client.close()
@@ -285,15 +297,36 @@ def test_a_resource_manager_without_map_holds_is_asked_once(tmp_path, caplog):
         rm.stop()
 
 
-def test_unhold_failure_does_not_fail_munmap(rm, caplog):
+def test_an_upgraded_resource_manager_holds_what_the_client_maps(tmp_path):
+    rm = HoldingRm(tmp_path, supports_holds=False)
+    client = MaruShmClient(address=rm.address)
+    try:
+        client.mmap(_handle(1), _RW)
+        client.mmap(_handle(2), _RW)
+        client.munmap(_handle(2))
+        assert rm.kinds() == ["map_hold", "get_access", "get_access"]
+        # The resource manager is restarted with a version that has MAP_HOLD.
+        rm.supports_holds = True
+        client._map_holds_retry_at = 0.0
+        client.mmap(_handle(3), _RW)
+        # Region 3 is held before it is mapped; region 1, still mapped
+        # without a hold, is held now; region 2 is no longer mapped.
+        assert [r[:2] for r in rm.requests[3:]] == [("map_hold", 3), ("map_hold", 1)]
+        client.close()
+        assert rm.kinds()[5:] == ["unhold", "unhold"]
+        assert sorted(r[1] for r in rm.requests[5:]) == [1, 3]
+    finally:
+        rm.stop()
+
+
+def test_unhold_failure_does_not_fail_munmap(rm, shm_log):
     client = MaruShmClient(address=rm.address)
     mm = client.mmap(_handle(), _RW)
     _lose_rm(client)
-    with caplog.at_level(logging.WARNING, logger="maru_shm.client"):
-        client.munmap(_handle())
-        client.close()
+    client.munmap(_handle())
+    client.close()
     assert mm.closed
-    assert any("could not drop the hold" in r.message for r in caplog.records)
+    assert any("could not drop the hold" in r.message for r in shm_log.records)
 
 
 def _lose_rm(client):
@@ -351,6 +384,62 @@ def test_a_missed_unhold_is_dropped_when_the_region_is_mapped_again(rm):
     finally:
         client.close()
     assert rm.kinds()[3:] == ["unhold"]
+
+
+def test_an_unhold_the_rm_could_not_save_is_sent_again(rm):
+    client = MaruShmClient(address=rm.address)
+    client.mmap(_handle(1), _RW)
+    client.mmap(_handle(2), _RW)
+    rm.unhold_statuses = [-errno.EIO]  # The RM keeps the hold.
+    client.munmap(_handle(1))
+    client.munmap(_handle(2))  # Waits behind the first: not sent yet.
+    client.get_access(_handle(2))  # An answer does not end this wait.
+    assert rm.kinds()[2:] == ["unhold", "get_access"]
+    client.close()
+    assert rm.kinds()[4:] == ["unhold", "unhold"]
+    assert sorted(r[1] for r in rm.requests[4:]) == [1, 2]
+
+
+def test_an_unhold_for_a_region_that_is_gone_is_not_sent_again(rm):
+    client = MaruShmClient(address=rm.address)
+    client.mmap(_handle(), _RW)
+    rm.unhold_statuses = [-errno.ENOENT]
+    client.munmap(_handle())
+    client.close()
+    assert rm.kinds() == ["map_hold", "unhold"]
+
+
+def test_close_closes_the_other_regions_when_one_cannot_be_closed(rm):
+    client = MaruShmClient(address=rm.address)
+    first = client.mmap(_handle(1), _RW)
+    second = client.mmap(_handle(2), _RW)
+    exported = memoryview(first)
+    try:
+        with pytest.raises(BufferError):
+            client.close()
+        assert second.closed and not first.closed
+        # Region 1 can still be written through `exported`: it stays held.
+        assert rm.requests[2:] == [("unhold", 2, rm.requests[1][2], rm.requests[1][2])]
+        client.close()  # Nothing left to close or to report.
+        assert len(rm.requests) == 3
+    finally:
+        exported.release()
+        first.close()
+
+
+def test_a_forked_child_cannot_map_with_the_parents_client(rm):
+    client = MaruShmClient(address=rm.address)
+    try:
+        mm = client.mmap(_handle(1), _RW)
+        pid = client._pid
+        client._pid += 1  # The same client as a forked child sees it.
+        assert client.mmap(_handle(1), _RW) is mm  # Inherited: still readable.
+        with pytest.raises(RuntimeError, match="created before fork"):
+            client.mmap(_handle(2), _RW)
+        assert rm.kinds() == ["map_hold"]
+        client._pid = pid
+    finally:
+        client.close()
 
 
 def test_a_forked_child_does_not_drop_the_parents_hold(rm):

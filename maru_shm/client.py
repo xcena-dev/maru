@@ -73,6 +73,9 @@ class HoldsUnsupportedError(HoldRefusedError):
 
 
 # Refusals: sending the same request again gets the same answer.
+# How long a resource manager without MAP_HOLD is not asked again.
+_MAP_HOLD_RETRY_S = 60
+
 _NOT_RETRYABLE = (
     0,
     -errno.ENOSYS,
@@ -189,8 +192,16 @@ class MaruShmClient:
         # No unhold is tried before this time (the RM was unreachable), other
         # than after an answer of the RM.
         self._unhold_after = 0.0
-        # False once the resource manager turned out to predate MAP_HOLD.
+        # Whether an answer of the RM ends that wait: yes if it was
+        # unreachable, no if it answered that it could not drop a hold.
+        self._unhold_forceable = True
+        # False once the resource manager turned out to predate MAP_HOLD. It
+        # is asked again from _map_holds_retry_at on (it may be upgraded), and
+        # the regions mapped without a hold meanwhile are then held too.
         self._map_holds = True
+        self._map_holds_retry_at = 0.0
+        self._map_holds_warned = False
+        self._unheld: dict[int, MaruHandle] = {}  # region_id -> mapped, not held
         self._sock: socket.socket | None = None
         self._conn_lock = threading.Lock()
 
@@ -279,7 +290,7 @@ class MaruShmClient:
             # Not while another thread maps or unmaps: that one flushes.
             if self._hold_lock.acquire(blocking=False):
                 try:
-                    self._flush_unholds(force=True)
+                    self._flush_unholds(force=self._unhold_forceable)
                 finally:
                     self._hold_lock.release()
         return result
@@ -464,13 +475,17 @@ class MaruShmClient:
             client_id=self._client_id,
             request_id=_next_request_id(),
         )
+        status = self._unhold_status(req)
+        if status == -errno.EINVAL:
+            raise HoldRefusedError(f"Unhold failed with status {status}")
+        if status != 0:
+            raise RuntimeError(f"Unhold failed with status {status}")
+
+    def _unhold_status(self, req: UnholdReq) -> int:
+        """Send an unhold; returns the status the resource manager answers."""
         hdr, payload = self._rpc(MsgType.UNHOLD_REQ, req.pack())
         self._check_hold_error(hdr, payload, "Unhold failed")
-        resp = FreeResp.unpack(payload)
-        if resp.status == -errno.EINVAL:
-            raise HoldRefusedError(f"Unhold failed with status {resp.status}")
-        if resp.status != 0:
-            raise RuntimeError(f"Unhold failed with status {resp.status}")
+        return FreeResp.unpack(payload).status
 
     def reset_holds(self, holder: str, instance: str) -> int:
         """Drop the holds of ``holder``'s other instances; they have ended.
@@ -544,13 +559,21 @@ class MaruShmClient:
             err = ErrorResp.unpack(payload)
             if err.status == -errno.ENOSYS:
                 self._map_holds = False
-                logger.warning(
-                    "the resource manager at %s does not hold mapped regions "
-                    "(it predates this Maru version): a region freed while "
-                    "this process maps it can be handed to another owner. "
-                    "Restart the resource manager with this Maru version",
-                    self._address,
-                )
+                self._map_holds_retry_at = time.monotonic() + _MAP_HOLD_RETRY_S
+                if not self._map_holds_warned:
+                    self._map_holds_warned = True
+                    logger.warning(
+                        "the resource manager at %s does not hold mapped "
+                        "regions (it predates this Maru version): a region "
+                        "freed while this process maps it can be handed to "
+                        "another owner. Restart the resource manager with "
+                        "this Maru version; this client asks again at most "
+                        "every %d s when it maps a region, and then holds "
+                        "the regions it maps. A client that maps nothing "
+                        "more stays unprotected until it is restarted",
+                        self._address,
+                        _MAP_HOLD_RETRY_S,
+                    )
                 return None
             raise RuntimeError(f"Map hold failed ({err.status}): {err.message}")
         resp = GetAccessResp.unpack(payload)
@@ -597,10 +620,18 @@ class MaruShmClient:
                 if region_id in self._unclosed:
                     del self._unhold_pending[region_id]
                     continue
+                req = UnholdReq(
+                    handle=handle,
+                    holder=self._map_holder,
+                    instance=self._map_holder,
+                    client_id=self._client_id,
+                    request_id=_next_request_id(),
+                )
                 try:
-                    self.unhold(handle, self._map_holder, self._map_holder)
+                    status = self._unhold_status(req)
                 except OSError as exc:
                     self._unhold_after = time.monotonic() + 30.0
+                    self._unhold_forceable = True
                     logger.warning(
                         "could not drop the hold of region %d (%s); tried "
                         "again after the next answer of the resource manager, "
@@ -610,13 +641,33 @@ class MaruShmClient:
                     )
                     return
                 except RuntimeError as exc:
-                    # The RM answered: asking again changes nothing.
+                    # Refused as a request: asking again changes nothing.
                     logger.warning(
                         "could not drop the hold of region %d (%s); the "
                         "resource manager keeps its range out of use until "
                         "this process exits",
                         region_id,
                         exc,
+                    )
+                    status = 0
+                if status not in _NOT_RETRYABLE:
+                    # The RM kept the hold (e.g. it could not save the drop).
+                    self._unhold_after = time.monotonic() + 5.0
+                    self._unhold_forceable = False
+                    logger.warning(
+                        "could not drop the hold of region %d (status %d); "
+                        "tried again later and in close()",
+                        region_id,
+                        status,
+                    )
+                    return
+                if status != 0:
+                    logger.warning(
+                        "could not drop the hold of region %d (status %d); "
+                        "the resource manager keeps its range out of use "
+                        "until this process exits",
+                        region_id,
+                        status,
                     )
                 self._unhold_pending.pop(region_id, None)
         finally:
@@ -920,8 +971,18 @@ class MaruShmClient:
 
         # Slow path: network RPC outside _lock. The hold comes before the
         # mapping, so that the range is never mapped without one.
+        if os.getpid() != self._pid:
+            # Its hold could never be dropped: this client's holds are named
+            # after, and dropped by, the process that created it.
+            raise RuntimeError(
+                "this MaruShmClient was created before fork(): create a new "
+                "one in the child to map a region"
+            )
         with self._hold_lock:
-            return self._mmap_held(handle, prot, path)
+            mm = self._mmap_held(handle, prot, path)
+            if self._map_holds and self._unheld:
+                self._hold_unheld()
+            return mm
 
     def _mmap_held(
         self, handle: MaruHandle, prot: int, path: str | None
@@ -930,6 +991,8 @@ class MaruShmClient:
         with self._lock:
             if handle.region_id in self._mmap_cache:  # Mapped meanwhile.
                 return self._mmap_cache[handle.region_id]
+        if not self._map_holds and time.monotonic() >= self._map_holds_retry_at:
+            self._map_holds = True  # Ask again: the RM may be a newer one now.
         access_resp = self._hold_mapping(handle) if self._map_holds else None
         held = access_resp is not None
         try:
@@ -961,6 +1024,8 @@ class MaruShmClient:
                 self._mmap_cache[handle.region_id] = mm
                 if held:
                     self._held[handle.region_id] = handle
+                else:
+                    self._unheld[handle.region_id] = handle
         except BaseException:
             if held:
                 self._unhold_mapping(handle)
@@ -974,6 +1039,32 @@ class MaruShmClient:
             path,
         )
         return mm
+
+    def _hold_unheld(self) -> None:
+        """Hold the regions mapped while the RM had no MAP_HOLD (best effort).
+
+        Call with ``_hold_lock`` held, once the resource manager answers
+        MAP_HOLD after all.
+        """
+        for region_id, handle in list(self._unheld.items()):
+            try:
+                if self._hold_mapping(handle) is None:
+                    return  # Not supported after all.
+            except (RuntimeError, OSError) as exc:
+                logger.warning(
+                    "region %d stays mapped without a hold (%s)", region_id, exc
+                )
+                if isinstance(exc, OSError):
+                    return
+                self._unheld.pop(region_id, None)
+                continue
+            with self._lock:
+                self._unheld.pop(region_id, None)
+                self._held[region_id] = handle
+        logger.info(
+            "the resource manager at %s now holds the regions this client maps",
+            self._address,
+        )
 
     def munmap(self, handle: MaruHandle) -> None:
         """Unmap a previously mapped handle and drop its hold.
@@ -1015,6 +1106,7 @@ class MaruShmClient:
         """
         mm = self._mmap_cache.pop(region_id, None)
         held = self._held.pop(region_id, None)
+        self._unheld.pop(region_id, None)
         if mm is not None:
             try:
                 mm.close()
@@ -1027,14 +1119,26 @@ class MaruShmClient:
         return held
 
     def close(self) -> None:
-        """Close all cached mmaps, drop their holds, and close the connection."""
+        """Close all cached mmaps, drop their holds, and close the connection.
+
+        Raises:
+            BufferError: if buffers exported from a mapping still exist, after
+                everything else was closed. That mapping lives until they are
+                released, and its hold until this process exits.
+        """
         unmapped: list[MaruHandle] = []
+        unclosed: BufferError | None = None
         with self._hold_lock:
             try:
                 with self._lock:
                     num_mmaps = len(self._mmap_cache)
                     for region_id in list(self._mmap_cache.keys()):
-                        held = self._close_region_locked(region_id)
+                        try:
+                            held = self._close_region_locked(region_id)
+                        except BufferError as exc:
+                            # Its hold stays; the others are still dropped.
+                            unclosed = unclosed or exc
+                            continue
                         if held is not None:
                             unmapped.append(held)
                     self._mmap_cache.clear()
@@ -1052,6 +1156,11 @@ class MaruShmClient:
                 with self._conn_lock:
                     self._close_conn()
         logger.debug("close(): released %d mmaps", num_mmaps)
+        if unclosed is not None:
+            raise unclosed
 
     def __del__(self) -> None:
-        self.close()
+        try:
+            self.close()
+        except BufferError:
+            pass  # Exported buffers outlive the client; nothing to report to.
