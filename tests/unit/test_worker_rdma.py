@@ -433,12 +433,13 @@ def test_uncertain_batch_keeps_every_slot_until_completion(env, monkeypatch, com
     assert all(r.result() is None and r.reason == "io_error" for r in requests)
     assert env.reader.snapshot()["free_slots"] == 2
     assert env.reader.capacity() == 0
-    assert len(env.unpins) == 2
+    assert not env.unpins
     if complete:
         env.agent.finish_stalled()
     else:
         env.agent.fail_stalled(late=True)
     env.reader.progress()
+    assert len(env.unpins) == (2 if complete else 0)
     assert env.reader.snapshot()["free_slots"] == (4 if complete else 2)
     if not complete:
         env.agent.deliver_late()
@@ -1066,6 +1067,8 @@ def test_a_unknown_write_fences_its_domain_and_the_worker_gets_a_new_one(env, wr
     buffer = env.reader.alloc_write(credit, PAGE)
     buffer.view[:] = b"w" * PAGE
     assert env.reader.write(buffer) == TransferEnd.UNKNOWN
+    env.reader.release_write(buffer)
+    assert not buffer.released and env.reader.capacity() == 3
     # A timeout sends UNKNOWN; it does not reclaim the memory-node page.
     assert env.reader.alloc_write(credit, PAGE) is None
     transport.deregister(registration)

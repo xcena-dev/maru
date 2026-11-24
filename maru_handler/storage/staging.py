@@ -106,23 +106,14 @@ class StagingBuffer:
     def close(self) -> None:
         """Unmap the buffer unless a caller still holds an exported view."""
         if self.cuda_registered:
-            try:
-                import torch
+            import torch
 
-                from maru_handler.memory.mapper import (
-                    _clear_cuda_sticky_error,
-                    _cuda_rc,
-                )
+            from maru_handler.memory.mapper import _clear_cuda_sticky_error, _cuda_rc
 
-                if _cuda_rc(torch.cuda.cudart().cudaHostUnregister(self.address)) != 0:
-                    _clear_cuda_sticky_error()
-            except (ImportError, RuntimeError, OSError) as exc:
-                logger.warning(
-                    "cudaHostUnregister of the remote staging buffer failed: %s", exc
-                )
+            rc = _cuda_rc(torch.cuda.cudart().cudaHostUnregister(self.address))
+            if rc != 0:
+                _clear_cuda_sticky_error()
+                raise RuntimeError(f"cudaHostUnregister of worker staging failed: {rc}")
             self.cuda_registered = False
-        try:
-            self._view.release()
-            self._mapping.close()
-        except BufferError:
-            logger.warning("remote staging buffer still exported; leaving it mapped")
+        self._view.release()
+        self._mapping.close()

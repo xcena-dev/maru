@@ -129,6 +129,7 @@ class WorkerRdma:
         transport_factory=None,
         progress=True,
         quarantine_max=None,
+        current_connection=None,
     ):
         self.config = config
         self.gate = threading.Lock()
@@ -154,6 +155,9 @@ class WorkerRdma:
         self._releases: deque[RemoteRead] = deque()
         self._peers: dict[str, PeerAccess] = {}
         self._ready_peers: dict[str, PeerAccess] = {}
+        self._current_connection = current_connection
+        self._peer_conn = None
+        self._pin_waiters: deque[ReadRequest] = deque()
         self._peer_lock = threading.Lock()
         self._loaded: dict[str, bytes] = {}
         self._read_retry_at: dict[str, float] = {}
@@ -162,7 +166,7 @@ class WorkerRdma:
         self._retired_domains = set()
         self._domain_agents = {}
         self._agent_domains = {}
-        self._write_pending: list[object] = []
+        self._write_pending: dict[WriteBuffer, object] = {}
         self._wake = threading.Event()
         self._thread = None
         self.transport = None
@@ -237,14 +241,49 @@ class WorkerRdma:
     def advance(self, *, drop_credits=False):
         """Invalidate reads before a lifecycle operation drops their pins."""
         with self.gate:
-            self.generation += 1
+            self._advance()
             if drop_credits:
                 self._credit_agents.clear()
-            for flight in self._flights:
-                for request in flight.waiters:
-                    request.reason = "generation"
-                    request.ready.set()
+
+    def _advance(self):
+        self.generation += 1
+        for flight in self._flights:
+            for request in flight.waiters:
+                request.reason = "generation"
+                request.ready.set()
         self._wake.set()
+
+    def connection_lost(self, conn):
+        with self.gate:
+            if self._peer_conn is conn:
+                self._peer_conn = None
+                self._peers = {}
+                self._ready_peers = {}
+                self._advance()
+
+    def _live(self, conn):
+        return self._current_connection is None or (
+            conn is not None and self._current_connection() is conn and not conn.closed
+        )
+
+    def has_owners(self):
+        if not self.gate.acquire(False):
+            return True
+        try:
+            return bool(
+                self._flights
+                or self._writing
+                or self._write_pending
+                or self.stopped.is_set()
+            )
+        finally:
+            self.gate.release()
+
+    def reading_source(self):
+        with self.gate:
+            return any(
+                f.pending is not None and not f.pending.completed for f in self._flights
+            )
 
     def stop(self):
         """Record CUDA stop immediately, including during a post."""
@@ -255,6 +294,8 @@ class WorkerRdma:
         self._wake.set()
 
     def _load(self, name, metadata, *, read=False):
+        if self.closed or self.stopped.is_set():
+            return False
         if name in self._loaded:
             if self._loaded[name] == metadata and (
                 not read or self.transport.peer_ready_hint(name)
@@ -273,11 +314,12 @@ class WorkerRdma:
         self._loaded[name] = metadata
         return True
 
-    def notify_peers(self, peers: list[ReadPeer]):
+    def notify_peers(self, peers: list[ReadPeer], conn=None):
         """Order peer changes with read posting and handoff."""
         with self.gate:
-            if self.closed or self.stopped.is_set():
+            if self.closed or self.stopped.is_set() or not self._live(conn):
                 return
+            self._peer_conn = conn
             entries = {}
             for peer in peers:
                 for pool in peer.pools:
@@ -346,6 +388,7 @@ class WorkerRdma:
         return (
             not self.stopped.is_set()
             and not self.closed
+            and self._live(self._peer_conn)
             and flight.generation == self.generation
             and flight.current()
             and self._peers.get(flight.location.pool_id) is flight.peer
@@ -383,6 +426,7 @@ class WorkerRdma:
             if (
                 self.closed
                 or self.stopped.is_set()
+                or not self._live(self._peer_conn)
                 or generation != self.generation
                 or not current()
             ):
@@ -532,7 +576,7 @@ class WorkerRdma:
 
     def progress(self):
         if self.stopped.is_set() or not (
-            self._flights or self._releases or self._write_pending
+            self._flights or self._releases or self._write_pending or self._pin_waiters
         ):
             return False
         if not self.gate.acquire(False):
@@ -570,9 +614,18 @@ class WorkerRdma:
                         request.ready.set()
                 self._reclaim(flight)
                 active = active or (pending is not None and not pending.finished)
-            for pending in list(self._write_pending):
+            for _ in range(len(self._pin_waiters)):
+                request = self._pin_waiters.popleft()
+                flight = request.flight
+                if flight is None or flight.pending is None or flight.pending.completed:
+                    if not self.stopped.is_set():
+                        request.unpin([request.outcome.pin_id])
+                else:
+                    self._pin_waiters.append(request)
+            for buffer, pending in list(self._write_pending.items()):
                 if self.transport.poll_nowait(pending):
-                    self._write_pending.remove(pending)
+                    del self._write_pending[buffer]
+                    self.release_write_unlocked(buffer)
             return active or bool(self._write_pending)
         finally:
             self.gate.release()
@@ -602,9 +655,11 @@ class WorkerRdma:
         if request.decided:
             return None
         result = None
+        defer_pin = False
         if not self._acquire_gate(request.deadline):
             request.reason = request._decision.setdefault("reason", "gate_busy")
             request.decided = True
+            defer_pin = request.flight is not None
             self._wake.set()
         else:
             try:
@@ -651,11 +706,18 @@ class WorkerRdma:
                     else:
                         self._remove_join(flight)
                 if flight is not None:
+                    defer_pin = (
+                        flight.pending is not None and not flight.pending.completed
+                    )
                     self._reclaim(flight)
             finally:
                 self.gate.release()
         if not self.stopped.is_set() and request.outcome.pin_id:
-            request.unpin([request.outcome.pin_id])
+            if defer_pin:
+                self._pin_waiters.append(request)
+                self._wake.set()
+            else:
+                request.unpin([request.outcome.pin_id])
         return None if self.stopped.is_set() else result
 
     def release(self, read):
@@ -678,7 +740,7 @@ class WorkerRdma:
         read.flight.consumers.discard(read)
         self._reclaim(read.flight)
 
-    def bind_credits(self, credits, agent, node_id, node_epoch):
+    def bind_credits(self, credits, agent, node_id, node_epoch, conn=None):
         agent = copy.deepcopy(agent)
         domain = agent.domain
         old = self._domain_agents.get(domain)
@@ -699,7 +761,7 @@ class WorkerRdma:
                 return False
         pools = {p.pool_id: p for p in agent.pools}
         with self.gate:
-            if self.stopped.is_set() or self.closed:
+            if self.stopped.is_set() or self.closed or not self._live(conn):
                 return False
             for credit in credits:
                 pool = pools.get(credit.pool_id)
@@ -726,8 +788,10 @@ class WorkerRdma:
     def owns_credit(self, credit):
         return credit in self._credit_agents
 
-    def forget_credits(self, credits):
+    def forget_credits(self, credits, conn=None):
         with self.gate:
+            if not self._live(conn):
+                return
             for credit in credits:
                 self._credit_agents.pop(credit, None)
 
@@ -764,7 +828,11 @@ class WorkerRdma:
 
     def release_write(self, buffer):
         with self.gate:
-            if self.stopped.is_set() or buffer.released:
+            if (
+                self.stopped.is_set()
+                or buffer.released
+                or buffer in self._write_pending
+            ):
                 return
             buffer.released = True
             buffer.view.release()
@@ -777,8 +845,13 @@ class WorkerRdma:
         with self.gate:
             if self.stopped.is_set() or buffer.released:
                 return TransferEnd.NOT_POSTED
-            self._credit_agents.pop(buffer.location, None)
-            if self.closed or buffer.agent.domain in self._retired_domains:
+            binding = self._credit_agents.pop(buffer.location, None)
+            if (
+                self.closed
+                or not self._live(self._peer_conn)
+                or binding is not buffer.agent
+                or buffer.agent.domain in self._retired_domains
+            ):
                 return TransferEnd.NOT_POSTED
             pool = next(
                 p for p in buffer.agent.pools if p.pool_id == buffer.location.pool_id
@@ -814,15 +887,16 @@ class WorkerRdma:
                 time.sleep(0.0002)
         with self.gate:
             if self.stopped.is_set():
-                self._write_pending.append(pending)
+                self._write_pending[buffer] = pending
                 return TransferEnd.UNKNOWN
             if not pending.finished:
-                self._write_pending.append(pending)
+                self._write_pending[buffer] = pending
                 self._wake.set()
             end = TransferEnd.DONE if pending.completed else TransferEnd.UNKNOWN
             if end == TransferEnd.UNKNOWN:
                 self._retired_domains.add(buffer.agent.domain)
-            self.release_write_unlocked(buffer)
+            if pending.finished:
+                self.release_write_unlocked(buffer)
             return end
 
     def release_write_unlocked(self, buffer):
@@ -845,13 +919,14 @@ class WorkerRdma:
         self._wake.set()
         if self._thread is not None:
             self._thread.join(timeout=1)
-        if not keep:
-            try:
-                self.transport.close()
-                self.staging.close()
-                return True
-            except Exception:
-                logger.exception("RDMA staging cleanup failed")
+        with self._peer_lock:
+            if not keep and not self.stopped.is_set():
+                try:
+                    self.transport.close()
+                    self.staging.close()
+                    return True
+                except Exception:
+                    logger.exception("RDMA staging cleanup failed")
         _KEPT_UNTIL_EXIT.append(self)
         return False
 

@@ -2,16 +2,9 @@
 # Copyright 2026 XCENA Inc.
 """MaruClient: the storage client behind MaruHandler on maru_node.
 
-ATTACH to the node, map its pools, open the worker session with the node-view
-pid, keep credit at hand. On a UDS break it unmaps the pools once unused (a
-new run may need their memory) and attaches again: to the same run it maps
-them again, keeps credit and resends unresolved ops; to a new run it drops
-them. A read goes only through the mapping of the
-run its lookup was answered under. If the node refuses the attach after the
-start, the client turns off: no loads, no stores, no retries. After a
-MaruServer restart it drops the pins of the ended epoch. A metadata-only
-client (a vLLM scheduler) attaches as a probe: no pool, credit or pin, PROBE
-only.
+A new node run drops old credit and unresolved ops. Local workers can replay
+them on the same run. A remote worker loses access after its connection ends
+and that run refuses its incarnation.
 """
 
 import collections
@@ -341,6 +334,7 @@ class MaruClient:
         self._attaching_epoch: str | None = None
         self._handles: set[CreditHandle] = set()
         self._reads: set[PinnedRead] = set()
+        self._staging_id = uuid.uuid4().hex
         self._rdma: WorkerRdma | None = None
         self._stopped = threading.Event()
         self._retrieve_local = threading.local()
@@ -608,6 +602,7 @@ class MaruClient:
             protocol=MS_PROTOCOL,
             capabilities=[WORKER_RDMA_CAPABILITY, HINT_CAPABILITY],
             instance=self.config.instance_id,
+            staging_id=self._staging_id,
             role=self.role,
             step_objects=self.config.step_objects if self._writes else 0,
         )
@@ -699,13 +694,13 @@ class MaruClient:
                     self._rdma = WorkerRdma(
                         self.config,
                         response.page_size,
+                        current_connection=lambda: self._storage,
                         quarantine_max=response.staging.quarantine_max
                         if response.staging
                         else None,
                     )
                 elif self._rdma.staging.slot_bytes != response.page_size:
                     raise AttachRefusedError("RDMA page size changed")
-                self._rdma.notify_peers(response.peers)
                 joined = conn.request(
                     NodeMessageType.READ_JOIN,
                     ReadJoinRequest(self._rdma.name, self._rdma.transport.metadata()),
@@ -737,6 +732,8 @@ class MaruClient:
                     continue
                 added.append(descriptor.pool.pool_id)
             close_fds(fds)  # those of pools still mapped
+            if not same_run and self._rdma is not None:
+                self._rdma.advance(drop_credits=True)
         except BaseException:
             with self._lock:
                 self._attaching_epoch = None
@@ -746,12 +743,10 @@ class MaruClient:
         with self._lock:
             self._attaching_epoch = None
             # close() sets _closing under this lock: it sees what is installed
-            closed = self._closing.is_set()
+            closed = self._closing.is_set() or conn.closed
             if not closed:
                 if not same_run:
                     self.credits.reset(response.node_epoch)
-                    if self._rdma is not None:
-                        self._rdma.advance(drop_credits=True)
                     if self.node_epoch is not None:
                         logger.warning(
                             "the StorageService restarted (node epoch %s -> %s); "
@@ -763,6 +758,7 @@ class MaruClient:
                     self._ops = OpTracker(
                         self.identity.incarnation, response.node_epoch
                     )
+                    self._credit_op = None
                     self._returns.clear()
                 self.attach_info = response
                 self._storage = conn
@@ -772,14 +768,14 @@ class MaruClient:
             conn.close()
             for pool_id in added:
                 self.pools.remove(pool_id)
-            raise StorageUnavailableError("the client is closed")
+            raise StorageUnavailableError("closed during attach")
+        if self._rdma is not None:
+            self._rdma.notify_peers(response.peers, conn)
         if not first:
             if same_run:
                 self._resend_unresolved()
             elif self._server is not None:
-                self._server.move_to(
-                    response.node_epoch, response.pid, response.pid_start
-                )
+                self._move_session(response)
             conn.start_notifications()
             self._refill_wake.set()
             self._unmap_unused_old_pools()
@@ -794,17 +790,17 @@ class MaruClient:
 
             _KEPT_UNTIL_EXIT.append(self)
             return
-        self._hints.close(timeout_s=1, end_open=True)
         with self._lock:
             if self._closing.is_set():
                 return
             self._closing.set()
-            if self._rdma is not None:
-                self._rdma.advance()
             handles = [h for h in self._handles if h.state == "writing"]
             reads = list(self._reads)
             connecting = self._connecting
             connect_thread = self._connect_thread
+        if self._rdma is not None:
+            self._rdma.advance()
+        self._hints.close(timeout_s=1, end_open=True)
         if connecting is not None:
             connecting.close()
         if handles:
@@ -851,20 +847,26 @@ class MaruClient:
         # MaruServer drops our pins on WORKER_CLOSE, or on the WORKER_EXIT the
         # node reports once this process ends. A DETACH makes the node forget
         # us, so it goes only once MaruServer holds nothing of ours.
+        staging_released = self._rdma is not None and self._rdma.close()
+        owned = handles or reads or (self._rdma is not None and self._rdma.has_owners())
         with self._lock:
             server, self._server = self._server, None
-        ended = server.close(goodbye=not (handles or reads)) if server else True
-        if ended and not (handles or reads):
+        ended = (
+            server.close(goodbye=not (owned or self._stopped.is_set()))
+            if server
+            else True
+        )
+        if ended and not owned and not self._stopped.is_set():
             try:
                 if storage is not None and not storage.closed:
                     storage.request(
-                        NodeMessageType.DETACH, DetachRequest(), CLOSE_TIMEOUT_S
+                        NodeMessageType.DETACH,
+                        DetachRequest(staging_released),
+                        CLOSE_TIMEOUT_S,
                     )
             except Exception as e:
                 logger.warning("DETACH before closing failed: %s", e)
         self._teardown(writing=handles, reading=reads)
-        if self._rdma is not None:
-            self._rdma.close()
         reads_seen = {
             name: n
             for name, n in sorted(self._counters().items())
@@ -1055,6 +1057,8 @@ class MaruClient:
                 self._handles.add(handle)
             info = self.attach_info
         if off:
+            if remote is not None:
+                self._rdma.release_write(remote)
             _release_view(view)
             self._return_credits([credit])
             self._count("store_skipped_off")
@@ -1478,7 +1482,7 @@ class MaruClient:
                     if any(p.pool_id == c.pool_id for p in remote.pools)
                 ]
                 if not self._rdma.bind_credits(
-                    remote_credits, remote, info.node_id, epoch
+                    remote_credits, remote, info.node_id, epoch, grant_storage
                 ):
                     self._count("credit_bad_domain")
                     # A lost connection fences its domain on the service.
@@ -1502,7 +1506,7 @@ class MaruClient:
             if self.credits.put(mapped, epoch):
                 got.extend(mapped)
             elif remote_credits:
-                self._rdma.forget_credits(remote_credits)
+                self._rdma.forget_credits(remote_credits, grant_storage)
 
         reply = self._send_op(NodeMessageType.CREDIT, request, on_result, ops)
         try:
@@ -1611,7 +1615,7 @@ class MaruClient:
                 else:
                     # Returned or refused, these pages are out of the worker cache.
                     if self._rdma is not None:
-                        self._rdma.forget_credits(batch)
+                        self._rdma.forget_credits(batch, storage)
 
             reply.add_done_callback(done)
 
@@ -1998,6 +2002,8 @@ class MaruClient:
         with self._lock:
             if conn is self._storage:
                 self._storage = None
+        if self._rdma is not None:
+            self._rdma.connection_lost(conn)
         self._lost.set()
 
     def _keep_attached(self) -> None:
@@ -2014,7 +2020,14 @@ class MaruClient:
             if storage is not None and not storage.closed:
                 if self._rdma is not None:
                     self._rdma.refresh_peers()
+                    if (
+                        self._server is not None
+                        and self._server.node_epoch != self.node_epoch
+                    ):
+                        self._move_session(self.attach_info)
                 continue
+            if storage is not None:
+                self._on_lost(storage)
             self._unmap_on_loss()
             try:
                 conn, response, fds = self._attach(
@@ -2023,6 +2036,10 @@ class MaruClient:
                 self._take_attach(conn, response, fds, first=False)
             except AttachRefusedError as e:
                 self._turn_off(e)
+                while self._rdma is not None and self._server is not None:
+                    if self._closing.wait(RECONNECT_S):
+                        break
+                    self._end_session_when_off()
                 return
             except Exception as e:
                 now = time.monotonic()
@@ -2047,8 +2064,8 @@ class MaruClient:
                 return
             self.off = error
             self.refused = error
-            if self._rdma is not None:
-                self._rdma.advance()
+        if self._rdma is not None:
+            self._rdma.advance()
         self.credits.close()
         self._refill_wake.set()
         logger.error(
@@ -2068,6 +2085,8 @@ class MaruClient:
             if (
                 self.off is None
                 or self._reads
+                or self._stopped.is_set()
+                or (self._rdma is not None and self._rdma.has_owners())
                 or any(h.state == "writing" for h in self._handles)
             ):
                 return
@@ -2093,7 +2112,15 @@ class MaruClient:
         )
         if self._rdma is not None:
             self._rdma.advance()
-        server.move_to(info.node_epoch, info.pid, info.pid_start)
+        self._move_session(info)
+
+    def _move_session(self, info):
+        # Opening on the new run releases the old session's orphan pins.
+        if self._rdma is not None and self._rdma.reading_source():
+            return
+        server = self._server
+        if server is not None:
+            server.move_to(info.node_epoch, info.pid, info.pid_start)
 
     def _unmap_on_loss(self) -> None:
         """The node connection is gone: every pool is unmapped once unused (a
@@ -2133,8 +2160,8 @@ class MaruClient:
         if self._stopped.is_set():
             return
         if isinstance(notify, Peers):
-            if conn is self._storage and not conn.closed and self._rdma is not None:
-                self._rdma.notify_peers(notify.peers)
+            if self._rdma is not None:
+                self._rdma.notify_peers(notify.peers, conn)
             return
         if notify.kind == NotifyKind.CREDIT_RETURN:
             with self._lock:
