@@ -534,6 +534,41 @@ def test_several_kv_cache_groups_are_taken(monkeypatch):
     assert connector._scheduler._deferred_loading
 
 
+@pytest.mark.parametrize("layerwise", [False, True])
+def test_dspark_node_stores_and_loads_the_layer_without_a_save_hook(node, layerwise):
+    config = model_vllm_config(
+        total_heads=2,
+        extra=node_extra(
+            node.config.socket,
+            maru_kv_chunk_tokens=CHUNK,
+            maru_use_layerwise=layerwise,
+            maru_async_load=False,
+            maru_async_store=False,
+        ),
+    )
+    config.speculative_config = SimpleNamespace(method="dspark")
+    connector = MaruKVConnector(config, KVConnectorRole.WORKER)
+    worker = connector._worker
+    kv = rank_kv(1, 2)
+    attn = make_flash_attn_metadata()
+    try:
+        connector.register_kv_caches(dict(zip(LAYER_NAMES, kv, strict=True)))
+        wait_credit(worker)
+        connector.bind_connector_metadata(
+            MaruConnectorMetadata(requests=[store_meta("r1", 0)])
+        )
+        for name, layer in zip(LAYER_NAMES[:-1], kv[:-1], strict=True):
+            connector.save_kv_layer(name, layer, attn)
+        connector.wait_for_save()
+        drain(worker)
+        dst = [torch.zeros_like(layer) for layer in kv]
+        load_into(worker, dst, attn)
+        assert_same_kv(dst, kv)
+        assert worker.take_failed_load_blocks() == set()
+    finally:
+        worker.shutdown()
+
+
 def test_the_scheduler_probes_again_after_each_pass():
     """Residency hints expire with the scheduling pass."""
     tokens = list(range(2 * CHUNK))

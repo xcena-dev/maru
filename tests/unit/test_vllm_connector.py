@@ -1215,6 +1215,111 @@ class TestChunkedPrefillFragmentedStore:
             worker.save_kv_layer("model.layers.0.self_attn", kv, attn, metadata)
         return token_ids
 
+    def _dspark_worker(self):
+        """Two registered layers, the target's and the drafter's, with DSpark."""
+        worker, stored = self._make_worker()
+        worker._store_after_forward = True
+        worker._num_layers = 2
+        target, draft = "model.layers.0.self_attn", "model.layers.1.self_attn"
+        kv = self._kv_layer()
+        worker._kv_caches = {target: kv, draft: kv + 5000}
+        token_ids = list(range(self.PROMPT))
+        metadata = store_metadata(
+            token_ids=token_ids,
+            block_ids=list(range(16)),
+            num_scheduled_tokens=self.PROMPT,
+            num_computed_tokens=0,
+        )
+        return worker, stored, metadata, _chunk_keys(token_ids, self.CHUNK)
+
+    def test_dspark_draft_layer_is_added_after_the_forward(self):
+        """With DSpark the target's layer is stored from its save_kv_layer
+        call, as without DSpark. The drafter's layer, which never calls it
+        under CUDA graphs, is stored from wait_for_save, which completes each
+        chunk's _DONE marker."""
+        worker, stored, metadata, chunk_keys = self._dspark_worker()
+        target, draft = worker._kv_caches
+        attn = make_flash_attn_metadata()
+
+        worker.save_kv_layer(target, worker._kv_caches[target], attn, metadata)
+        assert set(stored) == {f"{key}_L0" for key in chunk_keys}
+
+        worker.wait_for_save(metadata)
+
+        assert len(stored) == 3 * len(chunk_keys)
+        for ci, base_key in enumerate(chunk_keys):
+            expected_k = [float(ci * self.CHUNK + i) for i in range(self.CHUNK)]
+            assert stored[f"{base_key}_L0"][: self.CHUNK].tolist() == expected_k
+            assert stored[f"{base_key}_L1"][: self.CHUNK].tolist() == [
+                5000 + k for k in expected_k
+            ]
+            assert stored[f"{base_key}_DONE"] == "DONE"
+        assert worker._chunk_layer_progress == {}
+
+    def test_dspark_layers_that_all_save_need_no_wait_for_save(self):
+        """When the drafter runs eagerly its layer calls save_kv_layer too:
+        the chunks are complete from the hooks, and wait_for_save adds nothing."""
+        worker, stored, metadata, chunk_keys = self._dspark_worker()
+        attn = make_flash_attn_metadata()
+
+        for name, kv in worker._kv_caches.items():
+            worker.save_kv_layer(name, kv, attn, metadata)
+        assert len(stored) == 3 * len(chunk_keys)
+        assert all(stored[f"{key}_DONE"] == "DONE" for key in chunk_keys)
+        allocs = worker._handler.alloc.call_count
+
+        worker.wait_for_save(metadata)
+
+        assert len(stored) == 3 * len(chunk_keys)
+        assert worker._handler.alloc.call_count == allocs
+
+    def test_dspark_wait_for_save_stores_every_layer_of_a_step_without_hooks(self):
+        """A step whose forward is a full CUDA graph too calls no
+        save_kv_layer at all: wait_for_save stores every registered layer."""
+        worker, stored, metadata, chunk_keys = self._dspark_worker()
+
+        worker.wait_for_save(metadata)
+
+        assert len(stored) == 3 * len(chunk_keys)
+        assert all(stored[f"{key}_DONE"] == "DONE" for key in chunk_keys)
+
+    def test_dspark_hooks_of_an_earlier_step_do_not_count_for_the_next(self):
+        """The layers that saved are counted per step: a layer that saved in
+        the last step and not in this one is stored from wait_for_save."""
+        worker, stored, metadata, chunk_keys = self._dspark_worker()
+        target, draft = worker._kv_caches
+        attn = make_flash_attn_metadata()
+        empty = MaruConnectorMetadata(requests=[])
+        worker.save_kv_layer(target, worker._kv_caches[target], attn, empty)
+        worker.wait_for_save(empty)
+        assert stored == {}
+
+        worker.wait_for_save(metadata)
+
+        assert len(stored) == 3 * len(chunk_keys)
+
+    def test_without_dspark_a_layer_that_never_saves_leaves_no_done_marker(self):
+        """The layerwise format stores from save_kv_layer, as before:
+        wait_for_save adds nothing for a single-group model."""
+        worker, stored = self._make_worker()
+        worker._num_layers = 2
+        target, other = "model.layers.0.self_attn", "model.layers.1.self_attn"
+        kv = self._kv_layer()
+        worker._kv_caches = {target: kv, other: kv + 5000}
+        token_ids = list(range(self.PROMPT))
+        metadata = store_metadata(
+            token_ids=token_ids,
+            block_ids=list(range(16)),
+            num_scheduled_tokens=self.PROMPT,
+            num_computed_tokens=0,
+        )
+
+        worker.save_kv_layer(target, kv, make_flash_attn_metadata(), metadata)
+        worker.wait_for_save(metadata)
+
+        chunk_keys = _chunk_keys(token_ids, self.CHUNK)
+        assert set(stored) == {f"{key}_L0" for key in chunk_keys}
+
     @pytest.mark.parametrize("layout", ["legacy", "vllm023"])
     def test_fragmented_steps_store_all_chunks_with_correct_data(self, layout):
         """Boundaries 20/40 are not chunk-aligned; no chunk may be lost."""
@@ -4439,11 +4544,14 @@ class TestPackedStorage:
     NUM_LAYERS = 3
     PROMPT = 16  # 2 chunks
 
-    def _make_worker(self):
+    def _make_worker(self, store_after_forward: bool = False):
         from maru_vllm.connector import MaruWorkerConnector
 
         worker = MaruWorkerConnector(
-            block_size=self.BLOCK, kv_chunk_tokens=self.CHUNK, extra_config={}
+            block_size=self.BLOCK,
+            kv_chunk_tokens=self.CHUNK,
+            extra_config={},
+            store_after_forward=store_after_forward,
         )
         assert worker._use_layerwise is False  # default
         worker._num_layers = self.NUM_LAYERS
@@ -4712,6 +4820,304 @@ class TestPackedStorage:
             kernel, metadata
         )
         assert worker._queued_store_batches == []
+
+    def _store_meta(self):
+        from maru_vllm.connector import MaruConnectorMetadata, MaruReqMeta
+
+        return MaruConnectorMetadata(
+            requests=[
+                MaruReqMeta(
+                    req_id="r1",
+                    token_ids=list(range(self.PROMPT)),
+                    block_ids=[0, 1, 2, 3],
+                    is_store=True,
+                    num_scheduled_tokens=self.PROMPT,
+                    num_computed_tokens=0,
+                )
+            ]
+        )
+
+    def test_draft_layers_are_stored_after_the_forward(self):
+        """A DSpark draft layer that never calls save_kv_layer still lands in
+        each chunk's slab, stored from wait_for_save."""
+        from maru_vllm.connector import _chunk_keys
+
+        worker, store = self._make_worker(store_after_forward=True)
+        kv_layers = self._kv_layers()
+        names = [f"model.layers.{i}.self_attn" for i in range(self.NUM_LAYERS)]
+        worker._kv_caches = dict(zip(names, kv_layers, strict=True))
+        worker._packed_store_kernel_ctx = lambda attn: None  # per-layer fallback
+        attn = self._flash_attn()
+        meta = self._store_meta()
+
+        # The target's layers call save_kv_layer; the last, the drafter's, not.
+        # Each call writes its layer into the chunks' slabs, as without DSpark.
+        chunk_keys = _chunk_keys(list(range(self.PROMPT)), self.CHUNK)
+        for name, kv in zip(names[:-1], kv_layers[:-1], strict=True):
+            worker.save_kv_layer(name, kv, attn, meta)
+        assert store == {}
+        assert set(worker._pending_slabs) == set(chunk_keys)
+
+        worker.wait_for_save(meta)
+
+        assert set(store) == set(chunk_keys)
+        assert worker._pending_slabs == {}
+        slots = worker._build_slot_mapping([0, 1, 2, 3], self.PROMPT)
+        for ci, key in enumerate(chunk_keys):
+            slab = torch.frombuffer(bytearray(store[key]), dtype=torch.float32)
+            slab = slab.view(2, self.NUM_LAYERS, self.CHUNK, 1)
+            chunk_slots = slots[ci * self.CHUNK : (ci + 1) * self.CHUNK]
+            for li, kv in enumerate(kv_layers):
+                expected = kv.reshape(2, -1, 1)[:, chunk_slots]
+                assert torch.equal(slab[:, li], expected), f"chunk {ci} layer {li}"
+
+    def test_dspark_layers_that_all_save_store_from_the_last_call(self):
+        """When the drafter runs eagerly every layer calls save_kv_layer, and
+        the chunks are stored from the last call, as without DSpark;
+        wait_for_save adds nothing."""
+        from maru_vllm.connector import _chunk_keys
+
+        worker, store = self._make_worker(store_after_forward=True)
+        kv_layers = self._kv_layers()
+        names = [f"model.layers.{i}.self_attn" for i in range(self.NUM_LAYERS)]
+        worker._kv_caches = dict(zip(names, kv_layers, strict=True))
+        worker._packed_store_kernel_ctx = lambda attn: None  # per-layer fallback
+        attn = self._flash_attn()
+        meta = self._store_meta()
+
+        for name, kv in zip(names, kv_layers, strict=True):
+            worker.save_kv_layer(name, kv, attn, meta)
+        chunk_keys = _chunk_keys(list(range(self.PROMPT)), self.CHUNK)
+        assert set(store) == set(chunk_keys)
+        allocs = worker._handler.alloc.call_count
+
+        worker.wait_for_save(meta)
+
+        assert set(store) == set(chunk_keys)
+        assert worker._handler.alloc.call_count == allocs
+
+    def _dspark_kernel_worker(self, write_behind):
+        worker, _ = self._make_worker(store_after_forward=True)
+        worker._write_behind = write_behind
+        kernel = ("ops",) * 6
+        worker._packed_store_kernel_ctx = lambda attn: kernel
+        worker._store_packed_slabs = MagicMock()
+        worker._store_packed_slabs_write_behind = MagicMock()
+        names = [f"model.layers.{i}.self_attn" for i in range(self.NUM_LAYERS)]
+        worker._kv_caches = dict(zip(names, self._kv_layers(), strict=True))
+        return worker, kernel
+
+    @pytest.mark.parametrize("write_behind", [False, True])
+    def test_dspark_kernel_store_runs_once_after_the_forward(self, write_behind):
+        """With the drafter's layer missing, nothing is stored or queued from
+        save_kv_layer; wait_for_save stores the step once, a write-behind
+        store launched at once."""
+        worker, kernel = self._dspark_kernel_worker(write_behind)
+        attn = self._flash_attn()
+        meta = self._store_meta()
+
+        for name, kv in list(worker._kv_caches.items())[:-1]:
+            worker.save_kv_layer(name, kv, attn, meta)
+        worker._store_packed_slabs.assert_not_called()
+        worker._store_packed_slabs_write_behind.assert_not_called()
+        assert worker._queued_store_batches == []
+
+        worker.wait_for_save(meta)
+
+        used, unused = (
+            worker._store_packed_slabs_write_behind,
+            worker._store_packed_slabs,
+        )
+        if not write_behind:
+            used, unused = unused, used
+        used.assert_called_once_with(kernel, meta)
+        unused.assert_not_called()
+        assert worker._store_layers_seen == set()
+
+    @pytest.mark.parametrize("write_behind", [False, True])
+    def test_dspark_kernel_store_of_layers_that_all_save_runs_once(self, write_behind):
+        """When every layer calls save_kv_layer the last call stores the step,
+        as without DSpark, and wait_for_save does not store it again. A
+        write-behind store that the last call queued is launched from
+        wait_for_save."""
+        worker, kernel = self._dspark_kernel_worker(write_behind)
+        attn = self._flash_attn()
+        meta = self._store_meta()
+
+        for name, kv in worker._kv_caches.items():
+            worker.save_kv_layer(name, kv, attn, meta)
+        worker.wait_for_save(meta)
+
+        used, unused = (
+            worker._store_packed_slabs_write_behind,
+            worker._store_packed_slabs,
+        )
+        if not write_behind:
+            used, unused = unused, used
+        used.assert_called_once_with(kernel, meta)
+        unused.assert_not_called()
+        assert worker._queued_store_batches == []
+
+    def test_dspark_kernel_step_with_nothing_to_store_keeps_no_layers(self):
+        """The layers a step saw are dropped at its wait_for_save even when
+        the step stores nothing, so they cannot complete a later step."""
+        from maru_vllm.connector import MaruConnectorMetadata
+
+        worker, _ = self._dspark_kernel_worker(False)
+        attn = self._flash_attn()
+        meta = MaruConnectorMetadata(requests=[])
+
+        for name, kv in list(worker._kv_caches.items())[:-1]:
+            worker.save_kv_layer(name, kv, attn, meta)
+        worker.wait_for_save(meta)
+
+        assert worker._store_layers_seen == set()
+        worker._store_packed_slabs.assert_not_called()
+
+    def _load_hook(self, worker, meta):
+        """start_load_kv as vLLM 0.29+ calls it in a step without an inline
+        load: after the forward, before wait_for_save."""
+        forward = SimpleNamespace(no_compile_layers={}, attn_metadata=None)
+        worker.start_load_kv(forward, meta)
+
+    def test_dspark_slabs_begun_by_the_hooks_survive_the_load_hook(self):
+        """vLLM 0.29+ calls start_load_kv between the forward and
+        wait_for_save. The slabs the target's layers began must still be
+        there for wait_for_save to complete: no slab is allocated twice."""
+        from maru_vllm.connector import _chunk_keys
+
+        worker, store = self._make_worker(store_after_forward=True)
+        kv_layers = self._kv_layers()
+        names = [f"model.layers.{i}.self_attn" for i in range(self.NUM_LAYERS)]
+        worker._kv_caches = dict(zip(names, kv_layers, strict=True))
+        worker._packed_store_kernel_ctx = lambda attn: None  # per-layer fallback
+        attn = self._flash_attn()
+        meta = self._store_meta()
+        chunk_keys = _chunk_keys(list(range(self.PROMPT)), self.CHUNK)
+
+        for name, kv in zip(names[:-1], kv_layers[:-1], strict=True):
+            worker.save_kv_layer(name, kv, attn, meta)
+        self._load_hook(worker, meta)
+        worker.wait_for_save(meta)
+
+        assert set(store) == set(chunk_keys)
+        assert worker._handler.alloc.call_count == len(chunk_keys)
+        worker._handler.free.assert_not_called()
+        slots = worker._build_slot_mapping([0, 1, 2, 3], self.PROMPT)
+        for ci, key in enumerate(chunk_keys):
+            slab = torch.frombuffer(bytearray(store[key]), dtype=torch.float32)
+            slab = slab.view(2, self.NUM_LAYERS, self.CHUNK, 1)
+            chunk_slots = slots[ci * self.CHUNK : (ci + 1) * self.CHUNK]
+            for li, kv in enumerate(kv_layers):
+                expected = kv.reshape(2, -1, 1)[:, chunk_slots]
+                assert torch.equal(slab[:, li], expected), f"chunk {ci} layer {li}"
+
+    def test_dspark_slab_left_incomplete_is_freed_at_wait_for_save(self):
+        """With DSpark the step's store ends in wait_for_save, so a slab
+        that is still incomplete there (a layer failed mid-step) is freed
+        then, not at the next start_load_kv."""
+        worker, store = self._make_worker(store_after_forward=True)
+        worker._packed_store_kernel_ctx = lambda attn: None
+        handle = SimpleNamespace(buf=memoryview(bytearray(4)))
+        worker._pending_slabs["chunk-a"] = (handle, {1})
+        names = [f"model.layers.{i}.self_attn" for i in range(self.NUM_LAYERS)]
+        worker._kv_caches = dict(zip(names, self._kv_layers(), strict=True))
+
+        from maru_vllm.connector import MaruConnectorMetadata
+
+        worker.wait_for_save(MaruConnectorMetadata(requests=[]))
+
+        assert worker._pending_slabs == {}
+        worker._handler.free.assert_called_once_with(handle)
+
+    def test_dspark_kernel_store_from_the_last_call_is_not_repeated(self):
+        """Every layer called, so the last call stored the step. The
+        start_load_kv that vLLM makes before wait_for_save must not make
+        wait_for_save store it again."""
+        worker, kernel = self._dspark_kernel_worker(False)
+        attn = self._flash_attn()
+        meta = self._store_meta()
+
+        for name, kv in worker._kv_caches.items():
+            worker.save_kv_layer(name, kv, attn, meta)
+        self._load_hook(worker, meta)
+        worker.wait_for_save(meta)
+
+        worker._store_packed_slabs.assert_called_once_with(kernel, meta)
+
+    def test_dspark_kernel_store_of_a_missing_layer_survives_the_load_hook(self):
+        """start_load_kv between the forward and wait_for_save does not make
+        wait_for_save lose track of the step: it still stores once."""
+        worker, kernel = self._dspark_kernel_worker(False)
+        attn = self._flash_attn()
+        meta = self._store_meta()
+
+        for name, kv in list(worker._kv_caches.items())[:-1]:
+            worker.save_kv_layer(name, kv, attn, meta)
+        self._load_hook(worker, meta)
+        worker.wait_for_save(meta)
+
+        worker._store_packed_slabs.assert_called_once_with(kernel, meta)
+        assert worker._store_layers_seen == set()
+
+    def test_dspark_write_behind_store_queued_after_get_finished_is_launched(self):
+        """vLLM 0.33+ calls get_finished_saving before the drafter. A store
+        that the drafter's last save_kv_layer call queues would then wait
+        for the next step, when the request's blocks may be another's:
+        wait_for_save launches it."""
+        worker, kernel = self._dspark_kernel_worker(True)
+        attn = self._flash_attn()
+        meta = self._store_meta()
+        layers = list(worker._kv_caches.items())
+
+        for name, kv in layers[:-1]:
+            worker.save_kv_layer(name, kv, attn, meta)
+        worker.get_finished_saving(set())
+        worker.save_kv_layer(*layers[-1], attn, meta)
+        assert worker._queued_store_batches == [(kernel, meta)]
+
+        worker.wait_for_save(meta)
+
+        worker._store_packed_slabs_write_behind.assert_called_once_with(kernel, meta)
+        assert worker._queued_store_batches == []
+
+    def test_a_cuda_error_after_the_forward_stops_the_worker(self):
+        """A CUDA error making the store's kernel context stops the worker, as
+        from save_kv_layer; the next wait_for_save raises before it stores."""
+        worker, store = self._make_worker(store_after_forward=True)
+        names = [f"model.layers.{i}.self_attn" for i in range(self.NUM_LAYERS)]
+        worker._kv_caches = dict(zip(names, self._kv_layers(), strict=True))
+        worker._packed_store_kernel_ctx = MagicMock(side_effect=cuda_error())
+        worker._store_packed_slabs = MagicMock()
+        meta = self._store_meta()
+
+        with pytest.raises(_UnconfirmedCopyError, match="could not be confirmed"):
+            worker.wait_for_save(meta)
+        assert worker._stopped is not None
+
+        with pytest.raises(_UnconfirmedCopyError):
+            worker.wait_for_save(meta)
+        worker._packed_store_kernel_ctx.assert_called_once()
+        worker._store_packed_slabs.assert_not_called()
+        assert store == {}
+
+    def test_without_dspark_wait_for_save_stores_nothing(self):
+        """A single-group model stores from save_kv_layer, as before."""
+        worker, store = self._make_worker()
+        assert not worker.stores_after_forward
+        worker._packed_store_kernel_ctx = lambda attn: None
+        worker._kv_caches = dict(
+            zip(
+                [f"model.layers.{i}.self_attn" for i in range(self.NUM_LAYERS)],
+                self._kv_layers(),
+                strict=True,
+            )
+        )
+
+        worker.wait_for_save(self._store_meta())
+
+        assert store == {}
+        worker._handler.alloc.assert_not_called()
 
     def test_kernel_ctx_caching_contract(self):
         """_packed_store_kernel_ctx resolves once and caches the outcome:
@@ -6320,3 +6726,68 @@ class TestRequestTrace:
         assert monos == sorted(monos)
         offsets = [float(f["wall"]) * 1000 - float(f["mono"]) for _, f in events]
         assert max(offsets) - min(offsets) < 50  # one host clock, read together
+
+
+# =============================================================================
+# DSpark: loads of the draft layers are awaited before drafting
+# =============================================================================
+
+
+def _dspark_connector(store_after_forward: bool):
+    from maru_vllm.connector import MaruKVConnector
+
+    worker = make_worker(4, 8, {"maru_async_load": True})
+    worker._store_after_forward = store_after_forward
+    connector = MaruKVConnector.__new__(MaruKVConnector)
+    connector._worker = worker
+    return connector, worker
+
+
+def test_dspark_finish_forward_waits_for_every_layer_load(monkeypatch):
+    """vLLM drafts after finish_forward. A draft step replayed as a CUDA
+    graph calls no wait_for_layer_load, so with DSpark the model stream waits
+    there for every layer's load of the step, the draft layers' included."""
+    connector, worker = _dspark_connector(store_after_forward=True)
+    target, draft = MagicMock(), [MagicMock(), MagicMock()]
+    worker._layer_load_events = {"model.layers.0": [target], "model.layers.1": draft}
+    stream = MagicMock()
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda: stream)
+
+    connector.finish_forward()
+
+    waited = [c.args[0] for c in stream.wait_event.call_args_list]
+    assert sorted(map(id, waited)) == sorted(map(id, [target, *draft]))
+
+
+def test_without_dspark_finish_forward_adds_no_wait(monkeypatch):
+    """Without DSpark every layer waits in its own wait_for_layer_load."""
+    connector, worker = _dspark_connector(store_after_forward=False)
+    worker._layer_load_events = {"model.layers.0": [MagicMock()]}
+    stream = MagicMock()
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda: stream)
+
+    connector.finish_forward()
+
+    stream.wait_event.assert_not_called()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_dspark_draft_reads_a_delayed_layer_load_after_finish_forward():
+    """A draft-layer copy still running when the target's forward ends: what
+    the model stream runs after finish_forward reads the loaded value."""
+    connector, worker = _dspark_connector(store_after_forward=True)
+    cache = torch.zeros(1, device="cuda")
+    loaded = torch.full((1,), 42.0, device="cuda")
+    load_stream = torch.cuda.Stream()
+    with torch.cuda.stream(load_stream):
+        torch.cuda._sleep(200_000_000)  # a slow load
+        cache.copy_(loaded)
+        event = torch.cuda.Event()
+        event.record(load_stream)
+    worker._layer_load_events = {"model.layers.1": [event]}
+
+    connector.finish_forward()
+    seen = cache.clone()  # the draft's read, on the model stream
+
+    torch.cuda.synchronize()
+    assert seen.item() == 42.0
