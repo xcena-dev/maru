@@ -855,6 +855,88 @@ class ProcessRecoveryTest(unittest.TestCase):
         response = self.request(27, payload + struct.pack("<Q", request_id))
         return struct.unpack_from("<i", response)[0], response
 
+    def map_hold(self, handle, holder, pid=2147483647, start=1, expected_kind=None):
+        """A process on this host, in this boot and pid namespace, maps the
+        region; by default one that is gone."""
+        boot = Path("/proc/sys/kernel/random/boot_id").read_text().strip().encode()
+        ns = os.stat("/proc/self/ns/pid").st_ino
+        fixed = HANDLE.pack(*handle) + struct.pack(
+            "<IIIIQQ", len(holder), len(boot), pid, 0, start, ns
+        )
+        return self.request(31, fixed + holder + boot + self.client_id, expected_kind)
+
+    def test_map_hold_over_tcp(self):
+        """A region reclaimed from a gone owner stays out of use while a
+        process maps it (maru#115)."""
+        self.start(hold_grace=1)
+        me = (os.getpid(), self.pid_start(os.getpid()))
+        # maru-server 1: a process of this host that is gone, so the reaper
+        # reclaims its region within a second. The Handler's hold must be
+        # there first; if the reaper won, allocate again.
+        mine = (self.connection, self.client_id)
+        port = int((self.root / "port").read_text())
+        gone = f"{socket.gethostname()}:2147483647".encode()
+        deadline = time.monotonic() + START_S
+        while True:
+            self.assertLess(time.monotonic(), deadline, self.log.read_text())
+            self.connection = socket.create_connection(
+                ("127.0.0.1", port), timeout=REQUEST_S
+            )
+            self.client_id = struct.pack("<H", len(gone)) + gone
+            handle = self.allocate()
+            self.connection.close()
+            self.connection, self.client_id = mine
+            reply = self.map_hold(handle, b"handler-a", *me)
+            again = self.map_hold(handle, b"handler-a", *me)
+            gone_reply = self.map_hold(handle, b"gone")
+            if all(struct.unpack_from("<i", r)[0] == 0 for r in (reply, gone_reply)):
+                break
+        path_len = struct.unpack_from("<I", reply, 4)[0]
+        self.assertEqual(reply[8 : 8 + path_len], b"/dev/dax0.0")
+        self.assertEqual(struct.unpack_from("<QQ", reply, 8 + path_len), handle[1:3])
+        self.assertEqual(again, reply)  # Sent twice: no change.
+
+        # A bad token is an error reply; a bad name is the request's status;
+        # the host comes from client_id, so it is required.
+        bad = (*handle[:3], handle[3] ^ 1)
+        reply = self.map_hold(bad, b"handler-b", *me, expected_kind=255)
+        self.assertEqual(struct.unpack_from("<i", reply)[0], -errno.EACCES)
+        reply = self.map_hold(handle, b"handler b", *me)
+        self.assertEqual(struct.unpack_from("<iI", reply), (-errno.EINVAL, 0))
+        fixed = HANDLE.pack(*handle) + struct.pack("<IIIIQQ", 1, 0, *me[:1], 0, 0, 0)
+        reply = self.request(31, fixed + b"h", expected_kind=255)
+        self.assertEqual(struct.unpack_from("<i", reply)[0], -errno.EINVAL)
+
+        # The owner is reclaimed: the region reads as freed, and its range
+        # goes to nobody while handler-a maps it, across a restart too.
+        while self.access_status(handle) != -errno.ENOENT:
+            self.assertLess(time.monotonic(), deadline, self.log.read_text())
+            time.sleep(0.1)
+        self.assertIn("draining until unheld", self.log.read_text())
+        other = self.allocate()
+        self.assertNotEqual(other[1], handle[1])
+        # The reaper drops the hold of the process it sees gone, not the live one's.
+        while "gone[" in self.ctl("allocations")[1]:
+            self.assertLess(time.monotonic(), deadline, self.log.read_text())
+            time.sleep(0.2)
+        self.assertIn("hold of gone dropped", self.log.read_text())
+        self.stop()
+        self.start(hold_grace=1)
+        listing = self.ctl("allocations")[1]
+        self.assertIn(
+            f"held_by=handler-a[epoch=-,host={socket.gethostname()},", listing
+        )
+        self.assertIn(" draining", listing)
+        self.check_stats({"/dev/dax0.0": 2})
+        time.sleep(1.5)  # Past the reaper and the hold grace: alive, so kept.
+        self.check_stats({"/dev/dax0.0": 2})
+
+        # handler-a unmaps: the range is handed out again.
+        self.assertEqual(self.unhold(handle, b"handler-a", b"handler-a"), 0)
+        self.check_stats({"/dev/dax0.0": 1})
+        self.assertEqual(self.allocate()[1], handle[1])
+        self.stop()
+
     def test_node_hold_over_tcp(self):
         self.start(hold_grace=1)
         self.assertEqual(self.node_claim(b"node-a", b"e1", 1)[0], 0)

@@ -150,11 +150,13 @@ Process exit, session expiry and network loss are different events. The legacy
 `cxl` region owner tracked by the RM is usually MaruServer, not each GPU worker.
 Local owners can be checked by PID/start time; remote owners use connection
 state and a grace period. A timeout alone does not prove that NIC access or a
-worker's exported views have ended.
+worker's exported views have ended, so every process holds the regions it maps
+with the RM, and a region reclaimed from its owner keeps its range out of use
+until those holds end (Resource Manager design document, §5).
 
 | Component | Detection | Reclamation |
 |-----------|-----------|-------------|
-| Resource Manager | Local liveness or remote disconnect/grace period | Ends allocation ownership; a held range remains draining until deregistration is confirmed |
+| Resource Manager | Local liveness or remote disconnect/grace period | Ends allocation ownership; a held range remains draining until every NIC registration is confirmed gone and every process that maps it has unmapped it or ended |
 | Legacy `cxl` registry | Owner disconnect and KV ref counts | Defers return while registered keys still reference the region |
 | `remote_cxl` directory | Session close/expiry, region and agent status | Can keep regions with valid keys; agent release precedes normal region return |
 | `cpu`, current `mixed` | Worker session and read leases | Hides inaccessible replicas; expiry alone does not reclaim buffers or uncertain grants |

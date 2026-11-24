@@ -8,19 +8,21 @@
 namespace maru {
 
 /// One hold. A remote agent's HOLD has a holder (its node ID) and an
-/// instance (its epoch) only. A NODE_HOLD (instance == holder, a process's
-/// name in one node run) also records who it is, so that the RM can tell
-/// when that process is gone; empty or zero fields are unknown.
+/// instance (its epoch) only. A NODE_HOLD or MAP_HOLD (instance == holder, a
+/// name of the process that maps the region) also records who that process
+/// is, so that the RM can tell when it is gone; empty or zero fields are
+/// unknown.
 struct HoldRecord {
     std::string instance;
-    std::string nodeEpoch;  // The node's run the hold was made under
+    std::string nodeEpoch;  // NODE_HOLD: the node's run the hold was made under
     std::string host;
     std::string bootId;
     uint32_t pid{0};
     uint64_t pidStart{0};  // Field 22 of /proc/<pid>/stat
     uint64_t pidNs{0};     // Inode of /proc/<pid>/ns/pid
 
-    bool worker() const { return !nodeEpoch.empty(); }
+    // The hold of a process that maps the region (never empty for one).
+    bool ofProcess() const { return !host.empty(); }
     bool operator==(const HoldRecord &o) const {
         return instance == o.instance && nodeEpoch == o.nodeEpoch && host == o.host &&
                bootId == o.bootId && pid == o.pid && pidStart == o.pidStart && pidNs == o.pidNs;
@@ -36,10 +38,10 @@ bool validHoldName(const std::string &name);
 
 /// Holds and draining regions (freed while held), persisted in
 /// <stateDir>/holds as "hold <region> <holder> <instance>" lines, with
-/// " <node_epoch> <host> <boot_id|-> <pid> <pid_start> <pid_ns>" appended for
-/// a worker's hold, and "draining <region>" lines. A missing file means none;
+/// " <node_epoch|-> <host> <boot_id|-> <pid> <pid_start> <pid_ns>" appended
+/// for a process's hold, and "draining <region>" lines. A missing file means none;
 /// a malformed one is -EINVAL, never an empty set: losing a hold lets a late
-/// remote write land in the region's next owner.
+/// write land in the region's next owner.
 int loadRegionHolds(const std::string &stateDir, RegionHolds &holds,
                     std::set<uint64_t> &draining);
 /// Replace the file (temporary file, fsync, rename). Returns 0 once the new

@@ -56,6 +56,8 @@ class MsgType(IntEnum):
     NODE_HOLD_RESP = 28  # GetAccessResp payload
     NODE_HOLDS_REQ = 29  # NodeReq payload
     NODE_HOLDS_RESP = 30
+    MAP_HOLD_REQ = 31
+    MAP_HOLD_RESP = 32  # GetAccessResp payload
     ERROR_RESP = 255
 
 
@@ -450,6 +452,53 @@ class UnholdReq:
             h.pack()
             + struct.pack("<II", len(self.holder), len(self.instance))
             + _holder_tail(self.holder, self.instance, self.client_id, self.request_id)
+        )
+
+
+# MapHoldReq: Handle(32) + holderLen(u32) + bootIdLen(u32) + pid(u32) +
+# reserved(u32) + pidStart(u64) + pidNs(u64) = 64 bytes, then holder, boot ID,
+# client_id and request_id. The response is a GetAccessResp (MAP_HOLD_RESP).
+_MAP_HOLD_REQ_FORMAT = "<IIIIQQ"
+
+
+@dataclass
+class MapHoldReq:
+    """Check a handle like GET_ACCESS and record that this process maps it.
+
+    ``holder`` names the process (unique to it); UNHOLD with the holder as
+    instance drops the hold. The resource manager keeps a freed region's range
+    out of use until then, or until it sees the process gone: ``pid_start`` is
+    field 22 of /proc/<pid>/stat, ``pid_ns`` the inode of /proc/<pid>/ns/pid,
+    and the host is ``client_id``'s. Zero or empty means unknown.
+    """
+
+    handle: MaruHandle | None = None
+    holder: str = ""
+    boot_id: str = ""
+    pid: int = 0
+    pid_start: int = 0
+    pid_ns: int = 0
+    client_id: str = ""
+    request_id: int = 0
+
+    def pack(self) -> bytes:
+        holder = self.holder.encode("utf-8")
+        boot = self.boot_id.encode("utf-8")
+        h = self.handle or MaruHandle()
+        return (
+            h.pack()
+            + struct.pack(
+                _MAP_HOLD_REQ_FORMAT,
+                len(holder),
+                len(boot),
+                self.pid,
+                0,
+                self.pid_start,
+                self.pid_ns,
+            )
+            + holder
+            + boot
+            + _client_tail(self.client_id, self.request_id)
         )
 
 
