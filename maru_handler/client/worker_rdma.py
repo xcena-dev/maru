@@ -26,6 +26,8 @@ from maru_handler.storage.cpu import CpuReadLease
 from maru_handler.storage.staging import StagingBuffer
 from maru_remote.transport import NixlTransport
 
+from .storage_conn import RECONNECT_S
+
 logger = logging.getLogger(__name__)
 _KEPT_UNTIL_EXIT: list[object] = []
 _GATE_WAIT_S = 0.002
@@ -154,6 +156,7 @@ class WorkerRdma:
         self._ready_peers: dict[str, PeerAccess] = {}
         self._peer_lock = threading.Lock()
         self._loaded: dict[str, bytes] = {}
+        self._read_retry_at: dict[str, float] = {}
         self._credit_agents: dict[Location, WriteAgent] = {}
         self._writing: set[WriteBuffer] = set()
         self._retired_domains = set()
@@ -251,11 +254,15 @@ class WorkerRdma:
                 request.ready.set()
         self._wake.set()
 
-    def _load(self, name, metadata):
-        if self._loaded.get(name) == metadata:
-            return True
-        if name in self._loaded and not self.transport.disconnect(name):
-            return False
+    def _load(self, name, metadata, *, read=False):
+        if name in self._loaded:
+            if self._loaded[name] == metadata and (
+                not read or self.transport.peer_ready_hint(name)
+            ):
+                return True
+            if not self.transport.disconnect(name):
+                return False
+            del self._loaded[name]
         try:
             loaded = self.transport.add_peer(metadata, peer=name)
             if loaded != name:
@@ -309,19 +316,31 @@ class WorkerRdma:
                     )
                     request.ready.set()
         self._wake.set()
+        self.refresh_peers()
+
+    def refresh_peers(self):
+        """Reconnect failed read peers outside the request path."""
         ready = {}
         with self._peer_lock:
+            if self.closed or self.stopped.is_set():
+                return
+            entries = self._peers
             for pool_id, access in entries.items():
+                name = access.agent_name
                 if (
-                    access.generation_known
-                    and access.pool_registration > 0
-                    and access.metadata
-                    and self._load(access.agent_name, access.metadata)
+                    not access.generation_known
+                    or access.pool_registration <= 0
+                    or not access.metadata
+                    or time.monotonic() < self._read_retry_at.get(name, 0)
                 ):
+                    continue
+                if self._load(name, access.metadata, read=True):
                     ready[pool_id] = access
+                    self._read_retry_at.pop(name, None)
+                else:
+                    self._read_retry_at[name] = time.monotonic() + RECONNECT_S
             if self._peers is entries:
                 self._ready_peers = ready
-        self._wake.set()
 
     def _valid(self, flight):
         return (

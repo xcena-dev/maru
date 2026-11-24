@@ -41,6 +41,8 @@ from maru_common.storage_types import (
 
 logger = logging.getLogger(__name__)
 
+RECONNECT_S = 0.5
+
 
 class NodeNotListeningError(StorageUnavailableError):
     """No StorageService listens on the socket yet (ENOENT, ECONNREFUSED)."""

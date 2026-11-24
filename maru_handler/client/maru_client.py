@@ -80,6 +80,7 @@ from .pool_maps import (
 )
 from .server_conn import ServerConn, WorkerIdentity
 from .storage_conn import (
+    RECONNECT_S,
     AttachRefusedError,
     NodeNotListeningError,
     OpTracker,
@@ -90,7 +91,6 @@ from .worker_rdma import WorkerRdma
 
 logger = logging.getLogger(__name__)
 
-RECONNECT_S = 0.5
 REFILL_IDLE_S = 0.2
 REFILL_EMPTY_S = 0.05
 # A store waiting for its step's CREDIT looks again this often; a step's ask
@@ -2009,7 +2009,11 @@ class MaruClient:
             self._lost.clear()
             with self._lock:
                 storage = self._storage
-            if self._closing.is_set() or (storage is not None and not storage.closed):
+            if self._closing.is_set():
+                return
+            if storage is not None and not storage.closed:
+                if self._rdma is not None:
+                    self._rdma.refresh_peers()
                 continue
             self._unmap_on_loss()
             try:

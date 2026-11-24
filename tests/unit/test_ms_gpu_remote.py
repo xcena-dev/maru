@@ -229,6 +229,22 @@ def test_worker_writer_commits_and_another_worker_reads_without_a_copy_cache(pai
     reader.release_retrieved([second])
 
 
+def test_worker_reconnects_its_read_peer_while_control_stays_connected(pair):
+    store(pair)
+    reader = pair.client("reader", load_only=True)
+    storage = reader._storage
+    transport = reader._rdma.transport
+    peer = reader.attach_info.peers[0].agent_name
+    transport.fail_next()
+    assert reader.batch_retrieve(["kv"]) == [None]
+    wait_until(lambda: transport.peer_ready_hint(peer))
+    [read] = reader.batch_retrieve(["kv"])
+    assert bytes(read.view) == b"a" * PAGE
+    reader.release_retrieved([read])
+    assert reader._storage is storage and not storage.closed
+    wait_until(lambda: reader._rdma.snapshot().get("kept_slots") == 1)
+
+
 @pytest.mark.parametrize("pair", ["store_batches"], indirect=True)
 def test_remote_credit_keeps_up_with_consecutive_store_steps(pair, monkeypatch):
     grants = []

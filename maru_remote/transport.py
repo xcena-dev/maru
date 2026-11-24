@@ -401,6 +401,10 @@ class NixlTransport:
         with self._lock:
             return name in self._peers
 
+    def peer_ready_hint(self, name: str) -> bool:
+        """Refresh hint. Posting rechecks both sets under the transport lock."""
+        return name in self._peers and name not in self._tainted
+
     def peer_usable(self, name: str) -> bool:
         """Whether NIXL's connection to a loaded peer has not failed.
 

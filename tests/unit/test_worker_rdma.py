@@ -123,6 +123,86 @@ def test_slot_stays_until_the_gpu_copy_ends(env):
     assert env.reader.capacity() == 4
 
 
+def test_reannounced_read_peer_recovers_without_reusing_the_failed_slot(env):
+    env.agent.stall = True
+    failed = env.start()
+    assert env.agent.fail_stalled(late=True) == 1
+    assert take(env, failed) is None and failed.reason == "io_error"
+
+    env.agent.stall = False
+    env.reader.notify_peers([env.peer])
+    read = take(env, env.start(env.outcome(PAGE)))
+    assert read is not None and read.flight.slot != failed.flight.slot
+    assert env.agent.deliver_late() == 1
+    assert bytes(read.view) == b"b" * PAGE
+    read.release()
+    assert env.reader.snapshot()["kept_slots"] == 1
+    assert env.reader.capacity() == 3
+
+
+def test_read_peer_reconnect_leaves_pending_transfers_connected(env, monkeypatch):
+    now = 100.0
+    monkeypatch.setattr(time, "monotonic", lambda: now)
+    env.agent.stall = True
+    pending = env.start(deadline=now + 10)
+    env.agent.fail_next = True
+    failed = env.start(env.outcome(PAGE))
+    assert take(env, failed) is None
+    env.reader.notify_peers([env.peer])
+    assert env.peer.agent_name in env.agent.peers
+    assert not pending.flight.pending.finished
+    miss = env.start(env.outcome(PAGE))
+    assert miss.result() is None and miss.reason == "no_peer"
+
+    env.agent.stall = False
+    assert env.agent.finish_stalled() == 1
+    env.reader.progress()
+    assert pending.result() is None
+    now += 1
+    env.reader.notify_peers([env.peer])
+    read = take(env)
+    assert bytes(read.view) == b"a" * PAGE
+    read.release()
+    assert env.reader.capacity() == 3
+
+
+def test_read_peer_reconnect_limits_failed_loads(env, monkeypatch):
+    now = 100.0
+    monkeypatch.setattr(time, "monotonic", lambda: now)
+    env.agent.fail_next = True
+    assert take(env) is None
+    load = env.agent.add_remote_agent
+    attempts = []
+
+    def fail_once(metadata):
+        attempts.append(metadata)
+        if len(attempts) == 1:
+            raise RuntimeError("metadata unavailable")
+        return load(metadata)
+
+    monkeypatch.setattr(env.agent, "add_remote_agent", fail_once)
+    env.reader.notify_peers([env.peer])
+    env.reader.notify_peers([env.peer])
+    assert attempts == [env.peer.agent_metadata]
+    assert env.start().result() is None
+    now += 1
+    env.reader.notify_peers([env.peer])
+    read = take(env)
+    assert bytes(read.view) == b"a" * PAGE
+    read.release()
+    assert len(attempts) == 2 and env.reader.capacity() == 3
+
+
+def test_healthy_read_peer_refresh_leaves_the_post_lock_to_transfers(env):
+    refresh = threading.Thread(target=env.reader.refresh_peers)
+    with env.reader.transport._lock:
+        refresh.start()
+        refresh.join(1)
+        blocked = refresh.is_alive()
+    refresh.join(1)
+    assert not blocked
+
+
 def test_progress_polls_reads_quickly_and_idles_while_the_gpu_owns_a_slot(env):
     env.agent.stall = True
     request = env.start(deadline=time.monotonic() + 1)
