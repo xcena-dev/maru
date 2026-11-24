@@ -90,7 +90,7 @@ def test_a_registered_store_is_started_by_the_service(monkeypatch, caplog):
         remove_tree(sockdir)
 
 
-def test_a_spec_that_misstates_leased_fails_the_start(monkeypatch):
+def test_a_spec_that_misstates_leased_fails_the_start(monkeypatch, tmp_path):
     from maru_storage_service.drivers.dram import DramTier
 
     spec = TierSpec(
@@ -109,8 +109,8 @@ def test_a_spec_that_misstates_leased_fails_the_start(monkeypatch):
     config = parse_node_config(
         {
             "node_id": "gpu-test",
-            "socket": "/tmp/maru-plugin.sock",
-            "state_dir": "/tmp/maru-plugin-state",
+            "socket": str(tmp_path / "node.sock"),
+            "state_dir": str(tmp_path),
             "server": "tcp://localhost:1",
             "page_size": NODE_PAGE,
             "tiers": [{"store": "fake", "size": 16 * NODE_PAGE}],
