@@ -280,6 +280,19 @@ class ServerClient:
         )
         return response
 
+    def clear_memory_peer(self) -> None:
+        """Withdraw the peer once the periodic heartbeat has stopped."""
+        if self.session is None or self.epoch_lost:
+            return
+        self.memory_peer = None
+        try:
+            response = self.heartbeat([])
+        except Exception as exc:
+            logger.warning("Could not withdraw memory peer: %s", exc)
+            return
+        if response.status != Status.OK:
+            logger.warning("Memory peer withdrawal refused: %s", response.status)
+
     def _ids(self) -> tuple[str, str]:
         """(session, server_epoch) of the open session."""
         session, epoch = self.session, self.server_epoch

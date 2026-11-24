@@ -2,8 +2,10 @@
 """Worker staging through GPU control, memory COMMIT and Catalog pins."""
 
 import dataclasses
+import errno
 import json
 import mmap
+import socket
 import subprocess
 import sys
 import threading
@@ -14,7 +16,7 @@ from types import SimpleNamespace
 import pytest
 
 from maru_common.config import MaruConfig
-from maru_common.ms_rpc import PLACEHOLDER_OP
+from maru_common.ms_rpc import PLACEHOLDER_OP, RpcUnknownError
 from maru_common.node_protocol import (
     CreditRequest,
     CreditReturnRequest,
@@ -24,6 +26,7 @@ from maru_common.node_protocol import (
     WriteDoneItem,
     WriteDoneRequest,
 )
+from maru_common.protocol import NodeHeartbeatRequest
 from maru_common.remote_protocol import TransferEnd
 from maru_common.storage_types import (
     WORKER_RDMA_CAPABILITY,
@@ -477,12 +480,83 @@ def test_inflight_read_keeps_its_orphan_pin_while_the_gpu_ss_restarts(pair):
         rdma.close()
 
 
-def test_control_disconnect_invalidates_peers_and_ends_the_gpu_run(pair):
-    reader = pair.client(load_only=True)
+def test_control_disconnect_invalidates_peers_and_ends_the_gpu_run(pair, monkeypatch):
+    store(pair)
+    reader = pair.client("reader", load_only=True)
+    scheduler = pair.client("scheduler", metadata_only=True)
+    keys = [Key("ns", "kv")]
+    assert scheduler._server.probe(keys)[0].result == ItemResult.HIT
+    stopping, resume = threading.Event(), threading.Event()
+    stop_workers = pair.gpu.role.stop_workers
+
+    def hold_workers():
+        stopping.set()
+        assert resume.wait(5)
+        stop_workers()
+
+    monkeypatch.setattr(pair.gpu.role, "stop_workers", hold_workers)
+    try:
+        pair.gpu.store.remote.connection.close()
+        assert stopping.wait(5)
+        wait_until(lambda: not reader._rdma._peers)
+        assert scheduler._server.probe(keys)[0].result == ItemResult.MISS
+        miss = reader._server.lookup_and_pin(keys)[0][0]
+        assert miss.result == ItemResult.MISS and miss.pin_id is None
+    finally:
+        resume.set()
+    assert pair.gpu.wait_finished(5)
+    assert pair.gpu.ended
+
+
+def test_control_disconnect_still_closes_run_if_withdrawal_is_unanswered(
+    pair, monkeypatch
+):
+    peers = []
+
+    def unanswered(usage):
+        peers.append(pair.gpu.server.memory_peer)
+        raise RpcUnknownError("heartbeat unanswered")
+
+    monkeypatch.setattr(pair.gpu.server, "heartbeat", unanswered)
     pair.gpu.store.remote.connection.close()
-    wait_until(lambda: pair.gpu.ended)
-    assert pair.gpu.store.remote.peers == []
-    assert reader.batch_retrieve(["absent"]) == [None]
+    assert pair.gpu.wait_finished(5)
+    assert peers == [None]
+    assert (
+        pair.catalog.server.ms_service.registry.nodes["gpu"].session.closed_at
+        is not None
+    )
+
+
+def test_lost_registration_reply_is_retried_before_workers_connect(pair, monkeypatch):
+    pair.gpu.stop()
+    rpc = pair.catalog.rpc
+    answer = rpc._answer
+    attempts = []
+
+    def drop_first_reply(frame):
+        reply = answer(frame)
+        _, request = rpc._serializer.decode_request(frame)
+        if (
+            isinstance(request, NodeHeartbeatRequest)
+            and request.memory_peer is not None
+        ):
+            _, response = rpc._serializer.decode_response(reply)
+            with socket.socket(socket.AF_UNIX) as worker:
+                attempts.append(
+                    (request, response.status, worker.connect_ex(pair.config.socket))
+                )
+            if len(attempts) == 1:
+                return None
+        return reply
+
+    monkeypatch.setattr(rpc, "_answer", drop_first_reply)
+    gpu = pair.start_gpu()
+    request = attempts[0][0]
+    assert request.session == gpu.server.session
+    assert request.memory_peer == ("memory", pair.memory.node_epoch)
+    assert attempts == [(request, Status.OK, errno.ECONNREFUSED)] * 2
+    worker = pair.client(load_only=True)
+    assert worker.attach_info.node_epoch == gpu.node_epoch
 
 
 def test_memory_restart_uses_new_pool_registrations(pair):

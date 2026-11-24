@@ -458,6 +458,8 @@ class NodeRun:
             self._finished.set()
 
     def _teardown(self, mode: CloseMode) -> None:
+        if self.config.top.store == "remote" and self.server is not None:
+            self.server.clear_memory_peer()
         tiers = self._closing_order()
         leases = self._leases()
         for tier in tiers:

@@ -7,7 +7,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 
-from maru_common.ms_rpc import PLACEHOLDER_OP, OpOrigin
+from maru_common.ms_rpc import PLACEHOLDER_OP, OpOrigin, RpcUnknownError
 from maru_common.node_protocol import (
     AbortResponse,
     CreditResponse,
@@ -51,6 +51,7 @@ from maru_handler.hints import MAX_HINT_RANGES, MemoryHints
 from maru_remote.auth import load_key
 
 from ..op_ledger import LedgerEntry
+from ..ports import ServerStopped
 from ..remote_client import RemoteConnection
 from .workers import WorkerOps
 
@@ -219,7 +220,18 @@ class RemoteWorkerOps(WorkerOps):
 
     def start_heartbeat(self):
         self.remote.open()
-        response = self.remote.run.server.heartbeat(self.pools.usage())
+        for attempt in range(2):
+            try:
+                response = self.remote.run.server.heartbeat(self.pools.usage())
+                break
+            except RpcUnknownError as exc:
+                if attempt:
+                    raise ConnectionError(
+                        "Catalog did not confirm memory peer"
+                    ) from exc
+        if self.remote.connection.closed:
+            self.end_run("memory node control connection lost")
+            raise ServerStopped(self.ended)
         if response.status != Status.OK:
             raise ConnectionError("Catalog refused memory peer")
         self.on_heartbeat(response)
