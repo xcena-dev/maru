@@ -174,18 +174,23 @@ class PeerOps:
         room, limit = self._room(origin)
         if limit is not None:
             return ReserveResponse(Status.OK, room=room, limit=limit)
-        entry = self._domains.setdefault(domain, _Domain(f"write:{len(self._domains)}"))
-        if entry.state != "open":
+        entry = self._domains.get(domain)
+        if entry is not None and entry.state != "open":
             return ReserveResponse(Status.REJECTED, error="write domain closed")
+        credits = self.pools.credit(origin, request.pages * self.page_size)
+        if not credits:
+            room, limit = self._room(origin)
+            return ReserveResponse(Status.OK, room=room, limit=limit)
+        if entry is None:
+            entry = self._domains[domain] = _Domain(f"write:{len(self._domains)}")
+        for credit in credits:
+            entry.credits[_page_key(credit)] = credit
         try:
             agent = self.registrations.writer(domain)
         except Exception:
             logger.exception("write registration failed")
             self._fence(domain, entry)
             return ReserveResponse(Status.REJECTED, error="write registration failed")
-        credits = self.pools.credit(origin, request.pages * self.page_size)
-        for credit in credits:
-            entry.credits[_page_key(credit)] = credit
         self._reserves[origin, request.op.seq] = domain, list(credits)
         room, limit = self._room(origin)
         return ReserveResponse(

@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 from maru_common.node_protocol import DetachResponse
 from maru_common.storage_types import SessionRole, Status, WriteDomain
 
-from .worker_registry import WorkerRecord, WorkerRegistry
+from .worker_registry import WorkerRecord, WorkerRegistry, process_key
 
 
 @dataclass(eq=False)
@@ -33,7 +33,7 @@ class RemoteWorkers(WorkerRegistry):
         self._processes: dict[str, set[str]] = {}
 
     def attach(self, conn, ident):
-        key = f"process:{ident.pid}:{ident.pid_start}"
+        key = process_key(ident.pid, ident.pid_start)
         with self._lock:
             if ident.incarnation in self._probes or any(
                 ident.incarnation in seen for seen in self._processes.values()
@@ -46,7 +46,7 @@ class RemoteWorkers(WorkerRegistry):
             ):
                 return None, "worker staging budget exhausted"
             if key not in self._processes:
-                if not self._watcher.watch(key, ident.pid, ident.pid_start):
+                if not self.watch_process(ident.pid, ident.pid_start):
                     return None, "the process has ended"
                 self._processes[key] = set()
             if not self._watcher.watching(key):
@@ -157,7 +157,7 @@ class RemoteWorkers(WorkerRegistry):
     def on_process_exit(self, key):
         with self._lock:
             incarnations = self._processes.get(key, set()).intersection(self._workers)
-        for incarnation in incarnations:
-            self._worker_exited(incarnation)
+        reported = {inc for inc in incarnations if self._worker_exited(inc)}
         with self._lock:
             self._processes.pop(key, None)
+        return reported

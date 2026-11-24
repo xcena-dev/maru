@@ -694,7 +694,6 @@ class MaruClient:
                     self._rdma = WorkerRdma(
                         self.config,
                         response.page_size,
-                        current_connection=lambda: self._storage,
                         quarantine_max=response.staging.quarantine_max
                         if response.staging
                         else None,
@@ -732,8 +731,8 @@ class MaruClient:
                     continue
                 added.append(descriptor.pool.pool_id)
             close_fds(fds)  # those of pools still mapped
-            if not same_run and self._rdma is not None:
-                self._rdma.advance(drop_credits=True)
+            if self._rdma is not None:
+                self._rdma.attach_connection(conn, drop_credits=not same_run)
         except BaseException:
             with self._lock:
                 self._attaching_epoch = None
@@ -893,7 +892,7 @@ class MaruClient:
             # A later connect() starts as a new run: its pools get mapped
             self.node_epoch = None
             if self._rdma is not None:
-                self._rdma.advance()
+                self._rdma.connection_lost(storage)
             self._ops = None
             self.attach_info = None
             for handle in self._handles:
@@ -1999,11 +1998,11 @@ class MaruClient:
     # ------------------------------------------------------- connection loss
 
     def _on_lost(self, conn: StorageConn) -> None:
+        if self._rdma is not None:
+            self._rdma.connection_lost(conn)
         with self._lock:
             if conn is self._storage:
                 self._storage = None
-        if self._rdma is not None:
-            self._rdma.connection_lost(conn)
         self._lost.set()
 
     def _keep_attached(self) -> None:

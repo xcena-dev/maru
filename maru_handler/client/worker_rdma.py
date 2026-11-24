@@ -31,6 +31,7 @@ from .storage_conn import RECONNECT_S
 logger = logging.getLogger(__name__)
 _KEPT_UNTIL_EXIT: list[object] = []
 _GATE_WAIT_S = 0.002
+_STANDALONE = object()
 
 
 @dataclass(frozen=True)
@@ -129,7 +130,6 @@ class WorkerRdma:
         transport_factory=None,
         progress=True,
         quarantine_max=None,
-        current_connection=None,
     ):
         self.config = config
         self.gate = threading.Lock()
@@ -155,8 +155,7 @@ class WorkerRdma:
         self._releases: deque[RemoteRead] = deque()
         self._peers: dict[str, PeerAccess] = {}
         self._ready_peers: dict[str, PeerAccess] = {}
-        self._current_connection = current_connection
-        self._peer_conn = None
+        self._connection = _STANDALONE
         self._pin_waiters: deque[ReadRequest] = deque()
         self._peer_lock = threading.Lock()
         self._loaded: dict[str, bytes] = {}
@@ -253,18 +252,22 @@ class WorkerRdma:
                 request.ready.set()
         self._wake.set()
 
+    def attach_connection(self, conn, *, drop_credits):
+        with self.gate:
+            self._set_connection(None if conn.closed else conn)
+            if drop_credits:
+                self._credit_agents.clear()
+
     def connection_lost(self, conn):
         with self.gate:
-            if self._peer_conn is conn:
-                self._peer_conn = None
-                self._peers = {}
-                self._ready_peers = {}
-                self._advance()
+            if self._connection is conn:
+                self._set_connection(None)
 
-    def _live(self, conn):
-        return self._current_connection is None or (
-            conn is not None and self._current_connection() is conn and not conn.closed
-        )
+    def _set_connection(self, conn):
+        self._connection = conn
+        self._peers = {}
+        self._ready_peers = {}
+        self._advance()
 
     def has_owners(self):
         if not self.gate.acquire(False):
@@ -314,12 +317,11 @@ class WorkerRdma:
         self._loaded[name] = metadata
         return True
 
-    def notify_peers(self, peers: list[ReadPeer], conn=None):
+    def notify_peers(self, peers: list[ReadPeer], conn=_STANDALONE):
         """Order peer changes with read posting and handoff."""
         with self.gate:
-            if self.closed or self.stopped.is_set() or not self._live(conn):
+            if self.closed or self.stopped.is_set() or self._connection is not conn:
                 return
-            self._peer_conn = conn
             entries = {}
             for peer in peers:
                 for pool in peer.pools:
@@ -388,7 +390,7 @@ class WorkerRdma:
         return (
             not self.stopped.is_set()
             and not self.closed
-            and self._live(self._peer_conn)
+            and self._connection is not None
             and flight.generation == self.generation
             and flight.current()
             and self._peers.get(flight.location.pool_id) is flight.peer
@@ -426,7 +428,7 @@ class WorkerRdma:
             if (
                 self.closed
                 or self.stopped.is_set()
-                or not self._live(self._peer_conn)
+                or self._connection is None
                 or generation != self.generation
                 or not current()
             ):
@@ -740,7 +742,7 @@ class WorkerRdma:
         read.flight.consumers.discard(read)
         self._reclaim(read.flight)
 
-    def bind_credits(self, credits, agent, node_id, node_epoch, conn=None):
+    def bind_credits(self, credits, agent, node_id, node_epoch, conn=_STANDALONE):
         agent = copy.deepcopy(agent)
         domain = agent.domain
         old = self._domain_agents.get(domain)
@@ -761,7 +763,7 @@ class WorkerRdma:
                 return False
         pools = {p.pool_id: p for p in agent.pools}
         with self.gate:
-            if self.stopped.is_set() or self.closed or not self._live(conn):
+            if self.stopped.is_set() or self.closed or self._connection is not conn:
                 return False
             for credit in credits:
                 pool = pools.get(credit.pool_id)
@@ -788,9 +790,9 @@ class WorkerRdma:
     def owns_credit(self, credit):
         return credit in self._credit_agents
 
-    def forget_credits(self, credits, conn=None):
+    def forget_credits(self, credits, conn=_STANDALONE):
         with self.gate:
-            if not self._live(conn):
+            if self._connection is not conn:
                 return
             for credit in credits:
                 self._credit_agents.pop(credit, None)
@@ -848,7 +850,7 @@ class WorkerRdma:
             binding = self._credit_agents.pop(buffer.location, None)
             if (
                 self.closed
-                or not self._live(self._peer_conn)
+                or self._connection is None
                 or binding is not buffer.agent
                 or buffer.agent.domain in self._retired_domains
             ):

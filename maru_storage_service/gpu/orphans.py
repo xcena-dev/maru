@@ -7,7 +7,7 @@ import threading
 from maru_common.node_protocol import process_identity
 from maru_common.storage_types import WorkerRef
 
-from .peer_watcher import PeerWatcher
+from .worker_registry import process_key
 
 logger = logging.getLogger(__name__)
 
@@ -16,55 +16,61 @@ class OrphanWatch:
     def __init__(self, store, boot):
         self.store, self.boot = store, boot
         self.pid_ns = process_identity()[3]
-        self.watcher = PeerWatcher("maru-orphan-watcher")
-        self.lock = threading.RLock()
+        self.lock = threading.Lock()
         self.pending = {}
+        self.by_process = {}
         self.unknown = set()
         self.unwatchable = set()
 
     def start(self, orphans):
         with self.lock:
             self.pending = {o.incarnation: o for o in orphans}
-            self.unknown = set(self.pending)
-        self.watcher.start(self._exited)
-        self.retry()
-
-    def retry(self):
-        with self.lock:
-            for key in list(self.unknown):
-                orphan = self.pending[key]
+            for key, orphan in self.pending.copy().items():
                 if (
                     self.boot
                     and orphan.host_boot_id
                     and orphan.host_boot_id != self.boot
                 ):
-                    self._exited(key)
+                    self._report_exit(self.pending.pop(key))
                 elif orphan.host_boot_id != self.boot or orphan.pid_ns != self.pid_ns:
-                    self.unknown.remove(key)
                     self.unwatchable.add(key)
                     logger.error("orphan %s has no comparable process identity", key)
                 else:
-                    evidence = self.watcher.watch(key, orphan.pid, orphan.pid_start)
-                    if evidence is False:
-                        self._exited(key)
-                    elif evidence is True:
-                        self.unknown.remove(key)
+                    process = process_key(orphan.pid, orphan.pid_start)
+                    self.by_process.setdefault(process, []).append(key)
+                    self.unknown.add(key)
+        self.retry()
 
-    def _exited(self, key):
+    def retry(self):
         with self.lock:
-            orphan = self.pending.pop(key, None)
-            self.unknown.discard(key)
-        if orphan is not None:
-            self.store._queue_exit(
-                WorkerRef(
-                    "",
-                    0,
-                    0,
-                    orphan.pid,
-                    orphan.pid_start,
-                    orphan.incarnation,
+            if not self.unknown:
+                return
+            for process, keys in list(self.by_process.items()):
+                if keys[0] not in self.unknown:
+                    continue
+                orphan = self.pending[keys[0]]
+                evidence = self.store.workers.watch_process(
+                    orphan.pid, orphan.pid_start
                 )
-            )
+                if evidence is False:
+                    self._process_exited(process)
+                elif evidence is True:
+                    self.unknown.difference_update(keys)
 
-    def stop(self):
-        self.watcher.stop()
+    def on_process_exit(self, process):
+        with self.lock:
+            self._process_exited(process)
+
+    def _process_exited(self, process):
+        reported = self.store.workers.on_process_exit(process)
+        keys = self.by_process.pop(process, [])
+        self.unknown.difference_update(keys)
+        for key in keys:
+            orphan = self.pending.pop(key)
+            if key not in reported:
+                self._report_exit(orphan)
+
+    def _report_exit(self, orphan):
+        self.store._queue_exit(
+            WorkerRef("", 0, 0, orphan.pid, orphan.pid_start, orphan.incarnation)
+        )

@@ -1210,6 +1210,8 @@ def client(env, writer):
     c._storage = FakeStorageControl(
         CreditResponse(Status.OK, credits=[credit], write_agent=agent)
     )
+    c._rdma.attach_connection(c._storage, drop_credits=False)
+    c._rdma.notify_peers([env.peer], c._storage)
     c._server = SimpleNamespace(
         session="session",
         server_epoch="server",
@@ -1337,7 +1339,7 @@ def test_client_discards_remaining_credit_of_a_retired_domain(env, client, write
     assert client._refill_once()
     _, _, agent, _ = writer
     other = env.outcome(PAGE).location
-    assert env.reader.bind_credits([other], agent, "gpu", "gpu-run")
+    assert env.reader.bind_credits([other], agent, "gpu", "gpu-run", client._storage)
     assert client.credits.put([other], client.node_epoch)
     env.reader._retired_domains.add(agent.domain)
     with pytest.raises(CreditUnavailableError, match="write domain ended"):

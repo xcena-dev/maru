@@ -76,6 +76,10 @@ def _worker_key(incarnation: str) -> str:
     return f"worker:{incarnation}"
 
 
+def process_key(pid: int, pid_start: int) -> str:
+    return f"process:{pid}:{pid_start}"
+
+
 class WorkerRegistry:
     """Worker records and their lifecycle. Thread safe; ``on_exit`` is called
     without the lock held."""
@@ -119,6 +123,13 @@ class WorkerRegistry:
             timer.cancel()
 
     # ------------------------------------------------------- attach, detach
+
+    def watch_process(self, pid: int, pid_start: int) -> bool | None:
+        key = process_key(pid, pid_start)
+        with self._lock:
+            return self._watcher.watching(key) or self._watcher.watch(
+                key, pid, pid_start
+            )
 
     def attach(
         self, conn: WorkerEndpoint, ident: AttachIdentity
@@ -269,17 +280,18 @@ class WorkerRegistry:
 
     # ------------------------------------------------------------------ exit
 
-    def on_process_exit(self, key: str) -> None:
-        """A watched process ended."""
+    def on_process_exit(self, key: str) -> set[str]:
+        """Incarnations whose exit report follows their GPU drain grace."""
         kind, _, incarnation = key.partition(":")
-        if kind == "worker":
-            self._worker_exited(incarnation)
+        if kind == "worker" and self._worker_exited(incarnation):
+            return {incarnation}
+        return set()
 
-    def _worker_exited(self, incarnation: str) -> None:
+    def _worker_exited(self, incarnation: str) -> bool:
         with self._lock:
             rec = self._workers.pop(incarnation, None)
             if rec is None or rec.exited:
-                return
+                return False
             self._mark_exited(rec)
             self._settles_at[incarnation] = time.monotonic() + self.gpu_drain_grace_s
             conn, rec.conn = rec.conn, None
@@ -295,6 +307,7 @@ class WorkerRegistry:
         )
         self._after(self.gpu_drain_grace_s, self._grace_over, incarnation, rec.ref())
         self._ledger.drop(incarnation)
+        return True
 
     def _mark_exited(self, rec):
         rec.exited = True

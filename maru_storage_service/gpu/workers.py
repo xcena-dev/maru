@@ -111,7 +111,7 @@ class WorkerOps(NodeStore):
 
     def start(self) -> None:
         """After the session opened."""
-        self.watcher.start(self.workers.on_process_exit)
+        self.watcher.start(self._on_process_exit)
         for target, name in (
             (self._commit_loop, "maru-commit"),
             (self._evict_loop, "maru-evict"),
@@ -120,6 +120,12 @@ class WorkerOps(NodeStore):
             thread = threading.Thread(target=target, name=name, daemon=True)
             thread.start()
             self._threads.append(thread)
+
+    def _on_process_exit(self, key):
+        if self.orphans is None:
+            self.workers.on_process_exit(key)
+        else:
+            self.orphans.on_process_exit(key)
 
     def stop(self) -> None:
         """Stop the threads; unresolved requests are given up."""

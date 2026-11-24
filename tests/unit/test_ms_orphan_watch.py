@@ -13,6 +13,7 @@ import pytest
 from maru_common.node_protocol import process_identity
 from maru_common.storage_types import ItemResult, Key, KeyLocation, OrphanWorker
 from maru_storage_service.gpu.orphans import OrphanWatch
+from maru_storage_service.gpu.worker_registry import process_key
 from maru_storage_service.server_client import ServerClient
 from tests.unit.ms_node_helpers import (
     FakeRm,
@@ -27,44 +28,48 @@ from tests.unit.ms_node_helpers import (
 
 
 @pytest.mark.parametrize("evidence", [True, False, None])
-def test_orphan_uses_three_way_process_evidence(monkeypatch, evidence):
+def test_orphan_uses_three_way_process_evidence(evidence):
     boot, pid, start, ns = process_identity()
     reports = []
-    watch = OrphanWatch(SimpleNamespace(_queue_exit=reports.append), boot)
-    monkeypatch.setattr(watch.watcher, "watch", lambda *args: evidence)
-    try:
-        watch.start([OrphanWorker("worker", pid, start, boot, ns)])
-        assert bool(reports) == (evidence is False)
-        if evidence is None:
-            assert watch.unknown == {"worker"}
-            monkeypatch.setattr(watch.watcher, "watch", lambda *args: False)
-            watch.retry()
-            assert len(reports) == 1
-        if evidence is True:
-            watch._exited("worker")
-            watch._exited("worker")
-            assert len(reports) == 1
-    finally:
-        watch.stop()
+    workers = SimpleNamespace(
+        watch_process=lambda *args: evidence, on_process_exit=lambda key: set()
+    )
+    watch = OrphanWatch(
+        SimpleNamespace(_queue_exit=reports.append, workers=workers), boot
+    )
+    watch.start([OrphanWorker(inc, pid, start, boot, ns) for inc in ("a", "b")])
+    if evidence is None:
+        assert watch.unknown == {"a", "b"}
+        assert not reports
+        workers.watch_process = lambda *args: False
+        watch.retry()
+    elif evidence is True:
+        assert not reports
+        watch.on_process_exit(process_key(pid, start + 1))
+        assert not reports
+        watch.on_process_exit(process_key(pid, start))
+        watch.on_process_exit(process_key(pid, start))
+    assert sorted(r.incarnation for r in reports) == ["a", "b"]
 
 
 def test_incomparable_namespace_keeps_the_orphan_and_old_boot_proves_exit():
     boot, pid, start, ns = process_identity()
     reports = []
-    watch = OrphanWatch(SimpleNamespace(_queue_exit=reports.append), boot)
-    try:
-        watch.start(
-            [
-                OrphanWorker("namespace", pid, start, boot, ns + 1),
-                OrphanWorker("old-boot", pid, start, "previous-boot", ns),
-                OrphanWorker("unknown-boot", pid, start, "", ns),
-            ]
-        )
-        assert [r.incarnation for r in reports] == ["old-boot"]
-        assert watch.unwatchable == {"namespace", "unknown-boot"}
-        assert len(watch.pending) == 2
-    finally:
-        watch.stop()
+    workers = SimpleNamespace(on_process_exit=lambda key: set())
+    watch = OrphanWatch(
+        SimpleNamespace(_queue_exit=reports.append, workers=workers), boot
+    )
+    watch.start(
+        [
+            OrphanWorker("namespace", pid, start, boot, ns + 1),
+            OrphanWorker("old-boot", pid, start, "previous-boot", ns),
+            OrphanWorker("unknown-boot", pid, start, "", ns),
+        ]
+    )
+    watch.on_process_exit(process_key(pid, start))
+    assert [r.incarnation for r in reports] == ["old-boot"]
+    assert watch.unwatchable == {"namespace", "unknown-boot"}
+    assert len(watch.pending) == 2
 
 
 def test_node_open_orphans_are_read_through_every_cursor():

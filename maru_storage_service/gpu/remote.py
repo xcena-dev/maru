@@ -285,9 +285,9 @@ class RemoteWorkerOps(WorkerOps):
 
     def read_join(self, rec, request):
         with self.remote.lock:
+            old = self._agents.get(rec.incarnation)
 
             def register():
-                old = self._agents.get(rec.incarnation)
                 if old not in (None, request.agent_name):
                     return False
                 if old is None and request.agent_name in self._agents.values():
@@ -304,7 +304,7 @@ class RemoteWorkerOps(WorkerOps):
                         add=[AgentMetadata(request.agent_name, request.agent_metadata)]
                     ),
                 )
-                if answer.status != Status.OK:
+                if answer.status != Status.OK and old is None:
                     self._agents.pop(rec.incarnation, None)
                 return ReadJoinResponse(answer.status, error=answer.error)
             except (ConnectionError, TimeoutError):
@@ -525,8 +525,11 @@ class RemoteWorkerOps(WorkerOps):
                 outcomes[index] = outcome
 
             def settle():
-                for _, item in group:
-                    if item.end != TransferEnd.UNKNOWN:
+                for index, item in group:
+                    if item.end == TransferEnd.DONE and outcomes[index].result in (
+                        ItemResult.ADDED,
+                        ItemResult.DUPLICATE,
+                    ):
                         self._credits.pop(item.credit, None)
 
             self.workers.while_current(domain, settle)
