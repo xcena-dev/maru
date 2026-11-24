@@ -1692,11 +1692,13 @@ class MaruClient:
         pending = PendingRetrieve(self)
         self._retrieve_local.misses = pending.misses
         rdma = self._rdma
-        generation = rdma.capture() if rdma is not None else None
+        server = self._server
+        generation = None
         if (
             self.off is not None
             or self._stopped.is_set()
-            or (rdma is not None and generation is None)
+            or (server is not None and server.session_node_epoch != self.node_epoch)
+            or (rdma is not None and (generation := rdma.capture()) is None)
         ):
             self._count(
                 "retrieve_off" if self.off is not None else "retrieve_unavailable",
@@ -2014,16 +2016,18 @@ class MaruClient:
             self._lost.clear()
             with self._lock:
                 storage = self._storage
+                server, info = self._server, self.attach_info
             if self._closing.is_set():
                 return
             if storage is not None and not storage.closed:
                 if self._rdma is not None:
                     self._rdma.refresh_peers()
-                    if (
-                        self._server is not None
-                        and self._server.node_epoch != self.node_epoch
-                    ):
-                        self._move_session(self.attach_info)
+                if (
+                    server is not None
+                    and info is not None
+                    and server.node_epoch != info.node_epoch
+                ):
+                    self._move_session(info)
                 continue
             if storage is not None:
                 self._on_lost(storage)
@@ -2115,7 +2119,9 @@ class MaruClient:
 
     def _move_session(self, info):
         # Opening on the new run releases the old session's orphan pins.
-        if self._rdma is not None and self._rdma.reading_source():
+        if self.pools.has_old_views(info.node_epoch) or (
+            self._rdma is not None and self._rdma.reading_source()
+        ):
             return
         server = self._server
         if server is not None:

@@ -351,8 +351,8 @@ class PoolMaps:
         with self._lock:
             old = self._pools.get(info.pool_id)
             self._pools[info.pool_id] = mapped
-        if old is not None:
-            self._detach(old)
+            if old is not None:
+                self._detach(old)
         logger.info(
             "mapped %s (%d MiB, page-locked: %s)",
             info.pool_id,
@@ -414,6 +414,16 @@ class PoolMaps:
         with self._lock:
             return list(self._pools)
 
+    def has_old_views(self, node_epoch: str) -> bool:
+        """Whether a view still uses a mapping from another run."""
+        with self._lock:
+            for mapped in (*self._pools.values(), *self._detached):
+                if mapped.node_epoch != node_epoch:
+                    with mapped.lock:
+                        if mapped.views:
+                            return True
+        return False
+
     def page_locked(self) -> bool:
         """Some pool is mapped and every one is registered with CUDA."""
         with self._lock:
@@ -442,8 +452,8 @@ class PoolMaps:
         once its last view is released. Returns their pool_ids."""
         with self._lock:
             pools, self._pools = list(self._pools.values()), {}
-        for mapped in pools:
-            self._detach(mapped)
+            for mapped in pools:
+                self._detach(mapped)
         return [m.info.pool_id for m in pools]
 
     def wait_closed(self, pool_id: str, timeout: float) -> bool:
@@ -503,15 +513,14 @@ class PoolMaps:
             )
 
     def _detach(self, mapped: MappedPool) -> None:
-        """Out of ``_pools`` already: closed now, or by its last view."""
-        with self._lock:
-            self._detached.add(mapped)
+        """Retire a mapping removed from _pools. Caller holds the lock."""
+        self._detached.add(mapped)
         with mapped.lock:
             mapped.removing = True
             if mapped.views:
                 mapped.retired = True
                 return
-        self._close_later(mapped)
+        self._queue_close(mapped)
 
     def _close_later(self, mapped: MappedPool) -> None:
         with self._lock:

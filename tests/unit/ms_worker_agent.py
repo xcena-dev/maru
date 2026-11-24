@@ -100,6 +100,9 @@ def main() -> int:
             elif op == "state":
                 result = {
                     "node_epoch": client.node_epoch,
+                    "session_node_epoch": client.server_conn.session_node_epoch
+                    if client.server_conn
+                    else None,
                     "storage_connected": client.storage_connected,
                     "unused_credit": client.credits.unused_bytes,
                     "pools": client.pools.pool_ids(),

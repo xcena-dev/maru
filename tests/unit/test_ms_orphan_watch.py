@@ -13,7 +13,13 @@ from types import SimpleNamespace
 import pytest
 
 from maru_common.node_protocol import process_identity
-from maru_common.storage_types import ItemResult, Key, KeyLocation, OrphanWorker
+from maru_common.storage_types import (
+    ItemResult,
+    KeptCause,
+    Key,
+    KeyLocation,
+    OrphanWorker,
+)
 from maru_storage_service.gpu.orphans import OrphanWatch
 from maru_storage_service.gpu.worker_registry import process_key
 from maru_storage_service.server_client import ServerClient
@@ -177,7 +183,10 @@ sys.stdin.read()
         remove_tree(directory)
 
 
-def test_reattached_local_worker_keeps_current_pin_until_drain(monkeypatch, tmp_path):
+@pytest.mark.parametrize("tier", ["local_cxl", "dram"])
+def test_reattached_local_worker_keeps_pins_through_copy_and_drain(
+    monkeypatch, tmp_path, tier
+):
     with ExitStack() as stack:
         directory = short_tmpdir()
         stack.callback(remove_tree, directory)
@@ -185,33 +194,62 @@ def test_reattached_local_worker_keeps_current_pin_until_drain(monkeypatch, tmp_
         stack.callback(catalog.close)
         rm = FakeRm()
         config = node_config(
-            catalog.address, f"{directory}/node.sock", cxl_pages=16, region_pages=16
+            catalog.address,
+            f"{directory}/node.sock",
+            cxl_pages=16 if tier == "local_cxl" else None,
+            region_pages=16,
         )
         first = start_node(config, region_source=rm)
         stack.callback(first.stop)
-        (region,) = rm.regions[config.node_id]
-        backing = tmp_path / "region"
-        with backing.open("wb") as f:
-            f.truncate(region.handle.length)
-        child = Agent(
-            config.socket,
-            read_only=True,
-            cxl_paths={region.handle.region_id: str(backing)},
-        )
+        paths = {}
+        if tier == "local_cxl":
+            (region,) = rm.regions[config.node_id]
+            backing = tmp_path / "region"
+            with backing.open("wb") as f:
+                f.truncate(region.handle.length)
+            paths[region.handle.region_id] = str(backing)
+        child = Agent(config.socket, read_only=True, cxl_paths=paths)
         stack.callback(child.stop)
         child.connect()
         assert publish(first, "old").result == ItemResult.ADDED
-        assert child.call("retrieve", key="old") is not None
+        old_bytes = child.call("retrieve", key="old")
+        assert old_bytes is not None
+        service = catalog.server.ms_service
+        old_key = Key("ns", "old")
+        old = KeyLocation(old_key, service.catalog.locations(old_key)[0].location)
+        assert service.pins.count(old.key, old.location) == 1
 
         first.stop()
         second = start_node(config, region_source=rm)
         stack.callback(second.stop)
         wait_until(lambda: child.call("state")["node_epoch"] == second.node_epoch)
         orphans = second.role.orphans
-        assert child.incarnation in orphans.pending
+        assert second.store.workers.get(child.incarnation) is not None
         assert publish(second, "current").result == ItemResult.ADDED
-        wait_until(lambda: child.call("retrieve", key="current") is not None)
-        service = catalog.server.ms_service
+        if tier == "local_cxl":
+            assert child.incarnation in orphans.pending
+            service.maintain()
+            retired = second.server.retire([old]).items[0]
+            assert (retired.result, retired.cause) == (
+                ItemResult.KEPT,
+                KeptCause.PINNED,
+            )
+            assert service.pins.count(old.key, old.location) == 1
+        else:
+            # The new run has its own DRAM memfd.
+            wait_until(lambda: service.pins.count(old.key, old.location) == 0)
+        assert child.call("retrieve", key="current", timeout=2) is None
+        assert child.call("held", key="old") == old_bytes
+        assert child.call("state")["session_node_epoch"] == first.node_epoch
+
+        child.call("release", key="old")
+        wait_until(
+            lambda: child.call("state")["session_node_epoch"] == second.node_epoch
+        )
+        if tier == "local_cxl":
+            wait_until(lambda: service.pins.count(old.key, old.location) == 0)
+            assert second.server.retire([old]).items[0].result == ItemResult.RETIRED
+        assert child.call("retrieve", key="current") is not None
         key = Key("ns", "current")
         location = service.catalog.locations(key)[0].location
         assert service.pins.count(key, location) == 1

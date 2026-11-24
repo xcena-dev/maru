@@ -1215,6 +1215,7 @@ def client(env, writer):
     c._server = SimpleNamespace(
         session="session",
         server_epoch="server",
+        session_node_epoch=c.node_epoch,
         lookup_and_pin=lambda keys: (
             [env.outcome() for k in keys],
             "server",

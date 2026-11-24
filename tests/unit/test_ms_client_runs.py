@@ -202,6 +202,19 @@ def notice():
     return Notify(kind=NotifyKind.POOL_REMOVE, pool_id=CXL.pool_id, pool_generation=1)
 
 
+def test_old_views_follow_the_mapping_when_the_pool_id_is_reused(attached):
+    pools = attached.pools
+    location = Location(CXL.pool_id, "a", 1, 0, M, PoolKind.CXL)
+    with pools.view(location, node_epoch="e1") as view:
+        consumer = view[:]
+    assert pools.has_old_views("e2")
+    attached._take_attach(AttachConn(), attach_response("e2"), [], first=False)
+    with pools.view(location, node_epoch="e2"):
+        with consumer:
+            assert pools.has_old_views("e2")
+        assert not pools.has_old_views("e2")
+
+
 def test_a_delayed_notice_is_not_taken_for_the_new_runs(attached, monkeypatch):
     client = attached
     started = []

@@ -1650,9 +1650,10 @@ class TestRestart:
         assert put(h, "new")
         h.free(held)
         wait_until(
-            lambda: client.pools.pool_ids() == [second.tier("dram").pool.pool_id],
-            what="unmapped",
+            lambda: client.server_conn.session_node_epoch == second.node_epoch,
+            what="worker session moved",
         )
+        assert client.pools.pool_ids() == [second.tier("dram").pool.pool_id]
         read = h.retrieve("new")
         assert bytes(read.view) == b"new"
         h.release_retrieved([read])

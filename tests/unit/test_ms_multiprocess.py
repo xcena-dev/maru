@@ -183,8 +183,7 @@ def test_kill_9_of_a_reader_that_never_stored(fake, sockdir, agents):
 
 
 def test_storage_service_restart(fake, sockdir, agents):
-    """The new run serves at once: a worker attaches again by itself, and
-    nothing waits for its copies into the old run's DRAM."""
+    """An old DRAM write delays the Catalog move after re-ATTACH."""
     config = node_config(fake.url, f"{sockdir}/node.sock")
     first = start_node(config)
     second = None
@@ -203,8 +202,13 @@ def test_storage_service_restart(fake, sockdir, agents):
         # DRAM locations of the old run are gone; the new pool works
         assert x.call("retrieve", key="x0") is None
         store(x, "x1")
-        assert x.call("retrieve", key="x1", hold=False) == value("x1")
+        requests = len(fake.requests(MessageType.LOOKUP_AND_PIN))
+        assert x.call("retrieve", key="x1", timeout=2) is None
+        assert len(fake.requests(MessageType.LOOKUP_AND_PIN)) == requests
+        assert x.call("state")["session_node_epoch"] == first.node_epoch
         x.call("free_held", name="copy")
+        wait_until(lambda: x.call("state")["session_node_epoch"] == second.node_epoch)
+        assert x.call("retrieve", key="x1", hold=False) == value("x1")
         second.pools.check()
     finally:
         first.stop()
