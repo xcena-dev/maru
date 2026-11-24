@@ -5,6 +5,7 @@ import dataclasses
 import threading
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
@@ -164,6 +165,67 @@ def test_read_peer_reconnect_leaves_pending_transfers_connected(env, monkeypatch
     assert bytes(read.view) == b"a" * PAGE
     read.release()
     assert env.reader.capacity() == 3
+
+
+@pytest.mark.parametrize("batched", [False, True], ids=["single", "batch"])
+def test_peer_withdrawal_waits_for_a_read_post_during_reconnect(
+    env, monkeypatch, batched
+):
+    reader = env.reader
+    env.agent.fail_next = True
+    assert take(env) is None
+    loading, posting = threading.Event(), threading.Event()
+    withdrawing, resume_post = threading.Event(), threading.Event()
+    add_peer, post = reader.transport.add_peer, reader.transport.post_nowait
+    order = []
+
+    def reload_peer(*args, **kwargs):
+        loading.set()
+        assert withdrawing.wait(2)
+        return add_peer(*args, **kwargs)
+
+    def pause_post(op, peer, pairs):
+        posting.set()
+        assert resume_post.wait(2)
+        pending = post(op, peer, pairs)
+        order.append((op, peer, pending.direct_state))
+        return pending
+
+    def read():
+        batch = [] if batched else None
+        request = env.start(batch=batch, deadline=time.monotonic() + 5)
+        if batched:
+            reader.post_reads(batch)
+        return request
+
+    def withdraw():
+        withdrawing.set()
+        reader.notify_peers([])
+        order.append("withdrawn")
+
+    monkeypatch.setattr(reader.transport, "add_peer", reload_peer)
+    monkeypatch.setattr(reader.transport, "post_nowait", pause_post)
+    peer = reader._peers[env.pool.pool_id]
+    with ThreadPoolExecutor(max_workers=3) as threads:
+        keeper = threads.submit(reader.refresh_peers)
+        try:
+            assert loading.wait(2)
+            first = threads.submit(read)
+            assert posting.wait(2)
+            notice = threads.submit(withdraw)
+            keeper.result(2)
+            with pytest.raises(TimeoutError):
+                notice.result(0.1)
+            assert reader._peers[env.pool.pool_id] is peer
+        finally:
+            resume_post.set()
+        request = first.result(2)
+        notice.result(2)
+
+    assert take(env, request) is None and request.reason == "generation"
+    miss = read()
+    assert miss.result() is None and miss.reason == "no_peer"
+    assert order == [("READ", env.peer.agent_name, "DONE"), "withdrawn"]
 
 
 def test_read_peer_reconnect_limits_failed_loads(env, monkeypatch):
@@ -788,17 +850,21 @@ def test_peer_notice_misses_a_done_but_undecided_read(env, notice):
 
 @pytest.mark.parametrize("boundary", ["check", "view"])
 @pytest.mark.parametrize("recover", [False, True])
-def test_notice_between_hit_check_and_handoff_is_a_miss(
+def test_notice_waits_for_hit_handoff_and_invalidates_the_joiner(
     env, monkeypatch, boundary, recover
 ):
+    env.agent.stall = True
     request = env.start(deadline=time.monotonic() + 2)
+    joiner = env.start(deadline=request.deadline)
+    assert joiner.flight is request.flight
+    assert env.agent.finish_stalled() == 1
     env.reader.progress()
     owner, method = (
         (env.reader, "_valid") if boundary == "check" else (env.reader.staging, "view")
     )
     original = getattr(owner, method)
     checked, resume = threading.Event(), threading.Event()
-    results = []
+    notifying = threading.Event()
 
     def pause_after_check(*args):
         result = original(*args)
@@ -806,36 +872,38 @@ def test_notice_between_hit_check_and_handoff_is_a_miss(
         assert resume.wait(1)
         return result
 
-    monkeypatch.setattr(owner, method, pause_after_check)
-    finishing = threading.Thread(target=lambda: results.append(request.result()))
-    finishing.start()
-    try:
-        assert checked.wait(1)
-        assert not request.decided and not request.flight.consumers
+    def change_peer():
+        notifying.set()
         env.reader.notify_peers([dataclasses.replace(env.peer, generation_known=False)])
         if recover:
             env.reader.notify_peers([env.peer])
-    finally:
-        resume.set()
-        finishing.join(1)
-    assert not finishing.is_alive()
-    read = results[0]
-    try:
-        assert read is None
-        assert request.reason == "generation"
-        assert not request.flight.consumers
-        assert env.reader.capacity() == 4
-        assert env.unpins == [request.outcome.pin_id]
-    finally:
-        if read is not None:
-            read.release()
+
+    monkeypatch.setattr(owner, method, pause_after_check)
+    with ThreadPoolExecutor(max_workers=2) as threads:
+        finishing = threads.submit(request.result)
+        try:
+            assert checked.wait(1)
+            assert not request.decided and not request.flight.consumers
+            notice = threads.submit(change_peer)
+            assert notifying.wait(1)
+            with pytest.raises(TimeoutError):
+                notice.result(0.1)
+        finally:
+            resume.set()
+        read = finishing.result(1)
+        notice.result(1)
+    assert bytes(read.view) == b"a" * PAGE
+    assert joiner.result() is None and joiner.reason == "generation"
+    assert env.unpins == [request.outcome.pin_id, joiner.outcome.pin_id]
+    read.release()
+    assert env.reader.capacity() == 4
 
 
 def test_notice_between_check_and_post_cannot_be_lost(env, monkeypatch):
     original = env.agent.transfer
 
     def notice(handle):
-        # The invalidation snapshot is visible even while the gate is owned.
+        # Inject a stale peer directly to exercise the post's final check.
         env.reader._peers = {}
         result = original(handle)
         return result

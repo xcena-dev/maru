@@ -274,47 +274,47 @@ class WorkerRdma:
         return True
 
     def notify_peers(self, peers: list[ReadPeer]):
-        """Publish invalidation before installing changed metadata."""
-        if self.closed or self.stopped.is_set():
-            return
-        previous = self._peers
-        entries = {}
-        for peer in peers:
-            for pool in peer.pools:
-                access = PeerAccess(
-                    peer.node_id,
-                    peer.node_epoch,
-                    peer.agent_name,
-                    peer.boot,
-                    peer.conn_gen,
-                    peer.generation_known,
-                    pool.pool_registration,
-                    pool.pool_generation,
-                    pool.base,
-                    pool.capacity,
-                    pool.kind,
-                    peer.agent_metadata,
-                )
-                old = previous.get(pool.pool_id)
-                if (
-                    old is not None
-                    and old.node_id == access.node_id
-                    and old.node_epoch == access.node_epoch
-                    and access.conn_gen < old.conn_gen
-                ):
-                    entries[pool.pool_id] = old
-                else:
-                    entries[pool.pool_id] = old if old == access else access
-        self._peers = entries
-        for flight in tuple(self._flights):
-            if entries.get(flight.location.pool_id) is flight.peer:
-                continue
-            for request in tuple(flight.waiters):
-                if not request.decided:
-                    request.reason = request._decision.setdefault(
-                        "reason", "generation"
+        """Order peer changes with read posting and handoff."""
+        with self.gate:
+            if self.closed or self.stopped.is_set():
+                return
+            entries = {}
+            for peer in peers:
+                for pool in peer.pools:
+                    access = PeerAccess(
+                        peer.node_id,
+                        peer.node_epoch,
+                        peer.agent_name,
+                        peer.boot,
+                        peer.conn_gen,
+                        peer.generation_known,
+                        pool.pool_registration,
+                        pool.pool_generation,
+                        pool.base,
+                        pool.capacity,
+                        pool.kind,
+                        peer.agent_metadata,
                     )
-                    request.ready.set()
+                    old = self._peers.get(pool.pool_id)
+                    if (
+                        old is not None
+                        and old.node_id == access.node_id
+                        and old.node_epoch == access.node_epoch
+                        and access.conn_gen < old.conn_gen
+                    ):
+                        entries[pool.pool_id] = old
+                    else:
+                        entries[pool.pool_id] = old if old == access else access
+            self._peers = entries
+            for flight in self._flights:
+                if entries.get(flight.location.pool_id) is flight.peer:
+                    continue
+                for request in flight.waiters:
+                    if not request.decided:
+                        request.reason = request._decision.setdefault(
+                            "reason", "generation"
+                        )
+                        request.ready.set()
         self._wake.set()
         self.refresh_peers()
 
