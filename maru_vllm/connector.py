@@ -54,11 +54,13 @@ from maru_common.kv_shard import (
 )
 from maru_common.storage_types import StorageError, StorageUnavailableError
 from maru_vllm.kv_groups import (
+    DSPARK_METHOD,
     GROUP_FULL,
     GROUP_MAMBA,
     GROUP_MLA,
     GROUP_SKIP,
     GROUP_SLIDING_WINDOW,
+    GroupAdmission,
     GroupCache,
     KVGroup,
     check_multi_group_support,
@@ -1216,6 +1218,19 @@ def _vllm_version_at_least(minimum: str) -> bool:
         return False
 
 
+def _speculative_method(vllm_config: VllmConfig) -> str | None:
+    """The speculative decoding method vLLM runs, or None without one.
+
+    A config that names no method reads as an unknown one, so the support
+    checks refuse it on a model with several groups rather than take it for
+    no speculative decoding.
+    """
+    spec = vllm_config.speculative_config
+    if spec is None:
+        return None
+    return str(getattr(spec, "method", None) or "unknown")
+
+
 def _scheduler_lookahead_tokens(vllm_config: VllmConfig) -> int:
     """Read vLLM's slot margin, with the pre-property scheduler rules as fallback."""
     lookahead = getattr(vllm_config, "num_lookahead_tokens", None)
@@ -1247,6 +1262,38 @@ def _async_load_budget(
         else vllm_config.cache_config.num_gpu_blocks
     )
     return total - 1 if total else None  # vLLM sets one null block aside.
+
+
+def _group_admission(
+    kv_cache_config: KVCacheConfig, vllm_config: VllmConfig
+) -> tuple[GroupAdmission, ...]:
+    """The blocks vLLM gives one request in each KV cache group.
+
+    A full-attention or MLA group holds a block per ``block_size`` tokens; a
+    sliding-window group at most vLLM's per-request admission cap, the
+    window plus the tokens in flight; a circular buffer one block.
+    """
+    max_model_len = vllm_config.model_config.max_model_len
+    in_flight = getattr(vllm_config, "max_in_flight_tokens", None)
+    admission = []
+    for group in kv_cache_config.kv_cache_groups:
+        spec = group.kv_cache_spec
+        members = getattr(spec, "kv_cache_specs", None)
+        if isinstance(members, dict) and members:
+            spec = next(iter(members.values()))
+        if type(spec).__name__ == "CircularBufferSpec":
+            admission.append(GroupAdmission(int(spec.block_size), fixed=1))
+            continue
+        cap = getattr(spec, "max_admission_blocks_per_request", None)
+        admission.append(
+            GroupAdmission(
+                int(spec.block_size),
+                cap=int(cap(in_flight, max_model_len))
+                if cap is not None and in_flight
+                else None,
+            )
+        )
+    return tuple(admission)
 
 
 def _uncacheable_request(request: Any) -> str | None:
@@ -1886,7 +1933,7 @@ class MaruKVConnector(KVConnectorBase_V1, *_HYBRID_SUPPORT):
                 self._kv_groups,
                 block_size=self._block_size,
                 use_layerwise=bool(extra.get("maru_use_layerwise", False)),
-                speculative=vllm_config.speculative_config is not None,
+                speculative_method=_speculative_method(vllm_config),
                 inline_loads=not _get_knob(extra, "maru_async_load"),
             )
 
@@ -1936,6 +1983,11 @@ class MaruKVConnector(KVConnectorBase_V1, *_HYBRID_SUPPORT):
                 num_lookahead_tokens=lookahead,
                 max_model_len=vllm_config.model_config.max_model_len,
                 kv_groups=self._kv_groups,
+                group_admission=(
+                    _group_admission(kv_cache_config, vllm_config)
+                    if kv_cache_config is not None and len(self._kv_groups) > 1
+                    else ()
+                ),
                 shard_suffixes=[
                     shard.suffix
                     for shard in (
@@ -2035,6 +2087,7 @@ class MaruKVConnector(KVConnectorBase_V1, *_HYBRID_SUPPORT):
                     kv_cache_config.num_blocks if kv_cache_config is not None else None
                 ),
                 dp_rank=_dp_index(vllm_config),
+                store_after_forward=_speculative_method(vllm_config) == DSPARK_METHOD,
             )
 
     @property
@@ -2097,6 +2150,7 @@ class MaruKVConnector(KVConnectorBase_V1, *_HYBRID_SUPPORT):
         # V2 calls this before logits/sampling and speculative drafting.
         assert self._worker is not None
         self._worker._raise_if_stopped()
+        self._worker.wait_for_draft_layer_loads()
         self._worker.trace_forward_end()
         self._worker._raise_if_stopped()  # its timing event may have stopped it
 
@@ -2124,13 +2178,17 @@ class MaruKVConnector(KVConnectorBase_V1, *_HYBRID_SUPPORT):
 
     def wait_for_save(self):
         # A single-group model's synchronous stores complete inside
-        # save_kv_layer. Write-behind stores intentionally outlive this
-        # forward; request/block lifetime is tracked through
-        # request_finished() + get_finished(). Several groups store here,
-        # after the forward has written every group's KV and state.
+        # save_kv_layer; with DSpark the layers that make no such call are
+        # stored here (MaruWorkerConnector.stores_after_forward). Write-behind
+        # stores intentionally outlive this forward; request/block lifetime
+        # is tracked through request_finished() + get_finished(). Several
+        # groups store here, after the forward has written every group's KV
+        # and state.
         if self._worker is not None:
             self._worker._raise_if_stopped()
-        if len(self._kv_groups) <= 1:
+        if len(self._kv_groups) <= 1 and not (
+            self._worker is not None and self._worker.stores_after_forward
+        ):
             return
         assert self._worker is not None
         metadata = self._get_connector_metadata()
@@ -2331,6 +2389,7 @@ class MaruSchedulerConnector:
         kv_groups: list[KVGroup] | None = None,
         shard_suffixes: Sequence[str] = ("",),
         state_suffixes: Sequence[str] = ("",),
+        group_admission: Sequence[GroupAdmission] = (),
         dp_rank: int = 0,
         layer_indices: Sequence[int] = (),
     ):
@@ -2351,6 +2410,9 @@ class MaruSchedulerConnector:
         self._num_gpu_blocks = num_gpu_blocks
         self._num_lookahead_tokens = num_lookahead_tokens
         self._max_model_len = max_model_len
+        # With several KV cache groups, the blocks one request takes in each
+        # (_resume_blocks); empty for one group.
+        self._group_admission = tuple(group_admission)
         self._bypass_requests: set[str] = set()
         # Key suffix of every distinct KV slice the engine's workers hold
         # (one "" at TP=1). Each worker stores only its own slice, so a chunk
@@ -3081,13 +3143,19 @@ class MaruSchedulerConnector:
         return False
 
     def _resume_blocks(self, request: Request) -> int:
-        """Prompt plus resume lookahead, capped as in vLLM's slot allocation."""
+        """Prompt plus resume lookahead, capped as in vLLM's slot allocation.
+
+        With several KV cache groups, the sum over every group, since vLLM
+        allocates them all from one block pool (``GroupAdmission``).
+        """
         tokens = getattr(request, "num_tokens", None)
         if tokens is None:
             tokens = len(request.prompt_token_ids or ())
         tokens = int(tokens) + self._num_lookahead_tokens
         if self._max_model_len is not None:
             tokens = min(tokens, self._max_model_len)
+        if self._group_admission:
+            return sum(group.blocks(tokens) for group in self._group_admission)
         return -(-tokens // self._block_size)
 
     def _group_block_ids(
@@ -3695,6 +3763,9 @@ class MaruWorkerConnector:
     _state_shard: KVShard = WHOLE_MODEL
     _use_mla = False
     _kv_planes = 2
+    # With DSpark a single-group model also stores from wait_for_save: the
+    # layers that did not call save_kv_layer in the step (stores_after_forward).
+    _store_after_forward = False
 
     def __init__(
         self,
@@ -3710,6 +3781,7 @@ class MaruWorkerConnector:
         use_mla: bool = False,
         num_blocks: int | None = None,
         dp_rank: int = 0,
+        store_after_forward: bool = False,
     ):
         _validate_deferred_loading(bool(_get_knob(extra_config, "maru_async_load")))
         self._block_size = block_size
@@ -3872,6 +3944,14 @@ class MaruWorkerConnector:
         # num_chunks x num_layers. Layerwise=True keeps the per-(chunk,layer)
         # objects. The overlap path below works under either format.
         self._use_layerwise = bool(extra_config.get("maru_use_layerwise", False))
+        # With DSpark a single-group model also stores in wait_for_save,
+        # which vLLM calls after the drafter: DSpark's draft layers are
+        # registered beside the target's, but vLLM's V2 model runner replays
+        # the draft step as a full CUDA graph, which calls no save_kv_layer.
+        # The target's layers store from their calls as usual, and
+        # wait_for_save stores the layers that made none, without which a
+        # chunk would never be complete.
+        self._store_after_forward = store_after_forward and not self._multi_group
         async_load = bool(_get_knob(extra_config, "maru_async_load"))
         overlap_requested = bool(
             _get_knob(extra_config, "maru_overlap_load_with_compute")
@@ -3926,6 +4006,9 @@ class MaruWorkerConnector:
         # Distinct layer indices whose save_kv_layer call was seen this step;
         # the kernel store dispatches when the set completes (order-agnostic).
         self._store_layers_seen: set[int] = set()
+        # With DSpark, the layers whose save_kv_layer call was seen this
+        # step; wait_for_save stores the others (stores_after_forward).
+        self._saved_layers: set[str] = set()
         # Dedicated stream for the kernel store's per-chunk D2H transfers.
         self._store_stream: torch.cuda.Stream | None = None
         self._store_stream_device: torch.device | None = None
@@ -4305,8 +4388,14 @@ class MaruWorkerConnector:
         # its last layers have written the paged cache (stale KV registered as
         # valid); an incomplete fallback slab can never complete once the step
         # that allocated it ended.
-        self._store_layers_seen.clear()
-        self._reclaim_stale_pending_slabs()
+        #
+        # With DSpark the step's store ends in wait_for_save instead, which
+        # drops this state: vLLM 0.29+ makes this call after the forward when
+        # the step has no inline load, between the target's save_kv_layer
+        # calls and wait_for_save, which completes what they began.
+        if not self._store_after_forward:
+            self._store_layers_seen.clear()
+            self._reclaim_stale_pending_slabs()
         self._trace_fwd = None
         if self._timing:
             self._trace_step = metadata.trace_step
@@ -7554,6 +7643,29 @@ class MaruWorkerConnector:
                 trace.waits.append((before, after))
             self._raise_if_stopped()
 
+    def wait_for_draft_layer_loads(self) -> None:
+        """Make the model stream wait for every layer load of the step, with DSpark.
+
+        vLLM runs DSpark's drafter after ``finish_forward``. A draft layer
+        waits for its load in ``wait_for_layer_load`` only when the drafter
+        runs eagerly, as it does under the piecewise CUDA graphs that an
+        overlapping load makes vLLM use; a draft step replayed as a full CUDA
+        graph calls no hook. The waits are therefore also enqueued here,
+        before drafting, rather than left to vLLM's choice of graph mode. A
+        target layer's load was already awaited, so waiting again on it costs
+        nothing.
+
+        Raises:
+            _UnconfirmedCopyError: A wait raised a CUDA error; the worker is
+                stopped.
+        """
+        if not self._store_after_forward or not self._layer_load_events:
+            return
+        stream = torch.cuda.current_stream()
+        for events in self._layer_load_events.values():
+            for event in events:
+                self._checked(stream.wait_event, event)
+
     @_best_effort
     def _trace_wait_start(self, trace, events, stream):
         # An already complete copy cannot block the later model stream.
@@ -7668,11 +7780,31 @@ class MaruWorkerConnector:
             # key. Skipping here queues nothing, so get_finished_saving still
             # reports this rank's finished requests at once.
             return
+        if self._store_after_forward:
+            # wait_for_save stores the layers that make no call in this step.
+            self._saved_layers.add(layer_name)
 
         if not self._use_layerwise:
             self._save_kv_layer_packed(layer_name, kv_layer, attn_metadata, metadata)
             return
+        self._save_kv_layer_layerwise(layer_name, kv_layer, attn_metadata, metadata)
 
+    def _save_kv_layer_layerwise(
+        self,
+        layer_name: str,
+        kv_layer: torch.Tensor,
+        attn_metadata: AttentionMetadata,
+        metadata: MaruConnectorMetadata,
+    ) -> None:
+        """Store one layer of each chunk the step completed as its own object.
+
+        A chunk's ``_DONE`` marker is written once every registered layer of
+        it is stored.
+
+        Raises:
+            _UnconfirmedCopyError: A copy raised a CUDA error; the worker
+                is stopped.
+        """
         layer_idx = self._get_layer_index(layer_name)
 
         for req_meta in self._store_entries(metadata):
@@ -7960,13 +8092,21 @@ class MaruWorkerConnector:
         that ``batch_store``, which writes the staged objects by RDMA, runs
         on the write-behind thread (``_register_objects_behind``).
 
+        A single-group model stores here only with DSpark, and only the
+        layers that did not call ``save_kv_layer`` in the step
+        (``stores_after_forward``; see ``_store_single_group_after_forward``).
+
         Raises:
             _UnconfirmedCopyError: Once a GPU copy could not be confirmed
                 finished, here too if a group's copy raises a CUDA error;
                 nothing is stored then.
         """
         self._raise_if_stopped()
-        if not self._multi_group or not self._group_caches:
+        if not self._multi_group:
+            if self._store_after_forward:
+                self._store_single_group_after_forward(metadata)
+            return
+        if not self._group_caches:
             return
         if not self._store_entries(metadata):
             return
@@ -8013,6 +8153,93 @@ class MaruWorkerConnector:
             self._register_objects(keys, handles, "group")
         self._register_done_markers(markers)
         self._raise_if_stopped()
+
+    @property
+    def stores_after_forward(self) -> bool:
+        """Whether this single-group model also stores in ``wait_for_save``."""
+        return self._store_after_forward
+
+    def _store_single_group_after_forward(
+        self, metadata: MaruConnectorMetadata
+    ) -> None:
+        """Store what the step's ``save_kv_layer`` calls left out, with DSpark.
+
+        DSpark's draft layers (on Qwen3, for one) are registered beside the
+        target's. vLLM's V2 model runner replays the draft step as a full
+        CUDA graph unless ``--enforce-eager``, and a replay calls no
+        ``save_kv_layer``, so a chunk that waits for every registered layer
+        would never be complete. vLLM calls ``wait_for_save`` after the
+        drafter, so every layer's KV of the step is in the paged buffers
+        here, and each layer that made no call is stored as from its call:
+
+        - The layerwise format stores those layers' objects, which completes
+          the chunk's ``_DONE`` marker. The target's layers stored theirs
+          from their calls.
+        - The chunkwise fallback writes those layers into the chunk's slab,
+          which the target's layers began from their calls.
+        - The chunkwise kernel stores the whole chunk here, as it does from
+          the last call of a step in which every layer calls.
+
+        A step in which every layer called (the drafter ran eagerly) is
+        already stored. One in which none did (the forward was a full CUDA
+        graph too) is stored whole.
+
+        The step's store ends here, whatever was stored: the layers recorded
+        for it are dropped, a write-behind store that its last call queued
+        is launched, and a slab that is still incomplete is freed.
+        """
+        missing = [
+            (name, kv_layer)
+            for name, kv_layer in self._kv_caches.items()
+            if name not in self._saved_layers
+        ]
+        # The step's store ends in this call: its save_kv_layer calls must
+        # not count for the next step (_start_loads leaves that to here).
+        self._saved_layers.clear()
+        self._store_layers_seen.clear()
+        # A store that the step's last save_kv_layer call queued is launched
+        # now. vLLM 0.33+ calls get_finished_saving before the drafter, so a
+        # store queued by the drafter's last layer would wait for the next
+        # step, and a request preempted in between would have another's KV
+        # in its blocks by then.
+        queued = self._queued_store_batches
+        self._queued_store_batches = []
+        for kernel, queued_metadata in queued:
+            self._store_packed_slabs_write_behind(kernel, queued_metadata)
+        if missing and self._stores() and self._store_entries(metadata):
+            self._ensure_handler()
+            if self._handler is not None:
+                self._store_layers_after_forward(missing, metadata)
+        # A slab still incomplete here can never be completed.
+        self._reclaim_stale_pending_slabs()
+
+    def _store_layers_after_forward(
+        self,
+        layers: list[tuple[str, torch.Tensor]],
+        metadata: MaruConnectorMetadata,
+    ) -> None:
+        """Store ``layers``, which made no ``save_kv_layer`` call in the step."""
+        attn_metadata = self._last_attn_metadata
+        if self._use_layerwise:
+            for layer_name, kv_layer in layers:
+                self._save_kv_layer_layerwise(
+                    layer_name, kv_layer, attn_metadata, metadata
+                )
+            return
+        kernel = self._checked(self._packed_store_kernel_ctx, attn_metadata)
+        if kernel is None:
+            # The per-layer fallback fills each chunk's slab layer by layer.
+            for layer_name, kv_layer in layers:
+                self._save_kv_layer_packed(
+                    layer_name, kv_layer, attn_metadata, metadata
+                )
+        elif self._write_behind:
+            # Launched now rather than queued for get_finished_saving, which
+            # vLLM may already have called this step: it reserves the keys
+            # before the request can be reported finished.
+            self._store_packed_slabs_write_behind(kernel, metadata)
+        else:
+            self._store_packed_slabs(kernel, metadata)
 
     def _register_done_markers(self, markers: dict[str, list[str]]) -> None:
         """Register the ``_DONE`` marker of each chunk whose layers are stored.

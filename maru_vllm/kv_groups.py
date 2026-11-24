@@ -40,6 +40,11 @@ GROUP_MLA = "mla"
 GROUP_SKIP = "skip"
 GROUP_UNSUPPORTED = "unsupported"
 
+# vLLM's name for DSpark speculative decoding, the one method the connector
+# supports on a model with several KV cache groups and stores a single-group
+# model's draft layers for.
+DSPARK_METHOD = "dspark"
+
 
 @dataclass(frozen=True)
 class KVGroup:
@@ -354,6 +359,33 @@ def hit_chunks(
     return 0, prefix
 
 
+@dataclass(frozen=True)
+class GroupAdmission:
+    """The blocks vLLM gives one request in one KV cache group.
+
+    vLLM allocates the blocks of every group, the groups Maru skips included,
+    from one block pool, so a parked load is admitted against their sum.
+
+    Attributes:
+        block_size: Tokens per block in the group.
+        cap: vLLM's per-request admission cap for a sliding-window group
+            (``max_admission_blocks_per_request``), None for no cap.
+        fixed: Blocks a request holds whatever its length, as a circular
+            buffer's one block; None otherwise.
+    """
+
+    block_size: int
+    cap: int | None = None
+    fixed: int | None = None
+
+    def blocks(self, tokens: int) -> int:
+        """Blocks a request of ``tokens`` tokens holds in this group."""
+        if self.fixed is not None:
+            return self.fixed
+        blocks = -(-tokens // self.block_size)
+        return blocks if self.cap is None else min(blocks, self.cap)
+
+
 def chunk_unit(groups: list[KVGroup], block_size: int) -> int:
     """Tokens a chunk is a multiple of, so it holds whole blocks of each group.
 
@@ -419,7 +451,7 @@ def check_multi_group_support(
     *,
     block_size: int,
     use_layerwise: bool,
-    speculative: bool,
+    speculative_method: str | None,
     inline_loads: bool,
 ) -> None:
     """Reject group combinations the connector cannot store correctly.
@@ -428,8 +460,13 @@ def check_multi_group_support(
     Several groups are supported in chunkwise (packed) format with full
     attention, sliding window, Mamba (``align``) and MLA groups whose
     attention groups share one KV shape, but not a Mamba group beside an MLA
-    group, with parked loads, without speculative decoding; in layerwise
-    format only when every stored group is an MLA group (DeepSeek-V4.1).
+    group, with parked loads; in layerwise format only when every stored
+    group is an MLA group (DeepSeek-V4.1). The one speculative decoding
+    method supported is DSpark (``DSPARK_METHOD``), without a Mamba group:
+    vLLM puts its draft layers in groups like any other layer (DeepSeek-V4.1's
+    draft windows in the target's window groups), and the drafter writes a
+    token's draft KV in the step that computes the token, before the
+    connector stores it.
     Every group uses vLLM's block size, but an MLA group may use another
     (DeepSeek-V4.1's 64-token MLA blocks beside its 32-token windows); the
     chunk then holds whole blocks of each (``chunk_unit``). Groups vLLM does
@@ -441,7 +478,8 @@ def check_multi_group_support(
         groups: The model's KV cache groups.
         block_size: ``cache_config.block_size``, which the connector uses.
         use_layerwise: ``maru_use_layerwise``.
-        speculative: Whether speculative decoding is configured.
+        speculative_method: The speculative decoding method configured, or
+            None without speculative decoding.
         inline_loads: Whether loads run inline (``maru_async_load`` set to
             false; ``MaruKVConnector`` turns it on for several groups unless
             set).
@@ -485,12 +523,26 @@ def check_multi_group_support(
             "(DeepSeek-V4.1); otherwise only in chunkwise format. Set "
             f"maru_use_layerwise=false{one_group_hint(groups)}"
         )
-    if speculative:
-        raise ValueError(
-            "MaruKVConnector does not support speculative decoding with models "
-            f"that have several KV cache groups{one_group_hint(groups)}"
-        )
     kinds = {g.kind for g in stored}
+    if speculative_method is not None and GROUP_MAMBA in kinds:
+        # In align mode vLLM keeps a block per draft token at the end of a
+        # request's Mamba block list and moves one into place when a state
+        # lands there, but a connector learns only the blocks appended. The
+        # block list the scheduler tracks can then name, at a chunk's end, a
+        # block no kernel wrote, and Maru would store it as the chunk's state.
+        # Checked before the method: no method works here, DSpark included.
+        raise ValueError(
+            "MaruKVConnector does not support speculative decoding "
+            f"({speculative_method!r}) with a Mamba-type KV cache group: vLLM "
+            "moves a Mamba state block within the request's last blocks "
+            "without telling the connector"
+        )
+    if speculative_method is not None and speculative_method != DSPARK_METHOD:
+        raise ValueError(
+            "MaruKVConnector supports speculative decoding on models with "
+            f"several KV cache groups only with DSpark ({DSPARK_METHOD!r}), "
+            f"not {speculative_method!r}{one_group_hint(groups)}"
+        )
     if {GROUP_MAMBA, GROUP_MLA} <= kinds:
         # A Mamba group pins the chunk to one block (chunk_tokens_for_groups),
         # which holds no whole block of an MLA group with larger blocks, and
