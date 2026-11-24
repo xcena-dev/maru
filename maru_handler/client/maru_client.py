@@ -1278,7 +1278,7 @@ class MaruClient:
             for i in live:
                 self._finish_handle(handles[i], "done")
 
-        def on_result(response) -> None:
+        def on_result(response, _storage) -> None:
             if response.status != Status.OK:
                 logger.error(
                     "WRITE_DONE refused: %s %s", response.status, response.error
@@ -1331,7 +1331,7 @@ class MaruClient:
             request = ops.origin.stamp(
                 AbortRequest(op=PLACEHOLDER_OP, credits=credits[i : i + MAX_BATCH])
             )
-            self._send_op(NodeMessageType.ABORT, request, lambda _r: None, ops)
+            self._send_op(NodeMessageType.ABORT, request, lambda _r, _s: None, ops)
         self._credit_freed.set()
         self._refill_wake.set()
 
@@ -1386,7 +1386,7 @@ class MaruClient:
             if not ops.resolved(seq):
                 return  # another reply of this op was handled already
             try:
-                on_result(response)
+                on_result(response, storage)
             except Exception:
                 logger.exception("handling the result of 0x%02X failed", code)
 
@@ -1463,7 +1463,7 @@ class MaruClient:
         with self._lock:
             self._credit_op = (ops, request.op.seq)
 
-        def on_result(response) -> None:
+        def on_result(response, grant_storage) -> None:
             if response.status != Status.OK:
                 logger.warning("CREDIT: %s %s", response.status, response.error)
                 return
@@ -1481,6 +1481,12 @@ class MaruClient:
                     remote_credits, remote, info.node_id, epoch
                 ):
                     self._count("credit_bad_domain")
+                    # A lost connection fences its domain on the service.
+                    if not self._stopped.is_set() and not grant_storage.closed:
+                        grant_storage.submit(
+                            NodeMessageType.CREDIT_RETURN,
+                            CreditReturnRequest(credits=response.credits),
+                        )
                     return
             mapped = [
                 c

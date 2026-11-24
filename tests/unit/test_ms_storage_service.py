@@ -353,7 +353,8 @@ class TestRepliesAndResults:
         )
         got = []
 
-        def on_result(response):
+        def on_result(response, storage):
+            assert storage is client._storage
             got.append(response)
             client.credits.put(response.credits, ops.node_epoch)
 

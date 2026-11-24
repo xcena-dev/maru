@@ -324,6 +324,28 @@ def test_credit_replay_and_return_use_the_same_reservation(pair):
     assert pair.memory.pools.bytes_in(PageState.CREDITED) == 0
 
 
+def test_failed_write_agent_load_returns_the_full_grant(pair, monkeypatch):
+    monkeypatch.setattr(MaruClient, "_refill_loop", lambda self: None)
+    load = FakeTransport.add_peer
+    failed = []
+
+    def fail_once(transport, metadata, *, peer=None):
+        if peer and "-write-" in peer and not failed:
+            failed.append(peer)
+            raise RuntimeError("write agent unavailable")
+        return load(transport, metadata, peer=peer)
+
+    monkeypatch.setattr(FakeTransport, "add_peer", fail_once)
+    worker = pair.client()
+    wait_until(lambda: worker.stats["credit_bad_domain"] == 1)
+    assert len(failed) == 1 and worker.credits.unused_bytes == 0
+    wait_until(lambda: not pair.gpu.store._credits, what="unused grant returned")
+    worker._refill_once()
+    wait_until(lambda: worker.credits.unused_bytes == 4 * PAGE)
+    handle = worker.alloc(PAGE)
+    assert worker.batch_store(["after-bind-failure"], [handle]) == [True]
+
+
 def test_returning_remote_credit_releases_128_worker_bindings(pair, monkeypatch):
     monkeypatch.setattr(MaruClient, "_refill_loop", lambda self: None)
     worker = pair.client()
