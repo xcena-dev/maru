@@ -2217,10 +2217,12 @@ class MaruKVConnector(KVConnectorBase_V1, *_HYBRID_SUPPORT):
         """
         assert self._worker is not None
         self._worker.trace_forward_end()
-        return (
+        finished = (
             self._worker.get_finished_saving(finished_req_ids),
             self._worker.get_finished_loading(),
         )
+        self._worker.confirm_skipped_stores()
+        return finished
 
     def update_connector_output(self, connector_output: KVConnectorOutput) -> None:
         assert self._scheduler is not None
@@ -3829,11 +3831,14 @@ class MaruWorkerConnector:
         self._kv_planes = 1 if use_mla else 2
         self._handler = None
         self._kv_caches: dict[str, torch.Tensor] = {}
-        # TODO: _stored_keys grows unbounded and may become stale if CXL
-        # eviction removes the actual data. Consider TTL-based expiry or
-        # periodic batch_exists validation. Also risks memory growth in
-        # long-running deployments (num_chunks × num_layers keys).
+        # TODO: _stored_keys grows unbounded: memory growth in long-running
+        # deployments (num_chunks × num_layers keys).
         self._stored_keys: set[str] = set()
+        # Keys a store skipped this step because _stored_keys holds them. The
+        # set does not learn of an object another client deleted (or
+        # MaruServer evicted), so these are checked with MaruServer after the
+        # step (confirm_skipped_stores).
+        self._skipped_as_stored: set[str] = set()
         # Track per-chunk layer completion for writing _DONE markers.
         # chunk_base_key -> set of stored layer indices
         self._chunk_layer_progress: dict[str, set[int]] = {}
@@ -8255,7 +8260,7 @@ class MaruWorkerConnector:
         keys: list[str] = []
         handles: list = []
         for base, layer_keys in markers.items():
-            if not all(self._is_stored(key) for key in layer_keys):
+            if not all(self._is_stored(key, recheck=False) for key in layer_keys):
                 continue
             handle = None
             try:
@@ -9257,10 +9262,51 @@ class MaruWorkerConnector:
             except Exception:
                 pass
 
-    def _is_stored(self, key: str) -> bool:
+    def _is_stored(self, key: str, recheck: bool = True) -> bool:
+        """Whether this worker stored ``key``, as far as it knows.
+
+        ``recheck`` notes a key found for :meth:`confirm_skipped_stores`; pass
+        False where the answer skips no store.
+        """
         if self._cpu_mode:
             return self._handler is not None and self._handler.has_local(key)
-        return key in self._stored_keys
+        if key not in self._stored_keys:
+            return False
+        if recheck:
+            self._skipped_as_stored.add(key)
+        return True
+
+    def confirm_skipped_stores(self) -> None:
+        """Forget the stored keys MaruServer no longer has (once per step).
+
+        A store skips a chunk whose key is in ``_stored_keys``. Being asked to
+        store a chunk again is the sign that a lookup did not find it, so the
+        keys skipped in the step are checked with one ``batch_exists``. A key
+        that is gone leaves the set, and the chunk is stored the next time it
+        is computed. If MaruServer cannot be asked, the handler answers False
+        for every key: the chunks are then copied again and ``batch_store``
+        sorts out which of them exist.
+        """
+        if not self._skipped_as_stored:
+            return
+        skipped, self._skipped_as_stored = self._skipped_as_stored, set()
+        handler = self._handler
+        if handler is None or self._stopped is not None:
+            return
+        keys = sorted(skipped)
+        try:
+            exists = handler.batch_exists(keys)
+        except Exception:
+            logger.debug("Maru could not confirm skipped stores", exc_info=True)
+            return
+        gone = [key for key, found in zip(keys, exists, strict=False) if not found]
+        if gone:
+            self._stored_keys.difference_update(gone)
+            logger.info(
+                "Maru: %d stored object(s) were deleted; their chunks are "
+                "stored again when next computed",
+                len(gone),
+            )
 
     def _record_stored(self, key: str) -> None:
         if not self._cpu_mode:
