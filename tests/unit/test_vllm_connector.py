@@ -32,8 +32,6 @@ from maru_vllm.connector import (
 )
 from tests.unit.vllm_connector_helpers import (
     FailingSyncStream,
-    async_load_metadata,
-    async_load_req_meta,
     attach_capturing_handler,
     capture_float32,
     cuda_error,
@@ -41,6 +39,8 @@ from tests.unit.vllm_connector_helpers import (
     fake_new_request_data,
     fake_scheduler_output,
     holds,
+    load_metadata,
+    load_req_meta,
     make_bare_worker,
     make_flash_attn_metadata,
     make_scheduler,
@@ -1456,7 +1456,7 @@ class TestStoreLoadRoundtripModernLayout:
         )
         reader.start_load_kv(
             fwd,
-            async_load_metadata(
+            load_metadata(
                 token_ids=token_ids,
                 block_ids=list(range(16)),
                 num_matched_chunks=len(chunk_keys),
@@ -1583,7 +1583,7 @@ class TestPackedStoreLoadRoundtrip:
 
         reader.start_load_kv(
             forward_context,
-            async_load_metadata(
+            load_metadata(
                 token_ids=token_ids,
                 block_ids=list(range(self.NUM_BLOCKS)),
                 num_matched_chunks=len(chunk_keys),
@@ -1613,7 +1613,7 @@ class TestPackedStoreLoadRoundtrip:
         block_ids = list(range(self.NUM_BLOCKS))
         metadata = MaruConnectorMetadata(
             requests=[
-                async_load_req_meta(
+                load_req_meta(
                     token_ids=token_ids,
                     block_ids=block_ids,
                     num_matched_chunks=hit,
@@ -1688,7 +1688,7 @@ class TestPackedStoreLoadRoundtrip:
         step(
             MaruConnectorMetadata(
                 requests=[
-                    async_load_req_meta(
+                    load_req_meta(
                         token_ids=token_ids,
                         block_ids=block_ids,
                         num_matched_chunks=hit,
@@ -1711,7 +1711,7 @@ class TestPackedStoreLoadRoundtrip:
     def test_an_async_load_failing_on_the_loader_thread_still_stores(self):
         """The loader hands an async remote load's batches on as sync-load parts."""
         worker = self._make_worker(self._source_caches())
-        part = async_load_req_meta(
+        part = load_req_meta(
             token_ids=list(range(self.PROMPT)),
             block_ids=list(range(self.NUM_BLOCKS)),
             num_matched_chunks=2,
@@ -1873,7 +1873,7 @@ class TestPackedKernelRoundtripGPU:
         )
         reader.start_load_kv(
             forward_context,
-            async_load_metadata(
+            load_metadata(
                 token_ids=token_ids,
                 block_ids=list(range(self.NUM_BLOCKS)),
                 num_matched_chunks=num_chunks,
@@ -1950,7 +1950,7 @@ class TestPackedKernelRoundtripGPU:
         [(True,), (False,), (True, False)],
         ids=["pinned", "pageable", "mixed"],
     )
-    def test_inline_roundtrip_with_pin_states(self, pinning, monkeypatch):
+    def test_sync_roundtrip_with_pin_states(self, pinning, monkeypatch):
         """Failed pinning must preserve KV bytes without staging pinned pages."""
         import maru_kv_ops
 
@@ -2785,12 +2785,12 @@ class TestAsyncLoading:
 
     def test_failed_async_load_reports_blocks_and_completion(self):
         worker = make_worker(block_size=4, kv_chunk_tokens=self.CHUNK)
-        meta = async_load_req_meta(
+        meta = load_req_meta(
             token_ids=list(range(64)),
             block_ids=[7, 8, 9],
             num_matched_chunks=8,
         )
-        worker._fail_async_load(meta)
+        worker._handle_unavailable_kv(meta)
         assert worker.get_finished_loading() == {"r1"}
         assert worker.get_finished_loading() is None
         assert worker.take_failed_load_blocks() == {7, 8, 9}
@@ -2815,7 +2815,7 @@ class TestAsyncLoading:
 
         layer = SimpleNamespace(kv_cache=kv)
         fwd = SimpleNamespace(no_compile_layers={"l0": layer}, attn_metadata=None)
-        metadata = async_load_metadata(
+        metadata = load_metadata(
             token_ids=list(range(64)),
             block_ids=list(range(16)),
             num_matched_chunks=8,
@@ -2850,7 +2850,7 @@ class TestAsyncLoading:
             no_compile_layers={"l0": SimpleNamespace(kv_cache=bad_cache)},
             attn_metadata=None,
         )
-        metadata = async_load_metadata(
+        metadata = load_metadata(
             token_ids=list(range(64)),
             block_ids=list(range(16)),
             num_matched_chunks=8,
@@ -2870,7 +2870,7 @@ class TestAsyncPackedLoad:
         return make_worker(block_size=4, kv_chunk_tokens=self.CHUNK)
 
     def _async_load_meta(self):
-        return async_load_req_meta(
+        return load_req_meta(
             token_ids=list(range(64)),
             block_ids=list(range(16)),
             num_matched_chunks=8,
@@ -3487,7 +3487,7 @@ class TestPreIssuedLayerwiseHandoff:
 
         # The loader queues them a moment later and finds the request gone.
         events = {name: MagicMock() for name in self.LAYERS}
-        meta = async_load_req_meta(
+        meta = load_req_meta(
             token_ids=list(range(8)),
             block_ids=[0, 1],
             num_matched_chunks=2,
@@ -3524,7 +3524,7 @@ class TestPreIssuedLayerwiseHandoff:
         worker = self._worker()
         worker._inflight_async_load_req_ids.add("r1")
         events = {name: MagicMock() for name in self.LAYERS}
-        meta = async_load_req_meta(
+        meta = load_req_meta(
             token_ids=list(range(8)),
             block_ids=[0, 1],
             num_matched_chunks=2,
@@ -3581,7 +3581,7 @@ class TestPreIssuedLayerwiseHandoff:
         worker = self._worker()
         pre_issued = {name: MagicMock() for name in self.LAYERS}
         worker._async_layerwise_events["r1"] = dict(pre_issued)
-        failing = async_load_req_meta(
+        failing = load_req_meta(
             token_ids=list(range(8)),
             block_ids=[7, 8],
             num_matched_chunks=2,
@@ -3718,7 +3718,7 @@ class TestLayerwiseFormatOverlap:
         return worker
 
     def _async_load_meta(self):
-        meta = async_load_req_meta(
+        meta = load_req_meta(
             token_ids=list(range(64)),
             block_ids=list(range(16)),
             num_matched_chunks=8,
@@ -3832,7 +3832,7 @@ class TestLayerwiseFormatOverlap:
                 view=memoryview(bytearray(obj_bytes)), region_id=0, page_index=0
             )
         ]  # one short of 1 chunk x 2 layers
-        meta = async_load_req_meta(
+        meta = load_req_meta(
             token_ids=list(range(4)), block_ids=[0], num_matched_chunks=1
         )
 
@@ -4036,7 +4036,7 @@ class TestLayerwiseFormatOverlap:
             )
             for li, src in enumerate(sources)
         ]
-        meta = async_load_req_meta(
+        meta = load_req_meta(
             token_ids=list(range(4)), block_ids=[0], num_matched_chunks=1
         )
         assert meta.layerwise_load is False  # overlap off: scheduler never marks
@@ -4094,7 +4094,7 @@ class TestLayerwiseFormatOverlap:
             )
         worker._handler = MagicMock()
         worker._handler.batch_retrieve.return_value = infos
-        meta = async_load_req_meta(
+        meta = load_req_meta(
             token_ids=list(range(8)), block_ids=[0, 1], num_matched_chunks=2
         )
         meta.layerwise_load = True
@@ -5452,11 +5452,11 @@ class TestPackedStorage:
 
 
 class TestStartLoadKvEarlyReturnSafety:
-    """Early returns must strand no async-loading request and leak no per-step state.
+    """Early returns must release waiting requests and reset per-step state.
 
     ``start_load_kv`` can return before iterating ``metadata.requests``
-    (worker handler in connect backoff, no attention layers). Async-loading
-    requests already wait in WAITING_FOR_REMOTE_KVS and must degrade
+    (worker handler in connect backoff, no attention layers). Requests in
+    WAITING_FOR_REMOTE_KVS must be released for recomputation
     to recompute via ``get_finished_loading``/``take_failed_load_blocks``
     instead of hanging. Independently, the previous step's packed-store
     dispatch state (``_store_layers_seen``, incomplete ``_pending_slabs``)
@@ -5475,7 +5475,7 @@ class TestStartLoadKvEarlyReturnSafety:
         return worker
 
     def _metadata(self, is_async=True):
-        return async_load_metadata(
+        return load_metadata(
             token_ids=list(range(16)),
             block_ids=[0, 1, 2, 3],
             num_matched_chunks=2,
@@ -5516,10 +5516,10 @@ class TestStartLoadKvEarlyReturnSafety:
         assert worker.take_failed_load_blocks() == set()
 
     def test_zero_matched_chunks_degrades_async_load_to_recompute(self):
-        """An async-loading request with nothing to load must still be reported.
+        """A request waiting for KV needs a completion even with zero chunks.
 
         `update_state_after_alloc` defaults its match result to 0 when the
-        entry is missing, so the scheduler can emit an async-loading request with
+        entry is missing, so the scheduler can emit an async load with
         `num_matched_chunks=0`. The worker reaches its request loop normally
         in that case — the early returns never fire — so the loop itself has
         to report the request or it stays waiting forever.
@@ -5814,8 +5814,8 @@ class TestAsyncLoadAdmissionFitsCache:
     A request waiting for its async load holds blocks for its loaded prefix
     only, yet resumes only when its whole prompt fits. vLLM checks that fit
     for each request against the blocks free at that moment, so several
-    async-loading requests can together hold the pool while the oldest still needs
-    more. With nothing running, nothing frees a block and the engine stops.
+    requests waiting for KV can fill the pool while the oldest still needs more
+    blocks. With nothing running, nothing frees a block and the engine stops.
     """
 
     # 200 tokens with 12 cached chunks: 24 blocks held, 50 needed in all.
@@ -6414,7 +6414,7 @@ class TestRequestTrace:
                 worker._trace_worker_req("job_start", req_meta.req_id)
 
         monkeypatch.setattr(worker, "_async_load_job", job)
-        req_meta = async_load_req_meta(
+        req_meta = load_req_meta(
             token_ids=list(range(8)), block_ids=[0, 1], num_matched_chunks=1
         )
         assert worker._try_submit_async_load(req_meta)
@@ -6463,7 +6463,7 @@ class TestRequestTrace:
             trace(event, req_id, **fields)
 
         monkeypatch.setattr(worker, "_trace_worker_req", trace_req)
-        req_meta = async_load_req_meta(
+        req_meta = load_req_meta(
             token_ids=list(range(8)), block_ids=[0, 1], num_matched_chunks=1
         )
         worker._async_load_job(req_meta, [("l0", torch.zeros(2, 2, 4, 1), 0)], device)

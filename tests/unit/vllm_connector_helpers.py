@@ -486,7 +486,7 @@ def store_metadata(**kwargs: Any) -> MaruConnectorMetadata:
     return MaruConnectorMetadata(requests=[store_req_meta(**kwargs)])
 
 
-def async_load_req_meta(
+def load_req_meta(
     *,
     token_ids: list[int],
     block_ids: list[int],
@@ -494,7 +494,7 @@ def async_load_req_meta(
     req_id: str = "r1",
     async_load: bool = True,
 ) -> MaruReqMeta:
-    """Load-side request metadata for an async (between-step) load."""
+    """Build metadata for a single load. Loads are async by default."""
     from maru_vllm.connector import MaruReqMeta
 
     return MaruReqMeta(
@@ -507,11 +507,11 @@ def async_load_req_meta(
     )
 
 
-def async_load_metadata(**kwargs: Any) -> MaruConnectorMetadata:
-    """Single-request load metadata; kwargs go to :func:`async_load_req_meta`."""
+def load_metadata(**kwargs: Any) -> MaruConnectorMetadata:
+    """Single-request load metadata; kwargs go to :func:`load_req_meta`."""
     from maru_vllm.connector import MaruConnectorMetadata
 
-    return MaruConnectorMetadata(requests=[async_load_req_meta(**kwargs)])
+    return MaruConnectorMetadata(requests=[load_req_meta(**kwargs)])
 
 
 # =============================================================================

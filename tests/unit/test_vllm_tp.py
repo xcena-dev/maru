@@ -640,7 +640,7 @@ def test_tp_fails_a_layerwise_overlap_load_whose_copies_it_cannot_queue():
     whose copies failed is the only one that knows (#135), so the load fails
     while the request waits for its async load and vLLM recomputes it on every rank."""
     from maru_common.kv_shard import tp_part_shard
-    from tests.unit.vllm_connector_helpers import async_load_req_meta
+    from tests.unit.vllm_connector_helpers import load_req_meta
 
     worker = make_worker(
         BLOCK,
@@ -656,7 +656,7 @@ def test_tp_fails_a_layerwise_overlap_load_whose_copies_it_cannot_queue():
         for i in range(PROMPT // CHUNK)
     ]
     worker._issue_layerwise_copies_offthread = lambda *args, **kwargs: None
-    meta = async_load_req_meta(
+    meta = load_req_meta(
         token_ids=list(range(PROMPT)),
         block_ids=list(range(NUM_BLOCKS)),
         num_matched_chunks=PROMPT // CHUNK,

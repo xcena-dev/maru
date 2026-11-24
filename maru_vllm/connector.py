@@ -823,10 +823,10 @@ def _several_group_defaults(
 ) -> dict[str, Any]:
     """Turn on async loads for a model with several KV cache groups unless set.
 
-    vLLM 0.31+ takes a failed load of such a model only by its request, and
-    only for an async-loading request; a failed sync load stops the engine there
-    (xcena-dev/maru#126). ``check_multi_group_support`` refuses an explicit
-    ``maru_async_load=false``.
+    vLLM 0.31+ accepts a failure by request ID while the request waits for KV.
+    A failed sync load is reported by block ID and stops the engine with
+    several groups (xcena-dev/maru#126). ``check_multi_group_support``
+    refuses an explicit ``maru_async_load=false``.
     """
     knob = "maru_async_load"
     if len(groups) <= 1 or knob in extra or _RENAMED_KNOBS[knob] in extra:
@@ -844,9 +844,9 @@ def _tensor_parallel_defaults(extra: dict[str, Any], tp_size: int) -> dict[str, 
     A sync load runs in the step that computes its request, and a rank
     whose load fails is the only one that knows: the all-reduce in every layer
     spreads its unfilled KV to every rank, and the other ranks store what they
-    computed from it (xcena-dev/maru#135). An async load finishes on every rank
-    before the request computes, and vLLM merges all ranks' results first, so
-    a failure on one rank recomputes the request on all of them.
+    computed from it (xcena-dev/maru#135). With async loads, vLLM combines
+    the ranks' results before scheduling the request, so it can apply a
+    failure on one rank to the whole request.
 
     Raises:
         ValueError: If ``maru_async_load`` is set to false.
@@ -1459,10 +1459,8 @@ class MaruReqMeta:
     # For load: the request waits in WAITING_FOR_REMOTE_KVS and the worker
     # loads between scheduler steps, reporting completion via get_finished().
     async_load: bool = False
-    # Layerwise-overlap mode: the loader thread stops after retrieve and the
-    # resumed forward pipelines this request by layer. Set for every async
-    # load when maru_overlap_load_with_compute is on, under either storage
-    # format.
+    # With layerwise overlap the forward waits for each layer's KV as needed.
+    # The loader normally queues those copies before the request resumes.
     layerwise_load: bool = False
     # A model with several KV cache groups: the block IDs of every group, in
     # vLLM's group order, each accumulated like block_ids (whose list is the
@@ -1770,19 +1768,16 @@ class MaruKVConnector(KVConnectorBase_V1, *_HYBRID_SUPPORT):
         maru_kv_chunk_tokens: int - Tokens per KV chunk (default: 256)
 
     Performance axes — the knobs a deployer actually chooses between:
-        maru_async_load: bool - Load matched KV between scheduler steps: the
-            request waits in WAITING_FOR_REMOTE_KVS while a background
-            loader thread performs the whole load (Maru retrieve RPC +
-            CXL->GPU transfer on a dedicated stream), so neither the RPC wait
-            nor the copy ever blocks the engine's forward passes — the
-            in-process analog of the MP server's separate-process retrieve.
-            This is what vLLM itself calls an async load
-            (get_num_new_matched_tokens returns async_load=True). On vLLM
-            < 0.23, or with speculative lookahead, Maru budgets the async-loading
-            requests' prompts plus resume lookahead; excess loads wait their
-            turn. On vLLM 0.23+ without lookahead, admission uses vLLM's own
+        maru_async_load: bool - Load matched KV between scheduler steps.
+            The request waits in WAITING_FOR_REMOTE_KVS. With chunkwise KV
+            on one CUDA device per worker, a background thread retrieves the
+            KV and queues its copies.
+            On vLLM < 0.23, or with speculative lookahead, Maru budgets each
+            waiting request's prompt and lookahead before admitting another
+            load. On vLLM 0.23+ without lookahead, admission uses vLLM's own
             reservation without an additional Maru block budget.
-            (default: false, true for remote_cxl; was
+            (default: true for remote_cxl, several KV cache groups or TP > 1,
+            false otherwise; was
             maru_enable_deferred_loading)
         maru_async_store: bool - Gather completed prompt chunks into a
             reusable GPU staging slab after the forward, then copy them to CXL
@@ -1791,10 +1786,10 @@ class MaruKVConnector(KVConnectorBase_V1, *_HYBRID_SUPPORT):
             get_finished() reports the store complete
             (default: false, true for remote_cxl; was
             maru_enable_write_behind)
-        maru_overlap_load_with_compute: bool - With maru_async_load, queue a
-            async-loading request's per-layer transfers while it waits and release
-            it once its first layer has landed, so the remaining layers
-            arrive during its own attention. Works under either storage
+        maru_overlap_load_with_compute: bool - With maru_async_load, queue
+            per-layer copies while the request waits for KV. By default the
+            request can resume once the first layer arrives, so remaining
+            copies can overlap its attention computation. Works under either storage
             format: chunkwise slabs are sliced per layer, layerwise objects
             are gathered per layer. The transfers share one stream, which keeps
             each at full bandwidth and makes a later request's first layer
@@ -2454,10 +2449,8 @@ class MaruSchedulerConnector:
         self._requests_need_load: dict[str, tuple[Request, int]] = {}
         # req_id -> (request, num_matched_chunks)
 
-        # Asynchronous load (between-step): matched KV is transferred while the
-        # request waits in WAITING_FOR_REMOTE_KVS instead of stalling its
-        # first forward pass. This is the mechanism vLLM itself calls async
-        # loading — get_num_new_matched_tokens returns async_load=True.
+        # Returned as load_kv_async by get_num_new_matched_tokens. When true,
+        # vLLM holds the request in WAITING_FOR_REMOTE_KVS until we report it ready.
         self._async_loading = bool(_get_knob(extra_config, "maru_async_load"))
         _validate_async_loading(self._async_loading)
         if bool(extra_config.get("maru_read_hints", False)) and not (
@@ -2500,27 +2493,20 @@ class MaruSchedulerConnector:
         self._pending_async_loads: dict[
             str, tuple[Request, int, tuple[list[int], ...]]
         ] = {}
-        # Async-load hit requests that are still live in the scheduler. Pending
-        # admissions alone are not a concurrency signal: a burst may arrive
-        # one request per scheduler step while earlier requests are decoding.
-        # Keep the live set until finish/preemption so the layerwise overlap is
-        # used only when the serving workload is actually singleton.
+        # Requests admitted with an async load that are still live in the scheduler.
         self._active_async_load_req_ids: set[str] = set()
         # Track scheduler-observed completion, not worker event readiness:
         # an abort can race with a receive report travelling from the worker.
         self._awaiting_async_load_recv: set[str] = set()
         self._recv_only_finished_req_ids: set[str] = set()
-        # Requests emitted for async packed loading remain here until vLLM's
-        # second update_state_after_alloc call says they are ready to resume.
-        # The next connector metadata then activates the worker's retained CXL
-        # views for per-layer transfer.
+        # vLLM calls update_state_after_alloc again when the request can
+        # resume. The next step then picks up its per-layer copy events or
+        # issues the copies from the retained CXL views.
         self._async_layerwise_waiting: set[str] = set()
         self._async_layerwise_ready: set[str] = set()
-        # GPU blocks each async-loading request needs for its prompt and lookahead, from
-        # its async load until it resumes. An async-loading request holds blocks for its
-        # loaded prefix only and resumes only once the rest fits too, so the
-        # async-loading requests together must never need more than the cache holds:
-        # otherwise they can fill it with nothing running to free a block.
+        # Track the full prompt and lookahead until the request resumes. While
+        # waiting for KV it holds only its prefix blocks. If the waiting requests
+        # fill the cache, none can resume and free blocks for the others.
         self._async_load_blocks: dict[str, int] = {}
         # Requests told to wait for room, oldest first, with the blocks they
         # need. Their room is kept ahead of later requests so a long prompt
@@ -3061,8 +3047,8 @@ class MaruSchedulerConnector:
 
         Returns:
             ``(tokens, load_async)``. ``(None, False)`` asks vLLM to try the
-            request again on a later step: starting its async load now could leave the
-            async-loading requests needing more blocks than the cache has.
+            request again on a later step if admitting it would leave too few
+            blocks for the waiting requests to resume.
         """
         # vLLM asks only about a request that holds no async-load blocks. One
         # still on record had its load fail and its blocks freed.
@@ -3115,8 +3101,8 @@ class MaruSchedulerConnector:
     def _admit_async_loads(self, request: Request) -> bool:
         """Whether ``request`` may wait in WAITING_FOR_REMOTE_KVS while its load runs.
 
-        It may when the blocks its prompt and lookahead need, added to what the
-        async-loading requests and the older waiters need, fit in the cache. A
+        Its prompt and lookahead must fit alongside the blocks needed by
+        requests already waiting for KV and those ahead of it in the queue. A
         request that is first in line is always admitted: vLLM sizes the
         cache to hold one request of the maximum length.
         """
@@ -3732,8 +3718,8 @@ class MaruSchedulerConnector:
         self._trace_budget_waits.discard(request.request_id)
         self._trace_attempts.pop(request.request_id, None)
         if request.request_id in self._awaiting_async_load_recv:
-            # vLLM already retains an async-loading request's blocks until its receive
-            # completes. Claiming send ownership too produces a second free.
+            # vLLM retains these blocks until the receive completes.
+            # Claiming send ownership too produces a second free.
             self._recv_only_finished_req_ids.add(request.request_id)
             return False, None
         return self._write_behind, None
@@ -3887,12 +3873,8 @@ class MaruWorkerConnector:
         # copies queued after the abort was seen.
         self._inflight_async_load_req_ids: set[str] = set()
         self._abandoned_req_ids: set[str] = set()
-        # Truly asynchronous loads: a single background thread
-        # runs the whole load — Maru retrieve RPC + H2D on _async_load_stream —
-        # so neither the RPC wait nor the copy blocks the engine thread's
-        # forward passes (the in-process analog of MP's separate-process
-        # retrieve). _async_load_lock guards every _async_load_*/failed structure;
-        # both the loader thread and the engine thread mutate them.
+        # The loader and engine threads share load events, completion
+        # reports and failures under this lock.
         self._async_load_lock = threading.Lock()
         # A successful remote load already found these full chunks in its
         # pool. Skip their write-behind copies for this request only. Keep
@@ -4411,7 +4393,7 @@ class MaruWorkerConnector:
 
         self._ensure_handler()
         if self._handler is None:
-            self._abort_async_loads(metadata)
+            self._abort_step_loads(metadata)
             return
 
         attn_metadata = forward_context.attn_metadata
@@ -4440,7 +4422,7 @@ class MaruWorkerConnector:
                 (layer_name, kv_cache_layer, self._get_layer_index(layer_name))
             )
         if not layers:
-            self._abort_async_loads(metadata)
+            self._abort_step_loads(metadata)
             return
 
         prepared_requests: list[tuple[MaruReqMeta, int, torch.Tensor, list[Any]]] = []
@@ -4473,24 +4455,14 @@ class MaruWorkerConnector:
             if req_meta.is_store:
                 continue
             if req_meta.num_matched_chunks == 0:
-                # Nothing to load, but an async-loading request still waits in
-                # WAITING_FOR_REMOTE_KVS and must be reported. The scheduler
-                # emits num_matched_chunks=0 whenever its match result is
-                # missing at allocation time (update_state_after_alloc
-                # defaults to 0), so this is the third way an async-loading request
-                # can reach the worker with no load to perform.
-                # _fail_async_load ignores sync-load requests.
-                self._fail_async_load(req_meta)
+                # A missing match at allocation time leaves zero chunks to
+                # load. A request waiting for KV still needs a completion.
+                self._handle_unavailable_kv(req_meta)
                 continue
 
-            # Async loads run off-thread. The default path performs
-            # retrieve + whole-request H2D there; the layerwise overlap
-            # performs only retrieve and lets the resumed forward activate
-            # per-layer H2D events. Falls through to the synchronous path
-            # when the async prerequisites are missing. Layerwise-format
-            # requests go off-thread only when the scheduler marked them for
-            # overlap — the job's whole-request branch only understands
-            # chunkwise slabs.
+            # The loader can copy a chunkwise request as a whole or queue
+            # per-layer copies for overlap. Handle other layouts and devices
+            # on this thread.
             if (
                 req_meta.async_load
                 and (not self._use_layerwise or req_meta.layerwise_load)
@@ -4504,7 +4476,7 @@ class MaruWorkerConnector:
             chunk_keys = self._slice_chunk_keys(req_meta)
             num_chunks = min(req_meta.num_matched_chunks, len(chunk_keys))
             if num_chunks == 0:
-                self._fail_async_load(req_meta)
+                self._handle_unavailable_kv(req_meta)
                 continue
             total_tokens = num_chunks * self._kv_chunk_tokens
             slot_mapping = self._build_slot_mapping(req_meta.block_ids, total_tokens)
@@ -4517,7 +4489,7 @@ class MaruWorkerConnector:
                 first_chunk = start // self._kv_chunk_tokens
                 last_chunk = (end + self._kv_chunk_tokens - 1) // self._kv_chunk_tokens
                 if last_chunk > num_chunks:
-                    self._fail_async_load(req_meta)
+                    self._handle_unavailable_kv(req_meta)
                     continue
                 chunk_keys = chunk_keys[first_chunk:last_chunk]
                 num_chunks = len(chunk_keys)
@@ -4630,24 +4602,24 @@ class MaruWorkerConnector:
     def _start_group_loads(self, metadata: MaruConnectorMetadata) -> None:
         """Load the hits of a model with several KV cache groups.
 
-        An async-loading request loads on the loader thread; a sync one now, on
-        the load stream, finished before the forward. Either way every
-        group's objects are in place before the request computes: Mamba
-        layers have no per-layer load hook to wait on.
+        Submit async loads to the loader thread when a CUDA device is
+        available. Run the remaining loads here. Every group's objects must
+        be in place before the request computes because Mamba layers have
+        no per-layer load hook.
         """
-        sync_reqs: list[MaruReqMeta] = []
+        foreground_loads: list[MaruReqMeta] = []
         for req_meta in metadata.requests:
             if self._stopped is not None:
                 return
             if req_meta.is_store:
                 continue
             if req_meta.num_matched_chunks == 0:
-                self._fail_async_load(req_meta)
+                self._handle_unavailable_kv(req_meta)
                 continue
             if req_meta.async_load and self._try_submit_group_load(req_meta):
                 continue
-            sync_reqs.append(req_meta)
-        if not sync_reqs:
+            foreground_loads.append(req_meta)
+        if not foreground_loads:
             return
         device = self._group_caches[0].tensors[0].device
         stream: torch.cuda.Stream | None = None
@@ -4671,7 +4643,7 @@ class MaruWorkerConnector:
         ready: list[str] = []
         try:
             with stream_ctx:
-                for req_meta in sync_reqs:
+                for req_meta in foreground_loads:
                     if self._stopped is not None:
                         break
                     if self._cpu_mode:
@@ -4714,7 +4686,7 @@ class MaruWorkerConnector:
                     stream.synchronize()
                 except Exception as e:
                     if self._stop_if_unconfirmed(
-                        e, retained, req_id=_req_ids(sync_reqs)
+                        e, retained, req_id=_req_ids(foreground_loads)
                     ):
                         raise _UnconfirmedCopyError(self._stopped) from e
                     raise
@@ -4725,7 +4697,7 @@ class MaruWorkerConnector:
                 self._async_load_done.update(ready)
 
     def _try_submit_group_load(self, req_meta: MaruReqMeta) -> bool:
-        """Hand an async-loading request's group load to the loader thread.
+        """Submit a request's async group load to the loader thread.
 
         Returns:
             False when there is no CUDA device; the caller loads synchronously.
@@ -4753,7 +4725,7 @@ class MaruWorkerConnector:
         device: torch.device,
         queued: torch.cuda.Event,
     ) -> None:
-        """Retrieve and place an async-loading request's objects off-thread.
+        """Retrieve and place a request's group objects on the loader thread.
 
         Copies run on the async-load stream after ``queued``, the compute
         stream's work at submission; ``get_finished_loading`` reports the
@@ -5238,16 +5210,14 @@ class MaruWorkerConnector:
         layers: list[tuple[str, torch.Tensor, int]],
         device: torch.device,
     ) -> None:
-        """Prepare one async-loading request's KV off-thread.
+        """Prepare one request's KV on the loader thread.
 
         Runs on the async-load thread. The Maru RPC client serializes
         socket use internally, so retrieving here while the engine thread
         stores is safe. The default mode also performs H2D and records a CUDA
-        event. Layerwise-overlap mode stops after retrieve and retains the CXL
-        views (chunkwise slabs, or per-(chunk,layer) objects under
-        ``maru_use_layerwise``) for the resumed forward. Any failure reports
-        the request's blocks through ``take_failed_load_blocks`` so vLLM
-        recomputes instead of consuming unloaded KV.
+        event. With layerwise overlap, queue per-layer copies and report the
+        load ready at the configured release layer. At TP=1 the resumed
+        forward can issue the copies if the loader could not queue them.
         """
         refs: list[Any] = []  # what the queued copies use
         try:
@@ -5260,7 +5230,7 @@ class MaruWorkerConnector:
                 # Batches of leased staging slots: each batch is released once
                 # its copies are done; the request resumes after the last one.
                 if handler is None:
-                    self._fail_async_load(req_meta)
+                    self._handle_unavailable_kv(req_meta)
                     return
                 torch.cuda.set_device(device)
                 if (
@@ -5281,7 +5251,7 @@ class MaruWorkerConnector:
             chunk_keys = self._slice_chunk_keys(req_meta)
             num_chunks = min(req_meta.num_matched_chunks, len(chunk_keys))
             if handler is None or num_chunks == 0:
-                self._fail_async_load(req_meta)
+                self._handle_unavailable_kv(req_meta)
                 return
             if self._use_layerwise and not req_meta.layerwise_load:
                 # The whole-request branch below only understands chunkwise
@@ -5295,7 +5265,7 @@ class MaruWorkerConnector:
                     "recomputing",
                     req_meta.req_id,
                 )
-                self._fail_async_load(req_meta)
+                self._handle_unavailable_kv(req_meta)
                 return
             # The scheduler hinted this load; the memory side hears it starts
             # now (cxl backend with read hints; a no-op otherwise).
@@ -5334,7 +5304,7 @@ class MaruWorkerConnector:
                     len(keys),
                     req_meta.req_id,
                 )
-                self._fail_async_load(req_meta)
+                self._handle_unavailable_kv(req_meta)
                 return
             miss = next((i for i, v in enumerate(infos) if v is None), -1)
             if miss >= 0:
@@ -5343,7 +5313,7 @@ class MaruWorkerConnector:
                     keys[miss],
                     req_meta.req_id,
                 )
-                self._fail_async_load(req_meta)
+                self._handle_unavailable_kv(req_meta)
                 return
             if self._kept_if_stopped(infos):
                 return  # never queued
@@ -5370,19 +5340,16 @@ class MaruWorkerConnector:
                 if events is None and self._kept_if_stopped(refs):
                     return
                 if events is None and self._state_shard.parts > 1:
-                    # The resumed forward would issue the copies in the step
-                    # that computes the request, where a rank whose copies
-                    # failed is the only one that knows (xcena-dev/maru#135).
-                    # Under TP the load fails during its async load instead, so vLLM
-                    # merges the failure with the other ranks' results and
-                    # recomputes the request on all of them.
+                    # Report this rank's failure before the request resumes.
+                    # vLLM can then apply its load failure policy across all
+                    # ranks before any rank computes with missing KV (#135).
                     logger.warning(
                         "Maru: TP rank %d could not queue the layerwise-overlap "
                         "copies of req %s; failing its load for recompute",
                         self._state_shard.part,
                         req_meta.req_id,
                     )
-                    self._fail_async_load(req_meta)
+                    self._handle_unavailable_kv(req_meta)
                     return
                 gate = (
                     self._async_load_gate_event(events, layers)
@@ -5449,8 +5416,7 @@ class MaruWorkerConnector:
                 self._async_load_stream is None
                 or self._async_load_stream_device != device
             ):
-                # Highest priority: async-loading requests' TTFT gates on these
-                # copies.
+                # These copies delay the request's first token.
                 self._async_load_stream = torch.cuda.Stream(device=device, priority=-1)
                 self._async_load_stream_device = device
             stream = self._async_load_stream
@@ -5563,7 +5529,7 @@ class MaruWorkerConnector:
             for queue in [self._async_load_stream, *self._layerwise_streams]:
                 if queue is not None:
                     self._drain_load_stream(queue, refs, req_id=req_meta.req_id)
-            self._fail_async_load(req_meta)
+            self._handle_unavailable_kv(req_meta)
         finally:
             # This load is accounted for now, however it ended. An abort
             # arriving after this point finds the queued copies themselves.
@@ -5748,7 +5714,7 @@ class MaruWorkerConnector:
         layers: list[tuple[str, torch.Tensor, int]],
         device: torch.device,
     ) -> dict[str, torch.cuda.Event] | None:
-        """Queue one async-loading request's per-layer H2D from the loader thread.
+        """Queue a request's per-layer H2D copies from the loader thread.
 
         The request waits in WAITING_FOR_REMOTE_KVS with its blocks
         already allocated, so its paged KV can be written now — this is what
@@ -5758,7 +5724,7 @@ class MaruWorkerConnector:
         transfer also gets a head start over the forward.
 
         Args:
-            req_meta: Metadata of the async-loading request.
+            req_meta: Metadata for the request waiting for KV.
             num_chunks: Chunks matched for this request.
             slot_mapping: Host slot mapping covering those chunks.
             infos: Retrieved CXL views — a flat per-chunk list of chunkwise
@@ -6188,7 +6154,7 @@ class MaruWorkerConnector:
         first_chunk = start // ct
         last_chunk = (end + ct - 1) // ct
         if num_chunks == 0 or last_chunk > num_chunks:
-            self._fail_async_load(req_meta)
+            self._handle_unavailable_kv(req_meta)
             return
         slot_mapping = self._build_slot_mapping(req_meta.block_ids, num_chunks * ct)
         self._load_leased(
@@ -6222,8 +6188,8 @@ class MaruWorkerConnector:
         batch's copies have completed before its leases are released. A batch
         that cannot be read or copied fails the request
         from that batch on, and the later batches are not read; vLLM
-        recomputes those tokens. An async-loading request is reported finished only
-        after its last batch, or with its failure.
+        recomputes those tokens. For an async load, report completion after
+        the last batch succeeds or when the failure is reported.
 
         Args:
             layers: ``(name, kv_cache, layer index)`` per attention layer.
@@ -6254,7 +6220,7 @@ class MaruWorkerConnector:
             logger.warning(
                 "Maru: no staging slot free for req %s (recompute)", req_meta.req_id
             )
-            self._fail_async_load(req_meta)
+            self._handle_unavailable_kv(req_meta)
             return
         # A loader thread reads batch b+1 while batch b's copies run on its
         # stream; a batch's leases go back once an event says its copies ended.
@@ -6305,7 +6271,7 @@ class MaruWorkerConnector:
 
         def fail(rest: MaruReqMeta) -> None:
             unconfirmed = settle(True)
-            self._fail_async_load(unconfirmed or rest)
+            self._handle_unavailable_kv(unconfirmed or rest)
 
         b = 0
         batches = 0
@@ -6319,7 +6285,7 @@ class MaruWorkerConnector:
                     # the oldest ones rather than read a short batch.
                     unconfirmed = settle(False) or make_room(n)
                     if unconfirmed is not None:
-                        self._fail_async_load(unconfirmed)
+                        self._handle_unavailable_kv(unconfirmed)
                         return
                 if b > 0:
                     capacity = handler.retrieve_capacity()
@@ -6426,7 +6392,7 @@ class MaruWorkerConnector:
                 logger.error("Maru: could not release load batches", exc_info=True)
             raise
         if unconfirmed is not None:
-            self._fail_async_load(unconfirmed)
+            self._handle_unavailable_kv(unconfirmed)
             return
         # Every READ and GPU copy succeeded. Boundary chunks were loaded
         # only in part; leave them eligible for the existing store path.
@@ -6568,16 +6534,13 @@ class MaruWorkerConnector:
             return [False] * len(keys)
         return list((handler or self._handler).batch_store(keys, handles))
 
-    def _fail_async_load(self, req_meta: MaruReqMeta) -> None:
-        """Mark an async load as failed so the scheduler recomputes it.
+    def _handle_unavailable_kv(self, req_meta: MaruReqMeta) -> None:
+        """Handle a load that could not supply the request's KV.
 
-        The request's blocks are reported through
-        ``get_block_ids_with_load_errors`` (vLLM resets its computed-token
-        count), or with several groups its id (``_report_failed_load``), and
-        the request id through ``get_finished_loading`` (vLLM resumes it from
-        WAITING_FOR_REMOTE_KVS). CPU/mixed sync loads also report errors,
-        but only for their externally allocated blocks. A stopped worker
-        reports nothing.
+        A failed sync load suppresses stores for the request. On the CPU,
+        mixed and remote CXL backends it also reports the affected blocks.
+        An async load reports the failure and signals receive completion so
+        vLLM can handle the request waiting in WAITING_FOR_REMOTE_KVS.
         """
         if self._stopped is not None:
             return
@@ -6640,11 +6603,10 @@ class MaruWorkerConnector:
 
         vLLM calls ``start_load_kv`` outside its own try, so an exception
         from a load path (e.g. an unrecognized-layout refusal from inject)
-        would kill the engine. Reporting the blocks through
-        ``get_block_ids_with_load_errors`` makes vLLM recompute them, which
-        is the contract the refusal was designed for; an async-loading request is
-        additionally marked done so it resumes. A stopped worker reports
-        nothing.
+        would kill the engine. Report the affected blocks, or the request
+        ID for an async load with several KV cache groups. For an async
+        load, also signal receive completion so vLLM can apply its load
+        failure policy.
         """
         if self._stopped is not None:
             return
@@ -6691,19 +6653,12 @@ class MaruWorkerConnector:
             if r.is_store and r.req_id not in self._unsound_kv_req_ids
         ]
 
-    def _abort_async_loads(self, metadata: MaruConnectorMetadata) -> None:
-        """Degrade every async load in ``metadata`` to recompute.
+    def _abort_step_loads(self, metadata: MaruConnectorMetadata) -> None:
+        """Handle loads the worker could not start in this step.
 
-        Called before ``start_load_kv`` returns without iterating
-        ``metadata.requests`` (worker handler unavailable, no attention
-        layers). The scheduler has already put these requests in
-        WAITING_FOR_REMOTE_KVS; unless they are reported through
-        ``get_finished_loading`` (with their blocks through
-        ``get_block_ids_with_load_errors``), vLLM keeps them waiting forever
-        and never frees their blocks. With several KV cache groups a sync
-        load fails the same way: vLLM has counted its tokens as computed and
-        would otherwise run the forward on blocks nothing filled. With one
-        group ``_fail_async_load`` still ignores sync-load requests (#110).
+        With no handler or attention layers, a request waiting for KV still
+        needs a receive completion. With several groups, report every matched
+        load that failed because vLLM already counted its tokens as computed.
 
         Args:
             metadata: The step's connector metadata.
@@ -6718,7 +6673,7 @@ class MaruWorkerConnector:
                     req_meta, RuntimeError("worker MaruHandler unavailable")
                 )
             else:
-                self._fail_async_load(req_meta)
+                self._handle_unavailable_kv(req_meta)
 
     def _schedule_async_loads(
         self,
@@ -6918,8 +6873,8 @@ class MaruWorkerConnector:
         """Drain transfers before the scheduler reclaims the blocks they write.
 
         vLLM calls this before the step's forward and before
-        ``get_finished_loading``, which makes it the one place that covers both
-        ways an async-loading request's blocks are taken away:
+        ``get_finished_loading``, so it covers both ways vLLM can reclaim a
+        request's blocks during an async load:
 
         - Preemption returns the blocks to the pool right away.
         - A request that finished or was aborted during its async load keeps its blocks
@@ -7126,9 +7081,8 @@ class MaruWorkerConnector:
             layers: ``(name, kv_cache, layer index)`` per attention layer.
             prepared_requests: ``(request, chunks, slot mapping, infos)``.
             attn_metadata: The step's attention metadata.
-            stream: A loader thread's own CUDA stream. The copies go there
-                without waiting for the compute stream, as the async-loading
-                request's blocks are not computed on. None queues them on
+            stream: The loader thread's CUDA stream. It can copy directly
+                into the waiting request's blocks. None queues copies on
                 the load stream after the compute stream.
             wait: Wait for the copies before returning. A loader thread that
                 pipelines its batches passes False and waits on an event.

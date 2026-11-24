@@ -494,21 +494,22 @@ measurement ever exercised it.
 
 ### Asynchronous load and store
 
-By default both the cache-hit load and the populate store run to completion
-inside the model worker's forward pass. The two settings below move that work
-off the critical path; they are independent and can be enabled separately.
+`maru_async_load` and `maru_async_store` apply independently. With sync
+loading, the worker loads cached KV in the step that computes the request.
+With sync stores, the worker finishes storing new KV before the step ends.
 
-`maru_async_load` holds a cache-hit request in WAITING_FOR_REMOTE_KVS while a background thread
-performs the Maru lookup and the CXL→GPU transfer, then reports completion
-through a CUDA event. The forward pass no longer waits on the retrieve RPC.
-This is the mechanism vLLM itself calls an asynchronous load: the request
-waits in `WAITING_FOR_REMOTE_KVS`.
+`maru_async_load` lets vLLM schedule other requests while a cache-hit request
+waits for KV in `WAITING_FOR_REMOTE_KVS`. With chunkwise KV on a single CUDA
+device per worker, a background thread retrieves the KV from Maru and queues
+the CXL→GPU copies. vLLM can schedule the waiting request once the connector
+reports the load ready.
 
-An async-loading request initially holds blocks for its loaded prefix. It needs room
-for the rest of its prompt and any speculative lookahead before it can run.
-On vLLM < 0.23, Maru budgets this full requirement for async-loading requests and
-earlier waiters, capped at the model's maximum length. A request that does not
-fit stays in `WAITING` and keeps its place until vLLM gives it blocks. The
+While waiting for KV, a request holds blocks for its cached prefix. It needs
+room for the rest of its prompt and any speculative lookahead before it can run.
+On vLLM < 0.23, Maru budgets this full requirement for requests waiting for KV
+and those ahead of them in the admission queue. Each request's budget is
+capped at the model's maximum length. A request that does not fit stays in
+`WAITING` and keeps its place until vLLM gives it blocks. The
 first request in line is admitted on its own; vLLM sizes the cache to fit one
 maximum-length request.
 
@@ -597,19 +598,17 @@ off.
 
 ![Layerwise overlap: without overlap compute waits for the whole transfer; with overlap it starts once layer 1 has arrived, so compute fits inside the transfer and the transfer time is what remains as the floor; giving each request its own stream splits the bandwidth and raises that floor](../image/layerwise_overlap_concept.png)
 
-The loader thread queues the per-layer copies while the request still
-waits for its async load. The load is reported complete — which is what lets vLLM schedule the
-request — once `maru_overlap_release_after_layers` of them have landed, one
-layer by default, so the request's prefill compute runs while the remaining
-layers arrive rather than after them.
+The loader thread queues the per-layer copies while the request waits for KV.
+Once `maru_overlap_release_after_layers` layers have arrived (one by default),
+the connector reports the load ready. vLLM can then schedule the request's
+prefill while the remaining layers arrive.
 A cache-hit request computes only the tokens left over past its cached chunks,
 so one layer of compute is shorter than one layer of transfer: the compute
 fits inside the transfer and the transfer time is what sets time to first
-token. All async-loading request transfers share one stream. That keeps each at full
-CXL bandwidth — splitting them across streams makes each transfer take as many
-times longer as there are loading requests, raising that floor — and it means
-a later request's first layer only lands once the earlier one has finished, so
-requests take their turn without any extra admission mechanism.
+token. These per-layer copies share one stream across requests so each
+transfer gets the full CXL bandwidth. With separate streams, concurrent
+transfers would split that bandwidth and take longer. On the shared stream,
+a later request's first layer arrives after the earlier request's copies finish.
 
 The knob therefore applies at any concurrency. On a 16k prompt it lowered
 cache-hit TTFT by 24%, 25% and 17% at 2, 4 and 8 concurrent requests, and
@@ -769,15 +768,15 @@ groups (see {ref}`vllm-load-failures`).
 
 Above TP=1 every load is async (`maru_async_load=true`, which needs vLLM
 0.16+). The connector turns it on unless it is set, and refuses
-`maru_async_load=false`. An async load finishes on every rank, and vLLM
-merges every rank's result, before the request computes. A sync load runs
+`maru_async_load=false`. Each rank reports when the request's KV is ready.
+vLLM combines those results before scheduling the request. A sync load runs
 in the step that computes its request, and a rank whose load fails is the
 only one that knows: the all-reduce in every layer would spread its unfilled
 KV to every rank, and the other ranks would store what they computed from it
-([#135](https://github.com/xcena-dev/maru/issues/135)). For the same reason, a
-layerwise-overlap load (`maru_overlap_load_with_compute`) whose per-layer
-copies the loader thread cannot queue fails while the request waits for its async load,
-instead of having the forward issue them as it does at TP=1.
+([#135](https://github.com/xcena-dev/maru/issues/135)). With
+`maru_overlap_load_with_compute`, if a TP rank cannot queue its per-layer
+copies on the loader thread, it reports the failure before the request resumes.
+At TP=1 the resumed forward pass can issue those copies itself.
 
 Each worker process connects its own MaruHandler:
 

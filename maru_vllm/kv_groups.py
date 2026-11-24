@@ -572,9 +572,9 @@ def check_multi_group_support(
     if sync_loads:
         # A failed sync load is reported by its blocks, which vLLM 0.31+
         # refuses with several groups: block ids are unique only within a
-        # group, and its per-request report takes only async-loading requests. vLLM
-        # 0.30 takes it, but under "recompute" its V2 model runner does not
-        # rewind its device-side state (vllm-project/vllm#49250).
+        # group. Only requests waiting for KV can report failure by request
+        # ID. vLLM 0.30 accepts block IDs, but its V2 model runner does not
+        # rewind device-side state under "recompute" (vllm-project/vllm#49250).
         raise ValueError(
             "MaruKVConnector loads a model with several KV cache groups only "
             "between steps (maru_async_load=true, its default for such a "

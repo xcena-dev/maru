@@ -30,10 +30,10 @@ import maru_kv_ops
 from maru_vllm.connector import _chunk_keys, _logical_page_format
 from maru_vllm.kv_layout import _detect_kv_layout, _vllm_kv_cache_layout
 from tests.unit.vllm_connector_helpers import (
-    async_load_metadata,
     attach_capturing_handler,
     fake_new_request_data,
     fake_scheduler_output,
+    load_metadata,
     make_bare_worker,
     make_flash_attn_metadata,
     make_scheduler,
@@ -404,7 +404,7 @@ class TestPackedSlab:
                 },
                 attn_metadata=make_flash_attn_metadata(),
             ),
-            async_load_metadata(
+            load_metadata(
                 token_ids=token_ids,
                 block_ids=list(range(self.NUM_BLOCKS)),
                 num_matched_chunks=len(_chunk_keys(token_ids, self.CHUNK)),
@@ -506,7 +506,7 @@ class TestPackedSlab:
         )
         reader.start_load_kv(
             forward_context,
-            async_load_metadata(
+            load_metadata(
                 token_ids=token_ids,
                 block_ids=list(range(self.NUM_BLOCKS)),
                 num_matched_chunks=len(_chunk_keys(token_ids, self.CHUNK)),
@@ -598,7 +598,7 @@ class TestPackedSlab:
                 },
                 attn_metadata=meta,
             ),
-            async_load_metadata(
+            load_metadata(
                 token_ids=token_ids,
                 block_ids=list(range(self.NUM_BLOCKS)),
                 num_matched_chunks=chunks,

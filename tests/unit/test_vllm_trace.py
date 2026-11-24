@@ -17,11 +17,11 @@ import torch
 
 from maru_vllm import trace
 from maru_vllm.connector import MaruKVConnector, _CopyAhead
-from tests.unit.vllm_connector_helpers import async_load_req_meta, make_worker
+from tests.unit.vllm_connector_helpers import load_req_meta, make_worker
 
 
 def request():
-    return async_load_req_meta(
+    return load_req_meta(
         token_ids=list(range(8)), block_ids=[1, 2], num_matched_chunks=1
     )
 
@@ -102,8 +102,8 @@ def test_failed_loads_are_explicit_and_preserve_attempt(monkeypatch, capsys):
     req = request()
     req.trace_attempt = 3
     worker._trace_attempts["r1"] = 3
-    worker._fail_async_load(req)
-    worker._fail_async_load(req)
+    worker._handle_unavailable_kv(req)
+    worker._handle_unavailable_kv(req)
     assert worker.get_finished_loading() == {"r1"}
     lines = capsys.readouterr().err.splitlines()
     failed = [line for line in lines if line.startswith("REQ-TRACE load_failed")]

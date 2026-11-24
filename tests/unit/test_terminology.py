@@ -1,11 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Retired terms stay retired.
-
-Maru once had several names for one idea (a "parked", "deferred" or "async"
-load) and names that read as something else ("read promote"). Each rule
-below lists a retired term and where it must not come back. A line that
-names a deprecated alias on purpose says "legacy" or "deprecated".
-"""
+"""Check that vLLM code, tests and docs use the current load terminology."""
 
 from __future__ import annotations
 
@@ -42,7 +36,8 @@ RULES: list[Rule] = [
         term(
             r"(un)?park(s|ed|ing)?",
             "deferred",
-            r"inline[ _-](loads?|parts?|requests?|layerwise)",
+            r"inline[ _-](loads?|parts?|requests?|layerwise|roundtrips?)",
+            r"inline[ _-](?:cxl[ _-])?retriev(?:e|al)s?",
         ),
         (
             "maru_vllm/**/*.py",
@@ -56,17 +51,16 @@ RULES: list[Rule] = [
 ]
 
 
-def _offending_lines(rule: Rule) -> list[str]:
+def _find_retired_terms(rule: Rule) -> list[str]:
     pattern = re.compile(rule.pattern, re.IGNORECASE)
     files = sorted({p for glob in rule.paths for p in ROOT.glob(glob) if p.is_file()})
     found = []
     for path in files:
+        if pattern.search(path.name):
+            found.append(str(path.relative_to(ROOT)))
         for number, line in enumerate(path.read_text().splitlines(), start=1):
             for token in ALLOWED_TOKENS:
                 line = line.replace(token, "")
-            lowered = line.lower()
-            if "legacy" in lowered or "deprecated" in lowered:
-                continue
             if pattern.search(line):
                 found.append(f"{path.relative_to(ROOT)}:{number}: {line.strip()}")
     return found
@@ -84,11 +78,14 @@ def _rule(name: str) -> re.Pattern[str]:
         "_admit_parked(",
         "_note_failed_inline_load",
         "def test_inline_loads_of_groups",
+        "test_vllm_inline_retrieve_failure.py",
+        "def test_inline_roundtrip_with_pin_states",
+        "Inline CXL retrieval failures",
         "self._deferred_lock",
         "A parked request",
     ],
 )
-def test_async_load_rule_catches_terms_inside_identifiers(text: str) -> None:
+def test_async_load_rule_catches_retired_terms(text: str) -> None:
     assert _rule("async-load").search(text)
 
 
@@ -100,4 +97,4 @@ def test_async_load_rule_leaves_other_words_alone(text: str) -> None:
 @pytest.mark.parametrize("rule", RULES, ids=lambda r: r.name)
 def test_no_retired_term(rule: Rule) -> None:
     assert rule.paths and any(any(ROOT.glob(g)) for g in rule.paths)
-    assert _offending_lines(rule) == []
+    assert _find_retired_terms(rule) == []

@@ -1804,7 +1804,7 @@ def test_request_finished_all_groups_answers_per_request():
         True,
         None,
     )
-    # An async-loading request: vLLM already keeps its blocks for the receive.
+    # vLLM already keeps r2's blocks until its async load completes.
     connector._scheduler._awaiting_async_load_recv.add("r2")
     is_async = SimpleNamespace(request_id="r2")
     assert connector.request_finished_all_groups(is_async, ([5], [6])) == (False, None)
@@ -2216,8 +2216,8 @@ def test_a_request_waiting_for_blocks_asks_maru_once():
 
 
 def test_a_failed_async_load_computes_without_maru():
-    """vLLM calls update_state_after_alloc again, with no tokens, when an async-loading
-    load is done; that call does not hide a failure vLLM asks about later."""
+    """vLLM calls update_state_after_alloc with no tokens when an async load
+    finishes. A later lookup must still see the load failure."""
     a = list(range(1200))
     sched = make_scheduler(
         QWEN35_BLOCK,

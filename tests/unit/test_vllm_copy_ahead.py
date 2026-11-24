@@ -25,8 +25,8 @@ import torch
 from maru_vllm.connector import _chunk_keys, _CopyAhead
 from tests.unit.test_vllm_logical_page import logical_pages
 from tests.unit.vllm_connector_helpers import (
-    async_load_metadata,
     attach_capturing_handler,
+    load_metadata,
     make_flash_attn_metadata,
     make_worker,
     store_metadata,
@@ -289,7 +289,7 @@ class TestLoadRoundtrip:
         )
         reader.start_load_kv(
             forward_context,
-            async_load_metadata(
+            load_metadata(
                 token_ids=token_ids,
                 block_ids=list(range(self.NUM_BLOCKS)),
                 num_matched_chunks=len(_chunk_keys(token_ids, self.CHUNK)),
