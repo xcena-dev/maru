@@ -10,6 +10,8 @@ import subprocess
 import sys
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -18,16 +20,19 @@ import pytest
 from maru_common.config import MaruConfig
 from maru_common.ms_rpc import PLACEHOLDER_OP, RpcUnknownError
 from maru_common.node_protocol import (
+    AbortRequest,
     CreditRequest,
     CreditReturnRequest,
+    DetachRequest,
     NodeMessageType,
     Notify,
+    Peers,
     ReadJoinRequest,
     WriteDoneItem,
     WriteDoneRequest,
 )
 from maru_common.protocol import NodeHeartbeatRequest
-from maru_common.remote_protocol import TransferEnd
+from maru_common.remote_protocol import RemoteMessageType, TransferEnd
 from maru_common.storage_types import (
     WORKER_RDMA_CAPABILITY,
     ItemResult,
@@ -119,7 +124,11 @@ def pair(monkeypatch, request):
                     "url": memory_config.remote_server.listen,
                     "key_file": key,
                     "staging_size": (32 if store_batches else 8) * PAGE,
-                    "staging_max_bytes": 32 * PAGE,
+                    **(
+                        {}
+                        if profile == "default_staging_budget"
+                        else {"staging_max_bytes": 32 * PAGE}
+                    ),
                     "quarantine_max": 2 * PAGE,
                     "timeout_s": 0.5,
                 }
@@ -148,7 +157,7 @@ def pair(monkeypatch, request):
         lambda config, name: FakeTransport(name),
     )
 
-    def client(instance="instance", **kwargs):
+    def client(instance="instance", *, reconnect_s=0.02, **kwargs):
         config = MaruConfig(
             maru_node=gpu_config.socket,
             engine_id=f"engine-{len(clients)}",
@@ -159,17 +168,17 @@ def pair(monkeypatch, request):
             auto_connect=False,
             **kwargs,
         )
-        worker = MaruClient(config, rpc_timeout_s=1, reconnect_s=0.02)
+        worker = MaruClient(config, rpc_timeout_s=1, reconnect_s=reconnect_s)
         clients.append(worker)
         assert worker.connect()
         return worker
 
-    def raw():
+    def raw(**overrides):
         worker = RawWorker(gpu_config.socket)
         clients.append(worker)
         assert (
             worker.attach(
-                capabilities=[WORKER_RDMA_CAPABILITY], instance="instance"
+                capabilities=[WORKER_RDMA_CAPABILITY], instance="instance", **overrides
             ).status
             == Status.OK
         )
@@ -646,8 +655,8 @@ def test_read_agent_metadata_covers_every_memory_pool(pair):
     reader.release_retrieved(reads)
 
 
-@pytest.mark.parametrize("restart", [False, True])
-def test_pidfd_exit_releases_credit_and_pins_across_gpu_runs(pair, restart):
+@pytest.mark.parametrize("after", ["connected", "restart", "disconnect"])
+def test_pidfd_exit_releases_credit_and_pins_across_gpu_runs(pair, monkeypatch, after):
     store(pair)
     # The fake NIC lives in this process; the UDS and pidfd identify the child.
     agent = FakeTransport("child-reader")
@@ -669,7 +678,9 @@ assert credit.status.value == "OK" and credit.credits
 hit = s.lookup_and_pin([Key("ns", "kv")])[0][0]
 assert hit.result.value == "HIT"
 print(json.dumps({"pin": hit.pin_id, "incarnation": w.incarnation}), flush=True)
-sys.stdin.read()
+if sys.stdin.readline().strip() == "disconnect":
+    w.close()
+    sys.stdin.read()
 """
     child = subprocess.Popen(
         [
@@ -689,13 +700,35 @@ sys.stdin.read()
         service = pair.catalog.server.ms_service
         assert service.pins.get(info["pin"]) is not None
         domain = pair.gpu.store.workers.domains["child-instance"]
-        if restart:
+        if after == "restart":
             pair.gpu.stop()
             pair.gpu = pair.start_gpu()
             assert info["incarnation"] in pair.gpu.role.orphans.pending
             assert service.pins.get(info["pin"]) is not None
-        child.kill()
-        child.wait(5)
+        if after == "disconnect":
+            child.stdin.write("disconnect\n")
+            child.stdin.flush()
+            wait_until(lambda: domain in pair.memory.role.parts._closed_domains)
+            registry = pair.gpu.store.workers
+            with pause_call(monkeypatch, registry, "_worker_exited") as (
+                entered,
+                resume,
+                finished,
+            ):
+                child.kill()
+                child.wait(5)
+                assert entered.wait(3)
+                sibling = pair.client("child-instance")
+                handle = sibling.alloc(PAGE)
+                successor = handle.remote.agent.domain
+                assert successor != domain
+                resume.set()
+                assert finished.wait(3)
+            assert successor not in pair.memory.role.parts._closed_domains
+            assert sibling.batch_store(["survives-exit"], [handle]) == [True]
+        else:
+            child.kill()
+            child.wait(5)
         wait_until(lambda: service.pins.get(info["pin"]) is None)
         wait_until(lambda: domain in pair.memory.role.parts._closed_domains)
         assert pair.memory.pools.bytes_in(PageState.QUARANTINED) == 0
@@ -722,8 +755,6 @@ def test_reserve_reply_loss_cancels_by_sequence_and_keeps_the_gpu_run_closed(
         return submit(code, request, callback)
 
     def lose(code, request, timeout):
-        from maru_common.remote_protocol import RemoteMessageType
-
         response = real(code, request, timeout)
         if code == RemoteMessageType.RESERVE:
             seen.append(request.op.seq)
@@ -734,8 +765,6 @@ def test_reserve_reply_loss_cancels_by_sequence_and_keeps_the_gpu_run_closed(
     monkeypatch.setattr(connection, "submit", record)
     assert worker.credit(PAGE).credits == []
     assert seen
-    from maru_common.remote_protocol import RemoteMessageType
-
     assert any(
         code == RemoteMessageType.CANCEL and request.reserve_seq == seen[0]
         for code, request in sent
@@ -758,3 +787,466 @@ def test_failed_fence_keeps_quarantine_until_memory_process_restart(pair, monkey
     wait_until(lambda: pair.gpu.wait_finished(0))
     assert pair.memory.pools.bytes_in(PageState.QUARANTINED) == PAGE
     assert domain in pair.memory.role.parts._writers
+
+
+@contextmanager
+def pause_call(monkeypatch, obj, name, *, when=lambda *args, **kwargs: True):
+    """Hold the first matching call before it enters the method."""
+    entered, resume, finished = threading.Event(), threading.Event(), threading.Event()
+    method = getattr(obj, name)
+
+    def paused(*args, **kwargs):
+        if entered.is_set() or not when(*args, **kwargs):
+            return method(*args, **kwargs)
+        entered.set()
+        try:
+            assert resume.wait(10)
+            return method(*args, **kwargs)
+        finally:
+            finished.set()
+
+    with monkeypatch.context() as patch:
+        patch.setattr(obj, name, paused)
+        try:
+            yield entered, resume, finished
+        finally:
+            resume.set()
+
+
+def test_late_peer_withdrawal_keeps_reattached_workers_reads(pair, monkeypatch):
+    store(pair)
+    reader = pair.client("reader", load_only=True)
+    old = reader._storage
+    rdma = reader._rdma
+
+    def read():
+        [value] = reader.batch_retrieve(["kv"])
+        assert value is not None and bytes(value.view) == b"a" * PAGE
+        reader.release_retrieved([value])
+
+    with pause_call(
+        monkeypatch, rdma, "notify_peers", when=lambda peers, *a, **kw: not peers
+    ) as (entered, resume, finished):
+        pair.gpu.store.remote.connection.close()
+        assert entered.wait(3)
+        assert pair.gpu.wait_finished(5)
+        pair.gpu = pair.start_gpu()
+        wait_until(lambda: reader.storage_connected and reader._storage is not old)
+        wait_until(lambda: reader._server.session_node_epoch == pair.gpu.node_epoch)
+        read()
+        resume.set()
+        assert finished.wait(3)
+    rdma.refresh_peers()
+    read()
+
+
+@pytest.mark.parametrize("pair", ["default_staging_budget"], indirect=True)
+@pytest.mark.parametrize("failure", ["nixl", "cuda", "exported_view"])
+def test_uncertain_staging_teardown_keeps_admission(pair, monkeypatch, failure):
+    import torch
+
+    worker = pair.client(load_only=True)
+    staging = worker._rdma.staging
+    if failure == "nixl":
+
+        def refuse(registration):
+            raise RuntimeError("registration still active")
+
+        monkeypatch.setattr(worker._rdma.transport, "deregister", refuse)
+    elif failure == "cuda":
+        staging.cuda_registered = True
+        monkeypatch.setattr(
+            torch.cuda,
+            "cudart",
+            lambda: SimpleNamespace(cudaHostUnregister=lambda _: 1),
+        )
+        monkeypatch.setattr(
+            "maru_handler.memory.mapper._clear_cuda_sticky_error", lambda: None
+        )
+    else:
+        view = staging.view(0)
+    worker.close()
+    with pytest.raises(AttachRefusedError, match="staging budget"):
+        pair.client(load_only=True)
+    incarnation = worker.identity.incarnation
+    service = pair.gpu.store
+    assert {incarnation} in service.workers.admissions.values()
+    assert service.workers.get(incarnation).detached
+    assert len(service.watcher._fds) == 1
+    if failure == "cuda":
+        assert staging.cuda_registered
+    elif failure == "exported_view":
+        view.release()
+
+
+@pytest.mark.parametrize("pair", ["dram", "default_staging_budget"], indirect=True)
+def test_clean_close_reuses_budget_and_keeps_one_process_watch(pair):
+    service = pair.gpu.store
+    workers = service.workers
+    for _ in range(5):
+        client = pair.client()
+        rec = workers.get(client.identity.incarnation)
+        assert rec.staging_key == (
+            rec.ident.pid,
+            rec.ident.pid_start,
+            client._staging_id,
+        )
+        assert len(service.watcher._fds) == 1
+        client.close()
+        assert not workers.admissions
+        wait_until(lambda: not workers._workers)
+        assert not service._agents and not service._reserves and not service._credits
+        assert not workers._settles_at and service.ledger.origins() == 0
+        again = RawWorker(pair.config.socket, rec.incarnation)
+        try:
+            with pytest.raises(AttachRefusedError, match="incarnation"):
+                again.attach(capabilities=[WORKER_RDMA_CAPABILITY], instance="instance")
+        finally:
+            again.close()
+    assert len(service.watcher._fds) == 1
+
+
+def test_same_staging_and_legacy_workers_have_distinct_admissions(pair):
+    registry = pair.gpu.store.workers
+    a, _ = pair.raw(staging_id="shared")
+    b, _ = pair.raw(staging_id="shared")
+    legacy, _ = pair.raw()
+    other, _ = pair.raw()
+    assert len(registry.admissions) == 3
+    assert {a.incarnation, b.incarnation} in registry.admissions.values()
+    assert {legacy.incarnation} in registry.admissions.values()
+    assert {other.incarnation} in registry.admissions.values()
+    rec = registry.get(a.incarnation)
+    assert (
+        registry.detach(rec, registry.endpoint(b.incarnation), True).status
+        == Status.REJECTED
+    )
+    assert a.request(NodeMessageType.DETACH, DetachRequest(True)).status == Status.OK
+    assert {b.incarnation} in registry.admissions.values()
+    assert len(pair.gpu.store.watcher._fds) == 1
+
+
+def test_lost_credit_reply_disables_same_run_without_replay(pair, monkeypatch):
+    from maru_handler.client import CreditUnavailableError
+    from maru_storage_service.gpu.local_server import Connection
+
+    grants = []
+    respond = Connection.respond
+
+    def lose_credit(conn, header, response, *args):
+        if header.msg_type == NodeMessageType.CREDIT and response.credits:
+            grants.append(response)
+            conn.close()
+            return False
+        return respond(conn, header, response, *args)
+
+    monkeypatch.setattr(Connection, "respond", lose_credit)
+    worker = pair.client()
+    wait_until(lambda: worker.off)
+    assert "incarnation" in str(worker.off)
+    assert len(grants) == 1 and not worker.credits.unused_bytes
+    wait_until(
+        lambda: grants[0].write_agent.domain in pair.memory.role.parts._closed_domains
+    )
+    assert not worker._rdma._peers and not worker._stopped.is_set()
+    assert worker.batch_retrieve(["missing"]) == [None]
+    with pytest.raises(CreditUnavailableError):
+        worker.alloc(PAGE)
+
+
+@pytest.mark.parametrize("restart", [False, True])
+def test_disconnect_retains_source_pin_and_gpu_consumer(pair, restart):
+    store(pair)
+    reader = pair.client("reader", load_only=True)
+    rdma = reader._rdma
+    old = reader._storage
+    old_server = reader._server
+    consumer = reader.batch_retrieve(["kv"])[0]
+    rdma.transport.stall()
+    pending = reader.start_retrieve(["kv"])
+    request = pending._chunks[0].remote[0]
+    pin = request.outcome.pin_id
+    pins = pair.catalog.server.ms_service.pins
+    assert request.flight.pending is not None
+    if restart:
+        pair.gpu.stop()
+        pair.gpu = pair.start_gpu()
+        wait_until(lambda: reader.storage_connected and reader._storage is not old)
+        assert reader.off is None and old_server.session_node_epoch != reader.node_epoch
+    else:
+        pair.gpu.store.workers.endpoint(reader.identity.incarnation).close()
+        wait_until(lambda: reader.off)
+    assert pending.result() == [None]
+    assert reader._server is old_server and pins.get(pin) is not None
+    assert rdma.snapshot()["free_slots"] == rdma.slot_count - 2
+    assert bytes(consumer.view) == b"a" * PAGE
+    assert rdma.transport.finish_stalled() == 1
+    rdma.transport.stall(False)
+    wait_until(lambda: pins.get(pin) is None)
+    wait_until(lambda: rdma.snapshot().get("free_slots") == rdma.slot_count - 1)
+    reader.release_retrieved([consumer])
+    wait_until(lambda: rdma.snapshot().get("free_slots") == rdma.slot_count)
+    if restart:
+        wait_until(lambda: old_server.session_node_epoch == pair.gpu.node_epoch)
+        [hit] = reader.batch_retrieve(["kv"])
+        assert bytes(hit.view) == b"a" * PAGE
+        reader.release_retrieved([hit])
+    else:
+        assert reader.batch_retrieve(["kv"]) == [None]
+        wait_until(lambda: reader._server is None)
+
+
+@pytest.mark.parametrize("old_first", [False, True])
+def test_sibling_writes_mixed_domains_while_old_worker_cleanup_is_queued(
+    pair, monkeypatch, old_first
+):
+    service = pair.gpu.store
+    monkeypatch.setattr(MaruClient, "_refill_loop", lambda self: None)
+    first, _ = pair.raw()
+    d1 = first.credit(PAGE).write_agent.domain
+    sibling = pair.client()
+    old = sibling.alloc(PAGE)
+    assert old.remote.agent.domain == d1
+    sibling._on_notify(
+        Notify(NotifyKind.CREDIT_RETURN, bytes=3 * PAGE), sibling._storage
+    )
+    wait_until(lambda: len(service._credits) == 2)
+    with pause_call(monkeypatch, service, "_end_worker") as (entered, resume, finished):
+        first.close()
+        assert entered.wait(3)
+        assert d1 not in service.workers.domains.values()
+        assert sibling._refill_once()
+        new = sibling.alloc(PAGE)
+        d2 = new.remote.agent.domain
+        assert d2 != d1 and new.location in service._credits
+        assert old.location in service._credits
+        resume.set()
+        assert finished.wait(3)
+    service.workers._worker_exited(first.incarnation)
+    assert d2 in service.workers.domains.values()
+    assert d2 not in pair.memory.role.parts._closed_domains
+    handles = [old, new] if old_first else [new, old]
+    keys = ["old", "new"] if old_first else ["new", "old"]
+    results = [key == "new" for key in keys]
+    assert sibling.store_async(keys, handles).result(5) == results
+    assert sibling.batch_exists(keys) == results
+    assert old.location not in service._credits and new.location not in service._credits
+
+
+@pytest.mark.parametrize("failure", ["response", "timeout"])
+def test_unknown_credit_waits_for_fence_success(pair, monkeypatch, failure):
+    first, _ = pair.raw()
+    service = pair.gpu.store
+    grant = first.credit(4 * PAGE)
+    credit = grant.credits[0]
+    domain = grant.write_agent.domain
+    called = []
+    call = service.remote.call
+
+    def unconfirmed(code, request, **kwargs):
+        if code == RemoteMessageType.FENCE_DOMAIN:
+            called.append((request.domain, set(service._credits)))
+            if failure == "timeout":
+                raise TimeoutError
+            from maru_common.remote_protocol import FenceDomainResponse, FenceResult
+
+            return FenceDomainResponse(Status.OK, result=FenceResult.FAILURE)
+        return call(code, request, **kwargs)
+
+    monkeypatch.setattr(service.remote, "call", unconfirmed)
+    req = WriteDoneRequest(
+        PLACEHOLDER_OP,
+        [
+            WriteDoneItem(
+                Key("ns", "unknown"), credit, PAGE, domain, TransferEnd.UNKNOWN
+            )
+        ],
+    )
+    result = first.request(NodeMessageType.WRITE_DONE, first.stamp(req))
+    assert result.items[0].result == ItemResult.OK
+    assert called == [(domain, set(grant.credits))]
+    assert set(service._credits) == set(grant.credits)
+
+
+@pytest.mark.parametrize(
+    "code",
+    [
+        NodeMessageType.CREDIT,
+        NodeMessageType.READ_JOIN,
+        NodeMessageType.WRITE_DONE,
+        NodeMessageType.ABORT,
+    ],
+)
+def test_dispatched_request_cannot_recreate_terminal_worker(pair, monkeypatch, code):
+    worker, agent = pair.raw()
+    service = pair.gpu.store
+    rec = service.workers.get(worker.incarnation)
+    request = {
+        NodeMessageType.CREDIT: CreditRequest(PLACEHOLDER_OP, "session", PAGE),
+        NodeMessageType.READ_JOIN: ReadJoinRequest(
+            worker.incarnation, agent.metadata()
+        ),
+        NodeMessageType.WRITE_DONE: WriteDoneRequest(PLACEHOLDER_OP, []),
+        NodeMessageType.ABORT: AbortRequest(PLACEHOLDER_OP, []),
+    }[code]
+    if code != NodeMessageType.READ_JOIN:
+        request = worker.stamp(request)
+    method = "_write_done" if code == NodeMessageType.WRITE_DONE else code.name.lower()
+    replies = []
+    send_name = "post_response" if code == NodeMessageType.WRITE_DONE else "respond"
+    endpoint = rec.conn
+    send = getattr(endpoint, send_name)
+
+    def record(header, response):
+        replies.append(response)
+        return send(header, response)
+
+    monkeypatch.setattr(endpoint, send_name, record)
+    with pause_call(monkeypatch, service, method) as (entered, resume, finished):
+        worker.conn.submit(code, request)
+        assert entered.wait(3)
+        service.workers._worker_exited(worker.incarnation)
+        assert service.workers.get(worker.incarnation) is None
+        assert service.ledger.origins() == 0
+        resume.set()
+        assert finished.wait(3)
+        wait_until(lambda: replies)
+    assert replies[0].status == Status.REJECTED
+    assert not service.ledger.origins()
+    service._control_tasks.submit(lambda: None).result(3)
+    assert worker.incarnation not in service._agents
+    assert worker.incarnation not in pair.memory.role.parts._agents
+
+
+def test_closed_snapshot_cannot_post_before_loss_callback(pair, monkeypatch):
+    store(pair)
+    reader = pair.client("reader", load_only=True, reconnect_s=30)
+    old = reader._storage
+    rdma = reader._rdma
+    endpoint = pair.gpu.store.workers.endpoint(reader.identity.incarnation)
+    posts = []
+    post_nowait = rdma.transport.post_nowait
+
+    def record(op, *args):
+        posts.append(op)
+        return post_nowait(op, *args)
+
+    monkeypatch.setattr(rdma.transport, "post_nowait", record)
+    with (
+        ThreadPoolExecutor(max_workers=1) as pool,
+        pause_call(monkeypatch, rdma, "post_reads") as (reserved, post, _),
+        pause_call(monkeypatch, rdma, "notify_peers") as (notice, deliver, delivered),
+        pause_call(monkeypatch, old, "_on_lost") as (closed, _, _),
+    ):
+        result = pool.submit(reader.batch_retrieve, ["kv"])
+        assert reserved.wait(3)
+        endpoint.post_notify(Peers([]))
+        assert notice.wait(3)
+        endpoint.close()
+        assert closed.wait(3)
+        assert old.closed and reader._storage is old
+        deliver.set()
+        assert delivered.wait(3)
+        post.set()
+        assert result.result(3) == [None]
+        assert not posts
+
+
+@pytest.mark.parametrize("pair", ["default_staging_budget"], indirect=True)
+def test_terminal_detach_cannot_rebind_or_release_successor(pair, monkeypatch):
+    worker, _ = pair.raw(staging_id="first")
+    service = pair.gpu.store
+    rec = service.workers.get(worker.incarnation)
+    conn = rec.conn
+    old = worker.credit(PAGE)
+    with pause_call(monkeypatch, service, "_end_worker") as (entered, resume, finished):
+        assert (
+            worker.request(NodeMessageType.DETACH, DetachRequest(True)).status
+            == Status.OK
+        )
+        assert entered.wait(3)
+        again = RawWorker(pair.config.socket, worker.incarnation)
+        try:
+            with pytest.raises(AttachRefusedError, match="incarnation"):
+                again.attach(
+                    capabilities=[WORKER_RDMA_CAPABILITY],
+                    instance="instance",
+                    staging_id="first",
+                )
+        finally:
+            again.close()
+        successor, _ = pair.raw(staging_id="next")
+        new = successor.credit(PAGE)
+        assert old.write_agent.domain != new.write_agent.domain
+        assert old.credits[0] in service._credits
+        assert service.workers.detach(rec, conn, True).status == Status.REJECTED
+        service.workers.connection_lost(rec, conn)
+        resume.set()
+        assert finished.wait(3)
+    assert not service.workers.get(worker.incarnation)
+    assert old.credits[0] not in service._credits
+    assert new.credits[0] in service._credits
+    assert {successor.incarnation} in service.workers.admissions.values()
+    assert successor.credit(PAGE).credits
+
+
+def test_close_with_posted_read_keeps_catalog_pin_and_staging(pair):
+    store(pair)
+    reader = pair.client(load_only=True)
+    rdma = reader._rdma
+    rdma.transport.stall()
+    pending = reader.start_retrieve(["kv"])
+    request = pending._chunks[0].remote[0]
+    rec = pair.gpu.store.workers.get(reader.identity.incarnation)
+    reader.close()
+    wait_until(lambda: rec.detached)
+    assert pending.result() == [None]
+    assert pair.catalog.server.ms_service.pins.get(request.outcome.pin_id) is not None
+    assert request.flight in rdma._flights
+    assert rec.staging_key in pair.gpu.store.workers.admissions
+
+
+def test_writer_recovers_on_new_run_with_same_staging(pair):
+    writer = pair.client()
+    old = writer.alloc(PAGE)
+    first = pair.gpu.store.workers.get(writer.identity.incarnation)
+    staging = writer._rdma.staging
+    pair.gpu.stop()
+    pair.gpu = pair.start_gpu()
+    wait_until(lambda: writer.node_epoch == pair.gpu.node_epoch)
+    second = pair.gpu.store.workers.get(writer.identity.incarnation)
+    assert second.staging_key == first.staging_key and writer._rdma.staging is staging
+    assert not writer.off and not writer._rdma.owns_credit(old.location)
+    assert writer.batch_store(["old"], [old]) == [False]
+    wait_until(lambda: writer.credits.unused_bytes >= PAGE)
+    new = writer.alloc(PAGE)
+    assert new.remote.agent.domain.node_epoch == pair.gpu.node_epoch
+    assert writer.batch_store(["new"], [new]) == [True]
+    assert writer.batch_exists(["old", "new"]) == [False, True]
+
+
+def test_reserve_finishing_after_exit_never_grants_or_fences_siblings_domain(
+    pair, monkeypatch
+):
+    service = pair.gpu.store
+    sibling, _ = pair.raw()
+    grant = sibling.credit(PAGE)
+    worker, _ = pair.raw()
+    with pause_call(
+        monkeypatch,
+        service.remote,
+        "call",
+        when=lambda code, *args, **kwargs: code == RemoteMessageType.RESERVE,
+    ) as (entered, resume, _):
+        req = worker.stamp(CreditRequest(PLACEHOLDER_OP, "session", PAGE))
+        worker.conn.submit(NodeMessageType.CREDIT, req)
+        assert entered.wait(3)
+        rec = service.workers.get(worker.incarnation)
+        assert not rec.issued
+        service.workers._worker_exited(worker.incarnation)
+        resume.set()
+    wait_until(lambda: worker.incarnation not in service._agents)
+    assert set(service._credits) == set(grant.credits)
+    assert service.workers.domains["instance"] == grant.write_agent.domain
+    assert grant.write_agent.domain not in pair.memory.role.parts._closed_domains
+    assert sibling.credit(PAGE).credits
