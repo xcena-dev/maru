@@ -253,6 +253,8 @@ def test_reattached_local_worker_keeps_pins_through_copy_and_drain(
         orphans = second.role.orphans
         assert second.store.workers.get(child.incarnation) is not None
         assert publish(second, "current").result == ItemResult.ADDED
+        probe = Mock(wraps=service.probe)
+        monkeypatch.setitem(catalog.rpc._ms_handlers, MessageType.PROBE, probe)
         if tier == "local_cxl":
             assert child.incarnation in orphans.pending
             service.maintain()
@@ -262,18 +264,15 @@ def test_reattached_local_worker_keeps_pins_through_copy_and_drain(
                 KeptCause.PINNED,
             )
             assert service.pins.count(old.key, old.location) == 1
+            assert child.call("retrieve", key="current", timeout=2) is None
+            assert child.call("exists", keys=["current"]) == [False]
+            probe.assert_not_called()
+            assert child.call("state")["session_node_epoch"] == first.node_epoch
+            assert child.call("held", key="old") == old_bytes
+            child.call("release", key="old")
         else:
             # The new run has its own DRAM memfd.
             wait_until(lambda: service.pins.count(old.key, old.location) == 0)
-        assert child.call("retrieve", key="current", timeout=2) is None
-        probe = Mock(wraps=service.probe)
-        monkeypatch.setitem(catalog.rpc._ms_handlers, MessageType.PROBE, probe)
-        assert child.call("exists", keys=["current"]) == [False]
-        probe.assert_not_called()
-        assert child.call("held", key="old") == old_bytes
-        assert child.call("state")["session_node_epoch"] == first.node_epoch
-
-        child.call("release", key="old")
         wait_until(
             lambda: child.call("state")["session_node_epoch"] == second.node_epoch
         )
@@ -283,6 +282,9 @@ def test_reattached_local_worker_keeps_pins_through_copy_and_drain(
         assert child.call("retrieve", key="current") is not None
         assert child.call("exists", keys=["current"]) == [True]
         probe.assert_called_once()
+        if tier == "dram":
+            assert child.call("held", key="old") == old_bytes
+            child.call("release", key="old")
         key = Key("ns", "current")
         location = service.catalog.locations(key)[0].location
         assert service.pins.count(key, location) == 1

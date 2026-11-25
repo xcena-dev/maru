@@ -1848,7 +1848,7 @@ class MaruClient:
         try:
             # Only through the mapping of the run the lookup was answered
             # under: a new run released that run's pins
-            view = self.pools.view(outcome.location, node_epoch=node_epoch)
+            view = self.pools.view(outcome.location, node_epoch=node_epoch, read=True)
         except StaleRunError as e:
             logger.debug("a lookup of %s from another node run: %s", key, e)
             self._count(f"{prefix}_unavailable")
@@ -2121,7 +2121,7 @@ class MaruClient:
 
     def _move_session(self, info):
         # Opening on the new run releases the old session's orphan pins.
-        if self.pools.has_old_views(info.node_epoch) or (
+        if self.pools.has_old_cxl_reads(info.node_epoch) or (
             self._rdma is not None and self._rdma.reading_source()
         ):
             return

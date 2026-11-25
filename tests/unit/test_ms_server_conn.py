@@ -114,6 +114,22 @@ def test_a_reopen_waiting_for_another_open_does_not_open_again():
         conn._rpc.close()
 
 
+def test_heartbeat_epoch_does_not_reopen_a_replaced_node_run():
+    calls = []
+
+    def call(code, request):
+        calls.append(code)
+        return WorkerHeartbeatResponse(status=Status.EPOCH)
+
+    conn = make_conn(call, heartbeat_s=0.01, attached_epoch=lambda: "next")
+    try:
+        conn.start()
+        wait_until(lambda: len(calls) >= 3)
+    finally:
+        conn.close(goodbye=False)
+    assert set(calls) == {MessageType.WORKER_HEARTBEAT}
+
+
 def test_the_heartbeat_goes_on_when_a_callback_raises(monkeypatch, caplog):
     monkeypatch.setattr(server_conn, "DOWN_POLL_S", 0.01)
     opens, beats = [], []

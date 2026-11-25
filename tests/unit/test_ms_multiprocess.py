@@ -11,7 +11,7 @@ import sys
 import pytest
 
 from maru_common.protocol import MessageType
-from maru_common.storage_types import CloseMode, Key, Status
+from maru_common.storage_types import CloseMode, Key
 from maru_storage_service.cli import EXIT_START
 from maru_storage_service.drivers import dram
 from maru_storage_service.pool_manager import PageState
@@ -183,7 +183,7 @@ def test_kill_9_of_a_reader_that_never_stored(fake, sockdir, agents):
 
 
 def test_storage_service_restart(fake, sockdir, agents):
-    """An old DRAM write delays the Catalog move after re-ATTACH."""
+    """A held DRAM allocation survives the move to the new Catalog session."""
     config = node_config(fake.url, f"{sockdir}/node.sock")
     first = start_node(config)
     second = None
@@ -193,6 +193,7 @@ def test_storage_service_restart(fake, sockdir, agents):
         store(x, "x0")
         x.call("wait_credit", bytes=PAGE)
         x.call("alloc_hold", name="copy", size=64)  # a copy into old credit
+        opens = len(fake.requests(MessageType.WORKER_OPEN))
         first.stop(CloseMode.RESTART)
         second = start_node(config)
         wait_until(
@@ -202,27 +203,12 @@ def test_storage_service_restart(fake, sockdir, agents):
         # DRAM locations of the old run are gone; the new pool works
         assert x.call("retrieve", key="x0") is None
         store(x, "x1")
-        requests = len(fake.requests(MessageType.LOOKUP_AND_PIN))
-        assert x.call("retrieve", key="x1", timeout=2) is None
-        assert len(fake.requests(MessageType.LOOKUP_AND_PIN)) == requests
-        assert x.call("state")["session_node_epoch"] == first.node_epoch
-        with fake._lock:
-            beats = len(fake.requests(MessageType.WORKER_HEARTBEAT))
-            opens = len(fake.requests(MessageType.WORKER_OPEN))
-            fake.fail_requests(MessageType.WORKER_HEARTBEAT, Status.EPOCH, count=2)
-        wait_until(
-            lambda: (
-                len(fake.requests(MessageType.WORKER_HEARTBEAT)) >= beats + 3
-                or len(fake.requests(MessageType.WORKER_OPEN)) > opens
-            )
-        )
-        assert len(fake.requests(MessageType.WORKER_OPEN)) == opens
-        x.call("free_held", name="copy")
-        wait_until(lambda: x.call("state")["session_node_epoch"] == second.node_epoch)
+        assert x.call("retrieve", key="x1", hold=False) == value("x1")
+        assert x.call("state")["session_node_epoch"] == second.node_epoch
         assert [
             r.node_epoch for r in fake.requests(MessageType.WORKER_OPEN)[opens:]
         ] == [second.node_epoch]
-        assert x.call("retrieve", key="x1", hold=False) == value("x1")
+        x.call("free_held", name="copy")
         second.pools.check()
     finally:
         first.stop()

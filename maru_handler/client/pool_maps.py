@@ -263,6 +263,7 @@ class MappedPool:
     mapping: PoolMapping
     # Views handed out and not yet released (PEP 688 export count)
     views: int = 0
+    read_views: int = 0
     removing: bool = False
     # Taken out of use while views were held: the last released view closes it
     retired: bool = False
@@ -272,23 +273,31 @@ class MappedPool:
 class _PoolSlice:
     """Part of a mapped pool; its views are counted until released or freed."""
 
-    def __init__(self, maps: "PoolMaps", mapped: MappedPool, offset: int, length: int):
+    def __init__(
+        self, maps: "PoolMaps", mapped: MappedPool, offset: int, length: int, read: bool
+    ):
         self._maps = maps
         self._mapped = mapped
         self._offset = offset
         self._length = length
+        self._read = read
 
     def __buffer__(self, flags: int) -> memoryview:
         mapped = self._mapped
         with mapped.lock:
+            view = mapped.mapping.view(self._offset, self._length)
             mapped.views += 1
-        return mapped.mapping.view(self._offset, self._length)
+            if self._read:
+                mapped.read_views += 1
+        return view
 
     def __release_buffer__(self, view: memoryview) -> None:
         view.release()
         mapped = self._mapped
         with mapped.lock:
             mapped.views -= 1
+            if self._read:
+                mapped.read_views -= 1
             close = mapped.retired and mapped.views == 0
             if close:
                 mapped.retired = False
@@ -388,6 +397,8 @@ class PoolMaps:
         location: Location,
         length: int | None = None,
         node_epoch: str | None = None,
+        *,
+        read: bool = False,
     ) -> memoryview:
         """Checked bytes of ``location`` (the first ``length``); with
         ``node_epoch``, only through that run's mapping of the pool."""
@@ -404,7 +415,7 @@ class PoolMaps:
                     f"{mapped.node_epoch}, not {node_epoch}"
                 )
             # Counted before the caller sees it
-            return memoryview(_PoolSlice(self, mapped, location.offset, n))
+            return memoryview(_PoolSlice(self, mapped, location.offset, n, read))
 
     def get(self, pool_id: str) -> MappedPool | None:
         with self._lock:
@@ -414,13 +425,13 @@ class PoolMaps:
         with self._lock:
             return list(self._pools)
 
-    def has_old_views(self, node_epoch: str) -> bool:
-        """Whether a view still uses a mapping from another run."""
+    def has_old_cxl_reads(self, node_epoch: str) -> bool:
+        """Whether a CXL read view still needs an old run's Catalog pin."""
         with self._lock:
             for mapped in (*self._pools.values(), *self._detached):
-                if mapped.node_epoch != node_epoch:
+                if mapped.info.kind == PoolKind.CXL and mapped.node_epoch != node_epoch:
                     with mapped.lock:
-                        if mapped.views:
+                        if mapped.read_views:
                             return True
         return False
 
