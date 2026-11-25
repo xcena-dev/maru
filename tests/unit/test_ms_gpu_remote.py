@@ -13,7 +13,7 @@ import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -631,20 +631,85 @@ def test_lost_registration_reply_is_retried_before_workers_connect(pair, monkeyp
     assert worker.attach_info.node_epoch == gpu.node_epoch
 
 
-@pytest.mark.parametrize("restart", ["stop", "add_peer_failure"])
+@pytest.mark.parametrize("repeated", [False, True], ids=["once", "every-join"])
+def test_failed_read_join_preserves_another_workers_store(pair, monkeypatch, repeated):
+    writer = store(pair)
+    handle = writer.alloc(PAGE)
+    handle.buf[:] = b"b" * PAGE
+    domain = handle.remote.agent.domain
+    parts = pair.memory.role.parts
+    target = parts._writers[domain].transport if repeated else parts.transport
+    transport = writer._rdma.transport
+
+    with closing(FakeTransport("worker-b")) as agent:
+        join = ReadJoinRequest("worker-b", agent.metadata())
+
+        def reattach():
+            with closing(RawWorker(pair.config.socket)) as worker:
+                assert (
+                    worker.attach(
+                        capabilities=[WORKER_RDMA_CAPABILITY], instance="b"
+                    ).status
+                    == Status.OK
+                )
+                return worker.request(NodeMessageType.READ_JOIN, join).status
+
+        def refuse(metadata):
+            assert metadata == join.agent_metadata
+            raise RuntimeError("peer metadata refused")
+
+        with pause_call(monkeypatch, transport, "poll_nowait") as (polling, _, _):
+            transport.stall()
+            pending = writer.store_async(["during-join"], [handle])
+            assert polling.wait(3)
+            with monkeypatch.context() as patch:
+                patch.setattr(target, "add_peer", refuse)
+                for _ in range(2 if repeated else 1):
+                    assert reattach() == Status.REJECTED
+                    assert "worker-b" not in parts._agents
+                    assert not parts.transport.has_peer("worker-b")
+            assert transport.finish_stalled() == 1
+            transport.stall(False)
+        assert pending.result(3) == [True]
+        if not repeated:
+            assert reattach() == Status.OK
+
+    assert not pair.memory.ended and not pair.gpu.ended
+    assert pair.gpu.store.workers.domains[domain.instance] == domain
+    after = writer.alloc(PAGE)
+    assert after.remote.agent.domain == domain
+    assert writer.batch_store(["after-join"], [after]) == [True]
+    reads = writer.batch_retrieve(["kv", "during-join"])
+    assert [bytes(r.view) for r in reads] == [b"a" * PAGE, b"b" * PAGE]
+    writer.release_retrieved(reads)
+
+
+@pytest.mark.parametrize("restart", ["stop", "rollback_failure"])
 def test_memory_restart_uses_new_pool_registrations(pair, monkeypatch, restart):
     writer = store(pair)
     before = writer.attach_info.peers[0]
-    if restart == "add_peer_failure":
+    if restart == "rollback_failure":
+        parts = pair.memory.role.parts
+        (entry,) = parts._writers.values()
+        remove = parts.transport.remove_peer
+        failed = []
 
         def refuse(metadata):
             raise RuntimeError("peer metadata unavailable")
 
+        def fail_rollback(name):
+            if not failed:
+                failed.append(name)
+                raise RuntimeError("peer removal failed")
+            remove(name)
+
         with monkeypatch.context() as patch:
-            patch.setattr(pair.memory.role.parts.transport, "add_peer", refuse)
+            patch.setattr(entry.transport, "add_peer", refuse)
+            patch.setattr(parts.transport, "remove_peer", fail_rollback)
             with pytest.raises(StorageUnavailableError):
                 pair.client("b", load_only=True)
         assert pair.memory.wait_finished(5) and pair.memory.new_run
+        assert "peer removal failed" in pair.memory.ended
     else:
         pair.memory.stop()
     wait_until(lambda: pair.gpu.wait_finished(0))

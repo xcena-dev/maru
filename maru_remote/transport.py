@@ -27,6 +27,7 @@ import ctypes
 import logging
 import threading
 import time
+from collections.abc import Set
 from enum import StrEnum
 from typing import Any
 
@@ -400,6 +401,16 @@ class NixlTransport:
         """Whether a peer is loaded (added by :meth:`add_peer`, not removed)."""
         with self._lock:
             return name in self._peers
+
+    def peer_metadata_matches(self, present: Set[str], absent: Set[str]) -> bool:
+        """Check the recorded peers and NIXL registrations after a failed update."""
+        with self._lock:
+            check = self._agent.check_remote_metadata
+            return (
+                self._peers == present
+                and all(check(name) for name in present)
+                and not any(check(name) for name in absent)
+            )
 
     def peer_ready_hint(self, name: str) -> bool:
         """Refresh hint. Posting rechecks both sets under the transport lock."""

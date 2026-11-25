@@ -51,6 +51,10 @@ class _Writer:
     name: str
 
 
+class _PeerRefusedError(ValueError):
+    """The transport refused a metadata load."""
+
+
 class RemoteParts:
     """Mappings stay alive until every registration is revoked."""
 
@@ -123,7 +127,8 @@ class RemoteParts:
                 for pool_id, memory in self._maps.items():
                     entry.exporter.attach(pool_id, memory)
                 for worker, (_, metadata) in self._agents.items():
-                    self._add(entry.transport, entry.progress, worker, metadata)
+                    self._add(entry.transport, worker, metadata)
+                    entry.progress.expect(worker)
             return WriteAgent(
                 domain,
                 entry.name,
@@ -144,10 +149,19 @@ class RemoteParts:
             del self._writers[domain]
 
     @staticmethod
-    def _add(transport, progress, name, metadata) -> None:
-        if transport.add_peer(metadata) != name:
+    def _add(transport, name, metadata) -> None:
+        try:
+            actual = transport.add_peer(metadata)
+        except (UnicodeDecodeError, MemoryError):
+            # NIXL may have returned a name that the transport could not record.
+            raise
+        except Exception as exc:
+            # A malformed NIXL blob can leave connection info under an unknown name.
+            if "NIXL_ERR_MISMATCH" in str(exc):
+                raise
+            raise _PeerRefusedError("peer metadata refused") from exc
+        if actual != name:
             raise ValueError("agent name mismatch")
-        progress.expect(name)
 
     def _targets(self):
         return [
@@ -187,20 +201,42 @@ class RemoteParts:
                 > self.agents_max
             ):
                 raise ValueError("agent limit")
+            targets = self._targets()
             try:
                 for name in request.remove:
                     if name in self._agents:
-                        for transport, _ in self._targets():
+                        for transport, _ in targets:
                             transport.remove_peer(name)
                         del self._agents[name]
-                for name, metadata in add.items():
-                    for transport, progress in self._targets():
-                        self._add(transport, progress, name, metadata)
-                    self._agents[name] = origin, metadata
+                self._add_agents(targets, add, request.remove)
+            except _PeerRefusedError:
+                raise
             except Exception as exc:
                 self._closed = True
                 self._end_run(f"agent metadata update failed: {exc}")
                 raise
+            self._agents = kept
+
+    def _add_agents(self, targets, add, removed) -> None:
+        installed = []
+        try:
+            for name, metadata in add.items():
+                if name in self._agents:
+                    continue
+                for transport, _ in targets:
+                    self._add(transport, name, metadata)
+                    installed.append((transport, name))
+        except _PeerRefusedError as exc:
+            for transport, name in reversed(installed):
+                transport.remove_peer(name)
+            absent = (add.keys() | removed) - self._agents.keys()
+            for transport, _ in targets:
+                if not transport.peer_metadata_matches(self._agents.keys(), absent):
+                    raise RuntimeError("peer metadata rollback uncertain") from exc
+            raise
+        for name in add:
+            for _, progress in targets:
+                progress.expect(name)
 
     def forget_agents(self, origin: str) -> None:
         if self._closed:

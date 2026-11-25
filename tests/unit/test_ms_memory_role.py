@@ -3,6 +3,7 @@
 
 import dataclasses
 import socket
+from contextlib import ExitStack, closing
 
 import pytest
 
@@ -337,6 +338,47 @@ def test_invalid_agent_updates_are_rejected_before_metadata_is_exposed(memory, f
     worker.close()
 
 
+def test_failed_batch_undoes_new_peers_and_keeps_requested_removals(
+    memory, monkeypatch
+):
+    parts = memory.parts
+    with ExitStack() as stack:
+        records = []
+        for name in ("keep", "replace", "last"):
+            worker = stack.enter_context(closing(FakeTransport(name)))
+            records.append(AgentMetadata(name, worker.metadata()))
+        assert (
+            call(memory.ops.agents, A, AgentsRequest(add=records[:2])).status
+            == Status.OK
+        )
+        memory.reserve()
+        writer = parts._writers[DOMAIN].transport
+        load = writer.add_peer
+        remove = writer.remove_peer
+        loads = []
+        removals = []
+
+        def refuse_last(metadata):
+            loads.append(metadata)
+            if metadata == records[-1].agent_metadata:
+                raise RuntimeError("peer metadata refused")
+            return load(metadata)
+
+        def remove_peer(name):
+            removals.append(name)
+            remove(name)
+
+        monkeypatch.setattr(writer, "add_peer", refuse_last)
+        monkeypatch.setattr(writer, "remove_peer", remove_peer)
+        request = AgentsRequest(remove=["replace"], add=records)
+        assert call(memory.ops.agents, A, request).status == Status.REJECTED
+        assert loads == [r.agent_metadata for r in records[1:]]
+        assert removals == ["replace", "replace"]
+        assert parts._agents == {"keep": (A, records[0].agent_metadata)}
+        assert writer.agent.peers == parts.transport.agent.peers == {"keep"}
+        assert not memory.node.ended
+
+
 def test_write_domain_agent_limit_counts_failed_registrations(memory, monkeypatch):
     from tests.unit.test_ms_peer_ops import fail_fence, fence
 
@@ -393,3 +435,19 @@ def test_uncertain_agent_update_ends_the_run_and_revokes_registrations(memory):
     assert not memory.parts.transport.agent.peers
     assert not memory.parts.transport.agent.regs
     worker.close()
+
+
+def test_add_failure_after_native_install_ends_the_run(memory, monkeypatch):
+    agent = memory.parts.transport.agent
+    load = agent.add_remote_agent
+
+    def partial_install(metadata):
+        load(metadata)
+        raise RuntimeError("peer load incomplete")
+
+    monkeypatch.setattr(agent, "add_remote_agent", partial_install)
+    with closing(FakeTransport("worker")) as worker:
+        request = AgentsRequest(add=[AgentMetadata("worker", worker.metadata())])
+        assert call(memory.ops.agents, A, request).status == Status.REJECTED
+        assert memory.node.wait_finished(5) and memory.node.new_run
+        assert not agent.regs

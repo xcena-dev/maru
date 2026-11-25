@@ -150,6 +150,9 @@ class FakeNixlAgent:
     def get_agent_metadata(self) -> bytes:
         return f"{self.name}|1|*|{self.incarnation}".encode()
 
+    def check_remote_metadata(self, name: str) -> bool:
+        return name in self.peers
+
     def get_partial_agent_metadata(self, descs, inc_conn_info=False, backends=()):
         ranges = ";".join(f"{addr}:{size}:{key}" for addr, size, key in descs)
         conn = int(bool(inc_conn_info))
