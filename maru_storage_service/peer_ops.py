@@ -52,6 +52,10 @@ def peer_node(origin: str) -> str:
     return origin.removeprefix("peer:").rpartition("@")[0]
 
 
+class WriterLimitError(ValueError):
+    """No writer slot is available to start registration."""
+
+
 class WriteRegistrations(Protocol):
     def writer(self, domain: WriteDomain) -> WriteAgent: ...
     def fence(self, domain: WriteDomain) -> None: ...
@@ -176,21 +180,35 @@ class PeerOps:
             return ReserveResponse(Status.OK, room=room, limit=limit)
         entry = self._domains.get(domain)
         if entry is not None and entry.state != "open":
-            return ReserveResponse(Status.REJECTED, error="write domain closed")
+            return ReserveResponse(
+                Status.REJECTED,
+                error="write domain closed",
+                domain_fenced=entry.state == "fenced",
+            )
         credits = self.pools.credit(origin, request.pages * self.page_size)
         if not credits:
             room, limit = self._room(origin)
             return ReserveResponse(Status.OK, room=room, limit=limit)
+        try:
+            agent = self.registrations.writer(domain)
+        except WriterLimitError:
+            for credit in credits:
+                self.pools.abort(origin, credit)
+            return ReserveResponse(Status.OK)
+        except Exception:
+            logger.exception("write registration failed")
+            agent = None
         if entry is None:
             entry = self._domains[domain] = _Domain(f"write:{len(self._domains)}")
         for credit in credits:
             entry.credits[_page_key(credit)] = credit
-        try:
-            agent = self.registrations.writer(domain)
-        except Exception:
-            logger.exception("write registration failed")
-            self._fence(domain, entry)
-            return ReserveResponse(Status.REJECTED, error="write registration failed")
+        if agent is None:
+            result = self._fence(domain, entry)
+            return ReserveResponse(
+                Status.REJECTED,
+                error="write registration failed",
+                domain_fenced=result == FenceResult.SUCCESS,
+            )
         self._reserves[origin, request.op.seq] = domain, list(credits)
         room, limit = self._room(origin)
         return ReserveResponse(

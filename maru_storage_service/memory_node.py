@@ -20,7 +20,7 @@ from maru_remote.exporter import NixlExporter
 from maru_remote.progress import ConnectProgress
 from maru_remote.transport import NixlTransport
 
-from .peer_ops import peer_node
+from .peer_ops import WriterLimitError, peer_node
 from .remote_server import TcpRemoteServer
 
 AGENTS_PER_NODE = 64
@@ -112,7 +112,7 @@ class RemoteParts:
             if entry is None:
                 count = sum(d.node_id == domain.node_id for d in self._writers)
                 if count >= self.domains_max:
-                    raise ValueError("write domain limit")
+                    raise WriterLimitError("write domain limit")
                 name = f"{self.name}-write-{uuid.uuid4().hex}"
                 transport = self._make_transport(name)
                 entry = _Writer(

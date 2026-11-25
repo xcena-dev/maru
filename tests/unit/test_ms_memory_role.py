@@ -347,10 +347,11 @@ def test_write_domain_agent_limit_counts_failed_registrations(memory, monkeypatc
         fail_fence(memory, patch)
         assert fence(memory).result == "failure"
         other = dataclasses.replace(DOMAIN, number=2)
-        assert memory.reserve(domain=other).status == Status.REJECTED
+        full = memory.reserve(domain=other)
+        assert full.status == Status.OK and not full.credits
         assert len(parts._writers) == 1
     assert fence(memory).result == "success"
-    assert memory.reserve(domain=dataclasses.replace(DOMAIN, number=3)).credits
+    assert memory.reserve(domain=other).credits
 
 
 def test_hint_is_explicitly_unsupported_and_old_capabilities_are_refused(memory):

@@ -160,7 +160,8 @@ def test_fence_precedes_reuse_and_rejects_old_domain(memory, monkeypatch):
     assert observed == [PageState.QUARANTINED]
     assert state(memory, credit) == PageState.FREE
     assert memory.write([credit]).status == Status.REJECTED
-    assert memory.reserve().status == Status.REJECTED
+    rejected = memory.reserve()
+    assert rejected.status == Status.REJECTED and rejected.domain_fenced
     assert fence(memory).result == FenceResult.SUCCESS
 
 
@@ -225,6 +226,8 @@ def test_fence_failure_is_q2_and_time_or_late_done_never_releases_it(
         memory.ops._clock = lambda: 10**20
         assert memory.ops.sweep() == 0
         assert memory.write([credit]).status == Status.REJECTED
+        rejected = memory.reserve()
+        assert rejected.status == Status.REJECTED and not rejected.domain_fenced
         assert (
             call(
                 memory.ops.cancel,

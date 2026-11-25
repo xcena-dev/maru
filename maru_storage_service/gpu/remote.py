@@ -408,6 +408,9 @@ class RemoteWorkerOps(WorkerOps):
                 return CreditResponse(Status.REJECTED, error="write domain ended")
         else:
             self._reserves.pop(key, None)
+            if got.domain_fenced:
+                self.workers.withdraw(domain)
+                self._forget_fenced(domain)
         return CreditResponse(
             got.status,
             error=got.error,
@@ -547,6 +550,9 @@ class RemoteWorkerOps(WorkerOps):
         if answer.status != Status.OK or answer.result != FenceResult.SUCCESS:
             self.remote.connection.close()
             return
+        self._forget_fenced(domain)
+
+    def _forget_fenced(self, domain):
         for credit, (_, held_domain) in list(self._credits.items()):
             if held_domain == domain:
                 del self._credits[credit]

@@ -1441,6 +1441,82 @@ def test_empty_reserve_leaves_writer_capacity_for_the_next_instance(pair, monkey
     assert later.batch_store(["next"], [later.alloc(PAGE)]) == [True]
 
 
+def test_refill_after_the_only_writer_slot_is_released(pair, monkeypatch):
+    monkeypatch.setattr(MaruClient, "_refill_loop", lambda self: None)
+    parts = pair.memory.role.parts
+    parts.domains_max = 1
+    first = pair.client("a")
+    assert first.credits.unused_bytes == 4 * PAGE
+    second = pair.client("b")
+    assert second.credits.unused_bytes == 0
+    domain = pair.gpu.store.workers.domains["b"]
+    assert domain not in parts._closed_domains
+    first.close()
+    wait_until(lambda: not parts._writers)
+    assert second._refill_once()
+    assert second.credits.unused_bytes == 4 * PAGE
+    assert domain in parts._writers
+    assert second.batch_store(["b"], [second.alloc(PAGE)]) == [True]
+
+
+def test_refill_after_the_first_writer_registration_fails(pair, monkeypatch):
+    monkeypatch.setattr(MaruClient, "_refill_loop", lambda self: None)
+    parts = pair.memory.role.parts
+    parts.domains_max = 1
+    register = parts.writer
+
+    def fail(domain):
+        register(domain)
+        raise RuntimeError("writer metadata unavailable")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(parts, "writer", fail)
+        worker = pair.client()
+    assert worker.credits.unused_bytes == 0
+    (closed,) = parts._closed_domains
+    assert not parts._writers
+    assert worker._refill_once()
+    handle = worker.alloc(PAGE)
+    assert handle.remote.agent.domain != closed
+    assert worker.batch_store(["after"], [handle]) == [True]
+
+
+@pytest.mark.parametrize("fence_fails", [False, True])
+def test_registration_failure_on_an_issued_domain(pair, monkeypatch, fence_fails):
+    monkeypatch.setattr(MaruClient, "_refill_loop", lambda self: None)
+    worker = pair.client()
+    old = worker.alloc(PAGE)
+    domain = old.remote.agent.domain
+    service = pair.gpu.store
+    worker._on_notify(Notify(NotifyKind.CREDIT_RETURN, bytes=3 * PAGE), worker._storage)
+    wait_until(lambda: set(service._credits) == {old.location})
+    sibling, _ = pair.raw()
+    parts = pair.memory.role.parts
+    reserves = dict(service._reserves)
+
+    def fail(requested):
+        assert requested == domain
+        raise RuntimeError("registration error")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(parts, "writer", fail)
+        if fence_fails:
+            patch.setattr(parts, "fence", fail)
+        assert sibling.credit(PAGE).status == Status.REJECTED
+    if fence_fails:
+        assert service.workers.domains[domain.instance] == domain
+        assert old.location in service._credits and service._reserves == reserves
+        assert pair.memory.pools.bytes_in(PageState.QUARANTINED) == 2 * PAGE
+        worker.free(old)
+    else:
+        assert not service._credits and not service._reserves
+        assert worker._refill_once()
+        new = worker.alloc(PAGE)
+        assert new.remote.agent.domain != domain
+        assert worker.batch_store(["old", "new"], [old, new]) == [False, True]
+        assert worker.batch_exists(["old", "new"]) == [False, True]
+
+
 def test_restarted_readers_share_one_pidfd_with_their_orphan_pins(pair, monkeypatch):
     store(pair)
     readers = [pair.client(load_only=True) for _ in range(2)]

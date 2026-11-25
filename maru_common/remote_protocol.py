@@ -248,6 +248,7 @@ class ReserveResponse:
     room: int = 0
     limit: RoomLimit | None = None
     write_agent: WriteAgent | None = None
+    domain_fenced: bool = False  # the memory node confirmed revocation
 
 
 @dataclass
