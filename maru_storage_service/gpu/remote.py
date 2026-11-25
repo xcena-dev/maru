@@ -151,19 +151,28 @@ class RemoteControl:
             timeout = self.options["timeout_s"]
             if code == Code.RESERVE and request.hint == HintAction.WRITE_WAIT:
                 timeout = max(timeout, request.wait_ms / 1000 + 3)
+            deadline = time.monotonic() + timeout
             answer = self.connection.call(code, request, timeout)
         except (ConnectionError, TimeoutError):
             # A lost RESERVE reply never makes its pages available to a worker.
-            if code == Code.RESERVE and not self.connection.closed:
-                cancel = self.origin.stamp(
-                    CancelRequest(
-                        PLACEHOLDER_OP,
-                        reserve_seq=request.op.seq,
-                        domain=request.domain,
+            try:
+                if (
+                    code == Code.RESERVE
+                    and not self.connection.closed
+                    and time.monotonic() < deadline
+                ):
+                    cancel = self.origin.stamp(
+                        CancelRequest(
+                            PLACEHOLDER_OP,
+                            reserve_seq=request.op.seq,
+                            domain=request.domain,
+                        )
                     )
-                )
-                self.connection.submit(Code.CANCEL, cancel, lambda response: None)
-            self.connection.close()
+                    self.connection.submit(
+                        Code.CANCEL, cancel, lambda response: None, deadline=deadline
+                    )
+            finally:
+                self.connection.close()
             raise
         if op:
             self.origin.resolved(request.op.seq)

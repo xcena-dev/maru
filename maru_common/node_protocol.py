@@ -11,8 +11,10 @@ sends with a lock (a reply and a NOTIFY may race).
 
 import array
 import os
+import selectors
 import socket
 import struct
+import time
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from enum import IntEnum, unique
@@ -430,6 +432,25 @@ def send_frame_nowait(sock: socket.socket, frame: bytes) -> int:
         return sock.send(frame, socket.MSG_DONTWAIT)
     except BlockingIOError:
         return 0
+
+
+def send_frame_until(sock: socket.socket, frame: bytes, deadline: float) -> None:
+    """Send one frame by the monotonic deadline. Hold the send lock."""
+    _check_frame(frame)
+    view = memoryview(frame)
+    with selectors.PollSelector() as writable:
+        writable.register(sock, selectors.EVENT_WRITE)
+        while view:
+            if time.monotonic() >= deadline:
+                raise TimeoutError("remote send timed out")
+            try:
+                sent = sock.send(view, socket.MSG_DONTWAIT)
+            except BlockingIOError:
+                writable.select(deadline - time.monotonic())
+                continue
+            if not sent:
+                raise FrameError("connection closed during send")
+            view = view[sent:]
 
 
 def _recv_exact(sock: socket.socket, n: int) -> bytes:

@@ -13,7 +13,7 @@ import time
 from collections.abc import Callable
 from typing import Any
 
-from maru_common.node_protocol import recv_frame, send_frame
+from maru_common.node_protocol import recv_frame, send_frame, send_frame_until
 from maru_common.protocol import MessageHeader
 from maru_common.remote_protocol import (
     REMOTE_MESSAGE_CLASSES,
@@ -35,7 +35,7 @@ class RemoteConnection:
     """Seq-matched requests, without reconnects or op sequence bookkeeping.
 
     Callbacks run on the response reader (or the thread detecting failure)
-    and must return promptly. A blocking call timeout only removes its waiter.
+    and must return promptly. A response timeout only removes its waiter.
     """
 
     def __init__(self, sock: socket.socket, serializer: Serializer):
@@ -107,39 +107,50 @@ class RemoteConnection:
     def closed(self) -> bool:
         return self._closed.is_set()
 
-    def submit(self, msg_type: int, request: Any, callback: Reply) -> int:
-        """Send a request; answer callback once with its response or a connection error."""
-        failure: ConnectionError | None = None
-        registered = False
-        with self._send_lock:
-            frame = self._serializer.encode(msg_type, request)
-            seq = MessageHeader.unpack(frame).sequence
-            with self._lock:
-                if self.closed:
-                    failure = ConnectionError("remote connection is closed")
-                else:
-                    self._pending[seq] = (msg_type | RESPONSE_BIT, callback)
-                    registered = True
-            if failure is None:
-                try:
-                    send_frame(self._sock, frame)
-                except (OSError, ValueError) as exc:
-                    failure = ConnectionError(str(exc))
-        if failure is not None:
-            if registered:
-                # The reader sees the stream end and answers every pending
-                # callback there, not on this caller's thread (it may hold
-                # locks those callbacks take)
-                try:
-                    self._sock.shutdown(socket.SHUT_RDWR)
-                except OSError:
-                    pass
+    def submit(
+        self,
+        msg_type: int,
+        request: Any,
+        callback: Reply,
+        *,
+        deadline: float | None = None,
+    ) -> int:
+        """Answer the callback once. An expired send deadline also raises TimeoutError."""
+        frame = self._serializer.encode(msg_type, request)
+        seq = MessageHeader.unpack(frame).sequence
+        with self._lock:
+            closed = self.closed
+            if not closed:
+                self._pending[seq] = (msg_type | RESPONSE_BIT, callback)
+        if closed:
+            self._reply(callback, ConnectionError("remote connection is closed"))
+            return seq
+
+        wait = -1 if deadline is None else max(0.0, deadline - time.monotonic())
+        acquired = self._send_lock.acquire(timeout=wait)
+        try:
+            if not acquired:
+                raise TimeoutError("remote send lock timed out")
+            if deadline is None:
+                send_frame(self._sock, frame)
             else:
-                self._reply(callback, failure)
+                send_frame_until(self._sock, frame, deadline)
+        except (OSError, ValueError) as exc:
+            # The reader closes the stream and runs the callbacks.
+            try:
+                self._sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            if deadline is not None and isinstance(exc, TimeoutError):
+                raise
+        finally:
+            if acquired:
+                self._send_lock.release()
         return seq
 
     def call(self, msg_type: int, request: Any, timeout_s: float) -> Any:
         """Wait for one seq-matched response; raise on timeout or connection failure."""
+        deadline = time.monotonic() + timeout_s
         answered = threading.Event()
         result: list[Any] = []
 
@@ -147,8 +158,8 @@ class RemoteConnection:
             result.append(response)
             answered.set()
 
-        seq = self.submit(msg_type, request, done)
-        if not answered.wait(timeout_s):
+        seq = self.submit(msg_type, request, done, deadline=deadline)
+        if not answered.wait(deadline - time.monotonic()):
             with self._lock:
                 self._pending.pop(seq, None)
             raise TimeoutError("remote request timed out")

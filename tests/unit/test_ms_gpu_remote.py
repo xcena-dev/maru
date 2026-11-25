@@ -849,9 +849,9 @@ def test_reserve_reply_loss_cancels_by_sequence_and_keeps_the_gpu_run_closed(
     submit = connection.submit
     seen, sent = [], []
 
-    def record(code, request, callback):
+    def record(code, request, callback, *, deadline):
         sent.append((code, request))
-        return submit(code, request, callback)
+        return submit(code, request, callback, deadline=deadline)
 
     def lose(code, request, timeout):
         response = real(code, request, timeout)

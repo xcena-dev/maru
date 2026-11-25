@@ -13,7 +13,12 @@ from contextlib import contextmanager
 import pytest
 
 from maru_common.node_protocol import recv_frame, send_frame
-from maru_common.remote_protocol import REMOTE_MESSAGE_CLASSES, PingRequest
+from maru_common.remote_protocol import (
+    REMOTE_MESSAGE_CLASSES,
+    AgentMetadata,
+    AgentsRequest,
+    PingRequest,
+)
 from maru_common.remote_protocol import RemoteMessageType as Code
 from maru_common.serializer import Serializer, op_digest
 from maru_common.storage_types import Status
@@ -213,6 +218,46 @@ def test_call_timeout_discards_only_its_pending_response(make_server):
     assert ping(conn).status == Status.OK
     assert conn.call(Code.RESERVE, request(Code.RESERVE), WAIT).status == Status.OK
     assert len(h.ops.calls) == 1
+
+
+@pytest.mark.parametrize("block", ["send_buffer", "send_lock"])
+def test_send_deadline_closes_the_stream(block):
+    sock, peer = socket.socketpair()
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4096)
+    conn = RemoteConnection(sock, Serializer(REMOTE_MESSAGE_CLASSES))
+    closed = threading.Event()
+    conn.on_close(closed.set)
+    payload = b"x" * (1 << 20)
+    request = AgentsRequest(add=[AgentMetadata("worker", payload)])
+    errors = []
+
+    def call():
+        try:
+            conn.call(Code.AGENTS, request, 0.02)
+        except OSError as exc:
+            errors.append(exc)
+
+    if block == "send_lock":
+        conn._send_lock.acquire()
+    caller = threading.Thread(target=call)
+    try:
+        caller.start()
+        caller.join(0.5)
+        assert not caller.is_alive()
+        assert len(errors) == 1 and isinstance(errors[0], TimeoutError)
+        assert closed.wait(WAIT) and not conn._pending
+        peer.settimeout(WAIT)
+        received = b"".join(iter(lambda: peer.recv(65536), b""))
+        if block == "send_lock":
+            assert not received
+        else:
+            assert 0 < len(received) < len(payload)
+    finally:
+        if block == "send_lock":
+            conn._send_lock.release()
+        peer.close()
+        conn.close()
+        caller.join(WAIT)
 
 
 @pytest.mark.parametrize("bad", ["code", "payload", "truncated"])
