@@ -908,8 +908,7 @@ def test_late_peer_withdrawal_keeps_reattached_workers_reads(pair, monkeypatch):
 @pytest.mark.parametrize("pair", ["default_staging_budget"], indirect=True)
 @pytest.mark.parametrize("failure", ["nixl", "cuda", "exported_view"])
 def test_uncertain_staging_teardown_keeps_admission(pair, monkeypatch, failure):
-    import torch
-
+    torch = pytest.importorskip("torch") if failure == "cuda" else None
     worker = pair.client(load_only=True)
     staging = worker._rdma.staging
     if failure == "nixl":
