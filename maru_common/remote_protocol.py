@@ -269,6 +269,7 @@ class RemoteWriteDoneResponse:
     status: Status
     error: str | None = None
     items: list[ItemOutcome] = field(default_factory=list)
+    consumed: list[int] = field(default_factory=list)  # DONE indexes admitted to COMMIT
 
 
 @dataclass

@@ -526,14 +526,16 @@ class RemoteWorkerOps(WorkerOps):
             op=True,
         )
         if got.status == Status.OK and len(got.items) == len(group):
+            consumed = set(got.consumed)
             for (index, _), outcome in zip(group, got.items, strict=True):
                 outcomes[index] = outcome
 
             def settle():
-                for index, item in group:
-                    if item.end == TransferEnd.DONE and outcomes[index].result in (
-                        ItemResult.ADDED,
-                        ItemResult.DUPLICATE,
+                for pos, (index, item) in enumerate(group):
+                    if item.end == TransferEnd.DONE and (
+                        pos in consumed
+                        or outcomes[index].result
+                        in (ItemResult.ADDED, ItemResult.DUPLICATE)
                     ):
                         self._credits.pop(item.credit, None)
 

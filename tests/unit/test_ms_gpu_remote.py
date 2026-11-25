@@ -353,6 +353,24 @@ def test_credit_replay_and_return_use_the_same_reservation(pair):
     assert pair.memory.pools.bytes_in(PageState.CREDITED) == 0
 
 
+def test_rejected_catalog_commits_release_the_worker_credit_budget(pair, monkeypatch):
+    monkeypatch.setattr(MaruClient, "_refill_loop", lambda self: None)
+    writer = pair.client()
+    keys = [f"rejected-{i}" for i in range(4)]
+    handles = [writer.alloc(PAGE) for _ in keys]
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            pair.catalog.server.ms_service.catalog, "check_commit", lambda *_: "refused"
+        )
+        assert writer.batch_store(keys, handles) == [False] * len(keys)
+    assert writer.batch_exists(keys) == [False] * len(keys)
+    assert pair.memory.pools.bytes_in(PageState.FREE) == 16 * PAGE
+    assert not pair.gpu.store._credits
+    assert writer._refill_once()
+    assert writer.credits.unused_bytes == 4 * PAGE
+    assert writer.batch_store(["next"], [writer.alloc(PAGE)]) == [True]
+
+
 def test_failed_write_agent_load_returns_the_full_grant(pair, monkeypatch):
     monkeypatch.setattr(MaruClient, "_refill_loop", lambda self: None)
     load = FakeTransport.add_peer

@@ -284,7 +284,11 @@ class PeerOps:
             self.manager.commit_written(
                 outcomes,
                 pages,
-                lambda items: done(RemoteWriteDoneResponse(Status.OK, items=items)),
+                lambda items: done(
+                    RemoteWriteDoneResponse(
+                        Status.OK, items=items, consumed=list(pages)
+                    )
+                ),
             )
 
     def cancel(
