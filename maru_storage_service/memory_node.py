@@ -59,10 +59,12 @@ class RemoteParts:
         name: str,
         make_transport: Callable[[str], NixlTransport],
         *,
+        end_run: Callable[[str], None],
         agents_max: int = AGENTS_PER_NODE,
         domains_max: int = WRITE_DOMAINS_PER_NODE,
     ):
         self.name, self._make_transport = name, make_transport
+        self._end_run = end_run
         self.agents_max, self.domains_max = agents_max, domains_max
         self.transport = make_transport(name)
         self.exporter = NixlExporter(self.transport)
@@ -76,7 +78,6 @@ class RemoteParts:
         self._closed_domains: set[WriteDomain] = set()
         self._agents: dict[str, tuple[str, bytes]] = {}
         self._closed = False
-        self._agents_failed = False
 
     def attach(self, info: PoolInfo, memory: mmap.mmap) -> None:
         self._maps[info.pool_id] = memory
@@ -106,7 +107,7 @@ class RemoteParts:
 
     def writer(self, domain: WriteDomain) -> WriteAgent:
         with self._lock:
-            if self._closed or self._agents_failed or domain in self._closed_domains:
+            if self._closed or domain in self._closed_domains:
                 raise ValueError("write domain closed")
             entry = self._writers.get(domain)
             if entry is None:
@@ -156,7 +157,7 @@ class RemoteParts:
 
     def agents(self, origin: str, request: AgentsRequest) -> None:
         with self._lock:
-            if self._closed or self._agents_failed:
+            if self._closed:
                 raise ValueError("agent updates closed")
             add = {a.agent_name: a.agent_metadata for a in request.add}
             if (
@@ -193,15 +194,16 @@ class RemoteParts:
                             transport.remove_peer(name)
                         del self._agents[name]
                 for name, metadata in add.items():
-                    self._agents[name] = origin, metadata
                     for transport, progress in self._targets():
                         self._add(transport, progress, name, metadata)
-            except Exception:
-                self._agents_failed = True
+                    self._agents[name] = origin, metadata
+            except Exception as exc:
+                self._closed = True
+                self._end_run(f"agent metadata update failed: {exc}")
                 raise
 
     def forget_agents(self, origin: str) -> None:
-        if self._agents_failed:
+        if self._closed:
             return
         names = [n for n, (o, _) in self._agents.items() if o == origin]
         self.agents(origin, AgentsRequest(remove=names))
@@ -247,7 +249,11 @@ def make_remote_parts(run) -> RemoteParts:
         require_checked_transport(os.environ)
         return NixlTransport(name, ucx_device=rs.rdma_device)
 
-    parts = RemoteParts(agent_name(config.node_id, run.node_epoch), make)
+    parts = RemoteParts(
+        agent_name(config.node_id, run.node_epoch),
+        make,
+        end_run=lambda reason: run.store.end_run(reason),
+    )
     parts.server = TcpRemoteServer(
         rs.listen,
         key,

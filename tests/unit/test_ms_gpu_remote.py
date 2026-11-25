@@ -42,6 +42,7 @@ from maru_common.storage_types import (
     KeyLocation,
     NotifyKind,
     Status,
+    StorageUnavailableError,
 )
 from maru_handler.client import AttachRefusedError
 from maru_handler.client.maru_client import MaruClient
@@ -630,10 +631,22 @@ def test_lost_registration_reply_is_retried_before_workers_connect(pair, monkeyp
     assert worker.attach_info.node_epoch == gpu.node_epoch
 
 
-def test_memory_restart_uses_new_pool_registrations(pair):
+@pytest.mark.parametrize("restart", ["stop", "add_peer_failure"])
+def test_memory_restart_uses_new_pool_registrations(pair, monkeypatch, restart):
     writer = store(pair)
     before = writer.attach_info.peers[0]
-    pair.memory.stop()
+    if restart == "add_peer_failure":
+
+        def refuse(metadata):
+            raise RuntimeError("peer metadata unavailable")
+
+        with monkeypatch.context() as patch:
+            patch.setattr(pair.memory.role.parts.transport, "add_peer", refuse)
+            with pytest.raises(StorageUnavailableError):
+                pair.client("b", load_only=True)
+        assert pair.memory.wait_finished(5) and pair.memory.new_run
+    else:
+        pair.memory.stop()
     wait_until(lambda: pair.gpu.wait_finished(0))
     replacement = StorageService(
         pair.memory.config,
@@ -651,6 +664,9 @@ def test_memory_restart_uses_new_pool_registrations(pair):
     )
     reader = pair.client("reader", load_only=True)
     assert reader.batch_retrieve(["kv"]) == [None]
+    wait_until(lambda: writer.node_epoch == pair.gpu.node_epoch)
+    wait_until(lambda: writer.credits.unused_bytes >= PAGE)
+    assert writer.batch_store(["after"], [writer.alloc(PAGE)]) == [True]
 
 
 def test_staging_budget_rejects_a_fifth_worker(pair):

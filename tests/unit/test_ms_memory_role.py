@@ -384,16 +384,12 @@ def test_memory_command_reports_key_errors_without_creating_a_transport(
     assert "cannot start" in capsys.readouterr().err
 
 
-def test_uncertain_agent_update_blocks_further_resource_growth_until_restart(memory):
+def test_uncertain_agent_update_ends_the_run_and_revokes_registrations(memory):
     worker = FakeTransport("actual-name")
     request = AgentsRequest(add=[AgentMetadata("declared-name", worker.metadata())])
     assert call(memory.ops.agents, A, request).status == Status.REJECTED
-    assert memory.parts._agents_failed
-    assert memory.parts.transport.agent.peers == {"actual-name"}
-    assert (
-        call(memory.ops.agents, A, AgentsRequest(remove=["declared-name"])).status
-        == Status.REJECTED
-    )
-    assert memory.reserve().status == Status.REJECTED
-    assert memory.parts.transport.agent.peers == {"actual-name"}
+    assert memory.node.wait_finished(5) and memory.node.new_run
+    assert memory.node.teardown_failed is None
+    assert not memory.parts.transport.agent.peers
+    assert not memory.parts.transport.agent.regs
     worker.close()
