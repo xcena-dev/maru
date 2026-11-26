@@ -11,9 +11,9 @@ The structure table describes the native connector; node store restrictions are 
 
 | KV cache structure | Models | Single GPU | Tensor parallel |
 |---|---|---|---|
-| Full attention (MHA, GQA), one KV cache group | Qwen3 (dense and MoE), GLM-4.5, GLM-4.6 | 🟢 | 🟢 |
+| Full attention (MHA, GQA), one KV cache group | Llama 3.1, Qwen3 (dense and MoE) | 🟢 | 🟢 |
 | Sliding window + full attention | gpt-oss | 🟢 | 🟢 |
-| Gated DeltaNet (Mamba-type) + full attention | Qwen3.5, Qwen3.6, Qwen3.8, Qwen3-Next | 🟢 | 🟢 |
+| Gated DeltaNet (Mamba-type) + full attention | Qwen3.5, Qwen3.6, Qwen3.8 (except Flash-Next), Qwen3-Next | 🟢 | 🟢 |
 | Sliding-window MLA + compressed MLA latent and indexer cache | DeepSeek-V4.1-Flash | 🟢 | 🟢 |
 | Attention groups whose KV heads differ in count or size | Gemma 4, MiMo-V2 | ❌ | ❌ |
 | DSA: MLA latent + indexer cache | DeepSeek-V3.2, GLM-5 | ❌ | ❌ |
@@ -21,7 +21,7 @@ The structure table describes the native connector; node store restrictions are 
 | Chunked local + full attention | Llama 4 | ❌ | ❌ |
 ```
 
-🟢 means that Maru stores and loads the KV cache structure, and ❌ that the connector refuses it at startup. Models with several KV cache groups also need the settings in {ref}`vllm-hybrid-models`; DeepSeek-V4.1-Flash has notes of its own in {ref}`vllm-deepseek-v41`.
+🟢 means that Maru stores and loads the KV cache of such models, and ❌ that the connector refuses them at startup. Each model family in a 🟢 row has been run with its own weights while Maru stored and loaded its KV cache. Models with several KV cache groups also need the settings in {ref}`vllm-hybrid-models`; DeepSeek-V4.1-Flash has notes of its own in {ref}`vllm-deepseek-v41`.
 
 Pipeline parallelism and decode or prefill context parallelism are refused at startup. See {ref}`vllm-tensor-parallelism` for how each rank stores its part of the KV cache.
 

@@ -169,11 +169,6 @@ table.maru-supported-models tbody td:nth-child(4) {
     text-align: center;
 }
 
-/* Supported Models: keep model names in "Tested with" on one line */
-table.maru-supported-models tbody td:nth-child(5) {
-    white-space: nowrap;
-}
-
 /* Keep generated index columns scrollable inside a narrow content area. */
 .genindextable {
     display: block;
