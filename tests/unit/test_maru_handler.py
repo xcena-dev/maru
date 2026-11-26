@@ -590,7 +590,7 @@ class TestMaruHandlerCoverage:
         handler.close()
 
     def test_batch_store_overwrite_existing_key(self):
-        """batch_store skips keys already in local map — idempotent, returns True."""
+        """batch_store skips a key the server still has — idempotent, returns True."""
         handler = _make_mock_handler()
 
         # First store
@@ -600,12 +600,12 @@ class TestMaruHandlerCoverage:
         handler.store(key="42", handle=h)
         assert "42" in handler._key_to_location
 
-        # batch_exists_kv mock (Phase 1 check): key not on server either
+        # batch_exists_kv mock (Phase 1 check): the server has the key
         batch_exists_resp = MagicMock()
-        batch_exists_resp.results = [False]
+        batch_exists_resp.results = [True]
         handler._rpc.batch_exists_kv = MagicMock(return_value=batch_exists_resp)
 
-        # batch_store with same key — should skip via local map check, return True
+        # batch_store with same key — skipped, return True
         h2 = handler.alloc(size=3)
         buf2 = h2.buf
         buf2[:3] = b"new"
@@ -693,6 +693,17 @@ class TestMaruHandlerCoverage:
 
         results = handler.batch_exists(keys=["1", "2", "3"])
         assert results == [False, False, False]
+
+        handler.close()
+
+    def test_batch_exists_strict_raises_when_the_rpc_fails(self):
+        """strict=True: a failed request is not reported as absent keys."""
+        handler = _make_mock_handler()
+
+        handler._rpc.batch_exists_kv = MagicMock(side_effect=RuntimeError("RPC failed"))
+
+        with pytest.raises(RuntimeError, match="RPC failed"):
+            handler.batch_exists(keys=["1", "2", "3"], strict=True)
 
         handler.close()
 
@@ -876,7 +887,7 @@ class TestMaruHandlerCoverage:
         handler.close()
 
     def test_store_overwrite_existing_key(self):
-        """store() now skips duplicates — second store is a no-op via local map check."""
+        """store() skips duplicates — a second store of a key the server has is a no-op."""
         handler = _make_mock_handler()
 
         h1 = handler.alloc(size=2)
@@ -885,7 +896,8 @@ class TestMaruHandlerCoverage:
         assert result1 is True
         assert "1" in handler._key_to_location
 
-        # Second store same key: skipped via local _key_to_location check, returns True
+        # Second store same key: the server has it, so it is skipped, returns True
+        handler._rpc.exists_kv.return_value = True
         h2 = handler.alloc(size=2)
         h2.buf[:2] = b"v2"
         result2 = handler.store(key="1", handle=h2)
@@ -1783,10 +1795,85 @@ class TestStoreWithHandle:
         h0.buf[:5] = b"first"
         handler.store(key="42", handle=h0)
 
+        handler._rpc.exists_kv.return_value = True
         handle = handler.alloc(size=64)
         result = handler.store(key="42", handle=handle)
         assert result is True
         assert handler._rpc.register_kv.call_count == 1
+        handler.close()
+
+    def test_store_again_after_another_client_deleted_the_key(self):
+        """A key the server no longer has is registered again, its old page freed."""
+        handler = _make_mock_handler()
+
+        h0 = handler.alloc(size=5)
+        h0.buf[:5] = b"first"
+        handler.store(key="42", handle=h0)
+        old = handler._key_to_location["42"]
+        used = handler._owned.get_stats()
+
+        # Another client deleted the key: exists_kv (a MagicMock) answers False.
+        handler._rpc.exists_kv.return_value = False
+        h1 = handler.alloc(size=6)
+        h1.buf[:6] = b"second"
+        assert handler.store(key="42", handle=h1) is True
+
+        assert handler._rpc.register_kv.call_count == 2
+        new = handler._key_to_location["42"]
+        assert new == (h1._region_id, h1._page_index) and new != old
+        # The deleted object's page went back: no more pages in use than before.
+        assert handler._owned.get_stats() == used
+        handler.close()
+
+    def test_batch_store_again_after_another_client_deleted_a_key(self):
+        """batch_store registers a deleted key again and frees its old page."""
+        handler = _make_mock_handler()
+        for key in ("1", "2"):
+            h = handler.alloc(size=4)
+            h.buf[:4] = b"data"
+            handler.store(key=key, handle=h)
+        old = dict(handler._key_to_location)
+        used = handler._owned.get_stats()
+
+        # Another client deleted key 1; the server still has key 2.
+        exists = MagicMock()
+        exists.results = [False, True]
+        handler._rpc.batch_exists_kv = MagicMock(return_value=exists)
+        registered = MagicMock()
+        registered.success = True
+        registered.results = [True]
+        handler._rpc.batch_register_kv = MagicMock(return_value=registered)
+
+        handles = [handler.alloc(size=4), handler.alloc(size=4)]
+        assert handler.batch_store(keys=["1", "2"], handles=handles) == [True, True]
+
+        (entries,) = handler._rpc.batch_register_kv.call_args.args
+        assert [e[0] for e in entries] == ["1"]
+        assert handler._key_to_location["1"] == (
+            handles[0]._region_id,
+            handles[0]._page_index,
+        )
+        assert handler._key_to_location["1"] != old["1"]
+        assert handler._key_to_location["2"] == old["2"]
+        assert handler._owned.get_stats() == used
+        handler.close()
+
+    def test_batch_store_keeps_local_keys_when_the_server_cannot_be_asked(self):
+        """Without an answer from the server a locally known key is not dropped."""
+        handler = _make_mock_handler()
+        h = handler.alloc(size=4)
+        handler.store(key="1", handle=h)
+        old = handler._key_to_location["1"]
+        used = handler._owned.get_stats()
+
+        handler._rpc.batch_exists_kv = MagicMock(side_effect=RuntimeError("RPC failed"))
+        handler._rpc.batch_register_kv = MagicMock()
+        h2 = handler.alloc(size=4)
+        assert handler.batch_store(keys=["1"], handles=[h2]) == [True]
+
+        handler._rpc.batch_register_kv.assert_not_called()
+        assert handler._key_to_location["1"] == old
+        assert handler._owned.get_stats() == used
         handler.close()
 
     def test_store_with_handle_register_race(self):
