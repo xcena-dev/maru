@@ -141,10 +141,10 @@ def load_into(
     worker: MaruWorkerConnector,
     dst: list[torch.Tensor],
     attn_metadata,
-    parked: bool = False,
+    is_async: bool = False,
 ):
-    """One forward that loads both chunks into the paged KV ``dst``. A
-    ``parked`` load is one vLLM holds in WAITING_FOR_REMOTE_KVS; with CPU
+    """One forward that loads both chunks into the paged KV ``dst``. An
+    async load (``is_async``) is one vLLM holds in WAITING_FOR_REMOTE_KVS; with CPU
     caches it runs in this call and is reported finished at once."""
     forward = SimpleNamespace(
         no_compile_layers={
@@ -161,7 +161,7 @@ def load_into(
                 block_ids=list(range(NUM_BLOCKS)),
                 is_store=False,
                 num_matched_chunks=PROMPT // CHUNK,
-                deferred_load=parked,
+                async_load=is_async,
             )
         ]
     )
@@ -423,7 +423,7 @@ def test_scheduler_checks_a_replicated_slice_once():
 
 
 def test_worker_takes_mla_from_the_model_config():
-    """Not from attention metadata, which a parked load can run without."""
+    """Not from attention metadata, which an async load can run without."""
     mla = MaruKVConnector(fake_vllm_config(1, 1, use_mla=True), KVConnectorRole.WORKER)
     assert mla._worker._use_mla and mla._worker._kv_planes == 1
     gqa = MaruKVConnector(fake_vllm_config(1, 8), KVConnectorRole.WORKER)
@@ -489,7 +489,7 @@ def test_worker_trace_lines_end_with_the_tp_rank(monkeypatch, capsys, tp_size, r
     landed.elapsed_time.return_value = 1.0
     poller.add_load("r1", landed, landed, landed, 1024, NUM_LAYERS)
     poller.add_step(1, 0.0, landed, landed, [])
-    worker._deferred_done.add("r1")
+    worker._async_load_done.add("r1")
 
     poller.poll()
     assert worker.get_finished_loading() == {"r1"}
@@ -557,7 +557,7 @@ def test_attention_free_model_is_refused_under_tp():
 
 
 @pytest.mark.parametrize(
-    ("tp_size", "extra", "parked"),
+    ("tp_size", "extra", "is_async"),
     [
         (2, {}, True),
         (2, {"maru_async_load": True}, True),
@@ -566,21 +566,21 @@ def test_attention_free_model_is_refused_under_tp():
         (1, {}, False),
     ],
 )
-def test_tp_parks_every_load(monkeypatch, tp_size, extra, parked):
-    """An inline load runs in the step that computes its request, so a rank
+def test_tp_loads_every_hit_async(monkeypatch, tp_size, extra, is_async):
+    """A sync load runs in the step that computes its request, so a rank
     whose load failed would compute from unfilled KV with the others, which
-    would store the result (#135). Above TP=1 loads are parked unless told
-    otherwise, and inline loads are refused; TP=1 keeps the inline default."""
+    would store the result (#135). Above TP=1 loads are async unless told
+    otherwise, and sync loads are refused; TP=1 keeps the sync default."""
     monkeypatch.setattr(connector_module, "_tp_rank", lambda: 1)
     config = fake_vllm_config(tp_size, 8, extra=extra)
-    if parked is not None:
+    if is_async is not None:
         connector = MaruKVConnector(config, KVConnectorRole.SCHEDULER)
-        assert connector._scheduler._deferred_loading is parked
+        assert connector._scheduler._async_loading is is_async
         connector = MaruKVConnector(config, KVConnectorRole.WORKER)
         knob = connector_module._get_knob(
             connector._worker._extra_config, "maru_async_load"
         )
-        assert bool(knob) is parked
+        assert bool(knob) is is_async
         return
     for role in (KVConnectorRole.SCHEDULER, KVConnectorRole.WORKER):
         with pytest.raises(ValueError, match="maru_async_load=false") as refusal:
@@ -589,13 +589,13 @@ def test_tp_parks_every_load(monkeypatch, tp_size, extra, parked):
 
 
 @pytest.mark.parametrize("failing_rank", [0, 1], ids=["writer", "non-writer"])
-def test_a_parked_load_failing_on_one_rank_fails_it_for_every_rank(failing_rank):
+def test_an_async_load_failing_on_one_rank_fails_it_for_every_rank(failing_rank):
     """#135: with an MLA latent, rank 0 stores and rank 1 only loads. Whichever
-    rank's parked load fails, it reports the request loaded with its blocks
+    rank's async load fails, it reports the request loaded with its blocks
     failed, and vLLM merges every rank's report before the request computes:
     the request comes back finished only once both ranks report, with the
     failed blocks for vLLM to recompute on every rank. Nothing is stored
-    while the request is parked."""
+    while the request waits for its async load."""
     from vllm.distributed.kv_transfer.kv_connector.utils import KVOutputAggregator
     from vllm.v1.outputs import KVConnectorOutput
 
@@ -617,7 +617,7 @@ def test_a_parked_load_failing_on_one_rank_fails_it_for_every_rank(failing_rank)
     reports = []
     for worker in workers:
         dst = [torch.zeros_like(layer) for layer in kv]
-        load_into(worker, dst, mla_metadata(), parked=True)
+        load_into(worker, dst, mla_metadata(), is_async=True)
         reports.append(
             SimpleNamespace(
                 kv_connector_output=KVConnectorOutput(
@@ -638,9 +638,9 @@ def test_tp_fails_a_layerwise_overlap_load_whose_copies_it_cannot_queue():
     """At TP=1 the resumed forward issues such a load's copies itself. Under
     TP that would load in the step that computes the request, where a rank
     whose copies failed is the only one that knows (#135), so the load fails
-    while the request is parked and vLLM recomputes it on every rank."""
+    while the request waits for its async load and vLLM recomputes it on every rank."""
     from maru_common.kv_shard import tp_part_shard
-    from tests.unit.vllm_connector_helpers import deferred_req_meta
+    from tests.unit.vllm_connector_helpers import load_req_meta
 
     worker = make_worker(
         BLOCK,
@@ -656,20 +656,20 @@ def test_tp_fails_a_layerwise_overlap_load_whose_copies_it_cannot_queue():
         for i in range(PROMPT // CHUNK)
     ]
     worker._issue_layerwise_copies_offthread = lambda *args, **kwargs: None
-    meta = deferred_req_meta(
+    meta = load_req_meta(
         token_ids=list(range(PROMPT)),
         block_ids=list(range(NUM_BLOCKS)),
         num_matched_chunks=PROMPT // CHUNK,
     )
     meta.layerwise_load = True
 
-    worker._deferred_load_job(
+    worker._async_load_job(
         meta, [("l0", torch.zeros(2, 16, 4, 1), 0)], torch.device("cpu")
     )
 
     assert worker.get_finished_loading() == {"r1"}
     assert worker.take_failed_load_blocks() == set(range(NUM_BLOCKS))
-    assert worker._deferred_layerwise_loads == {}
+    assert worker._async_layerwise_loads == {}
 
 
 PAGE = 6 * 1024 * 1024

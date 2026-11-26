@@ -363,8 +363,8 @@ def hit_chunks(
 class GroupAdmission:
     """The blocks vLLM gives one request in one KV cache group.
 
-    vLLM allocates the blocks of every group, the groups Maru skips included,
-    from one block pool, so a parked load is admitted against their sum.
+    vLLM allocates every group's blocks from the same pool. Admission for an
+    async load therefore counts even the groups Maru skips.
 
     Attributes:
         block_size: Tokens per block in the group.
@@ -452,7 +452,7 @@ def check_multi_group_support(
     block_size: int,
     use_layerwise: bool,
     speculative_method: str | None,
-    inline_loads: bool,
+    sync_loads: bool,
 ) -> None:
     """Reject group combinations the connector cannot store correctly.
 
@@ -460,7 +460,7 @@ def check_multi_group_support(
     Several groups are supported in chunkwise (packed) format with full
     attention, sliding window, Mamba (``align``) and MLA groups whose
     attention groups share one KV shape, but not a Mamba group beside an MLA
-    group, with parked loads; in layerwise format only when every stored
+    group, with async loads; in layerwise format only when every stored
     group is an MLA group (DeepSeek-V4.1). The one speculative decoding
     method supported is DSpark (``DSPARK_METHOD``), without a Mamba group:
     vLLM puts its draft layers in groups like any other layer (DeepSeek-V4.1's
@@ -479,9 +479,9 @@ def check_multi_group_support(
         use_layerwise: ``maru_use_layerwise``.
         speculative_method: The speculative decoding method configured, or
             None without speculative decoding.
-        inline_loads: Whether loads run inline (``maru_async_load`` set to
-            false; ``MaruKVConnector`` turns it on for several groups unless
-            set).
+        sync_loads: Whether loads run in the forward step
+            (``maru_async_load=false``). With several groups, async loads are
+            the default.
 
     Raises:
         ValueError: With the reason and the setting to change.
@@ -568,16 +568,16 @@ def check_multi_group_support(
             f"to use the block size {block_size} (got "
             f"{sorted({g.block_size for g in stored})}){one_group_hint(groups)}"
         )
-    if inline_loads:
-        # A failed inline load is reported by its blocks, which vLLM 0.31+
+    if sync_loads:
+        # A failed sync load is reported by its blocks, which vLLM 0.31+
         # refuses with several groups: block ids are unique only within a
-        # group, and its per-request report takes only parked requests. vLLM
-        # 0.30 takes it, but under "recompute" its V2 model runner does not
-        # rewind its device-side state (vllm-project/vllm#49250).
+        # group. Only requests waiting for KV can report failure by request
+        # ID. vLLM 0.30 accepts block IDs, but its V2 model runner does not
+        # rewind device-side state under "recompute" (vllm-project/vllm#49250).
         raise ValueError(
             "MaruKVConnector loads a model with several KV cache groups only "
             "between steps (maru_async_load=true, its default for such a "
-            "model): vLLM 0.31 and later stop the engine on a failed inline "
+            "model): vLLM 0.31 and later stop the engine on a failed sync "
             "load of such a model (xcena-dev/maru#126), and vLLM 0.30 "
             "recomputes one into wrong output under kv_load_failure_policy="
             "'recompute' (vllm-project/vllm#49250). Remove "

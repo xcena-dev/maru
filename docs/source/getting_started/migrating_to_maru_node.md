@@ -101,9 +101,9 @@ Keys in the first column describe old configurations. Use only the current colum
 | Agent `--memory-generation-poll-s`, `--memory-generation-grace-s` | `region_extension.generation_poll_s`, `.generation_grace_s` | Positive intervals; defaults `0.1` and `2.0` seconds |
 | Agent `--max-hint-requests` | `region_extension.hint_requests_max` | Positive integer, default `4096` |
 | Agent `--allow-unchecked-transport` | No equivalent | Registration revocation requires checked transport |
-| `maru_async_load`, `maru_async_store` | Same connector keys | Node advice defaults both to `false`; async scheduling, TP or multiple KV groups require deferred loads |
+| `maru_async_load`, `maru_async_store` | Same connector keys | Node advice defaults both to `false`; async scheduling, TP or multiple KV groups require async loads |
 
-Use `maru_lookup_timeout_ms` (default `100`) for foreground lookup RPC timeouts, `maru_credit_wait_ms` (default `0`) for the per-step engine-thread store credit wait, and `maru_load_read_depth` (default `2`, minimum `1`) for deferred reads in flight.
+Use `maru_lookup_timeout_ms` (default `100`) for foreground lookup RPC timeouts, `maru_credit_wait_ms` (default `0`) for the per-step engine-thread store credit wait, and `maru_load_read_depth` (default `2`, minimum `1`) for async-load reads in flight.
 
 ## Support matrix
 
@@ -120,9 +120,9 @@ The previous column identifies the replaced behavior; it is not a list of availa
 | Several memory endpoints per GPU service | Multiple remote agents/pools | No; one `url` |
 | Several memory nodes mapping the same region | Shared-pool remote agents | No; each memory node owns its regions |
 | Several Catalogs per deployment | Remote server URL list | No |
-| TP, DP, multiple KV groups | Restricted on `cpu` and `mixed` | Yes; TP and multiple groups require deferred loads |
+| TP, DP, multiple KV groups | Restricted on `cpu` and `mixed` | Yes; TP and multiple groups require async loads |
 | Synchronous load | Available with restrictions | Yes with one group and TP=1, with async scheduling off |
-| Deferred load and asynchronous store | Remote only among removed backends | Yes; deferred load requires vLLM 0.16+ |
+| Async load and async store | Remote only among removed backends | Yes; async load requires vLLM 0.16+ |
 | Layerwise format and overlapped load | Rejected by removed backends | `dram` and `local_cxl` only; remote rejects both at startup |
 | CUDA graphs | Removed backends required eager execution | Yes |
 | Pipeline or context parallelism | Rejected | Rejected |

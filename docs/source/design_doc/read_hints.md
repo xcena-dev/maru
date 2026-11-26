@@ -29,7 +29,7 @@ The extension receives `{"handle": {"region_id", "offset", "length", ...}, "offs
 
 ## Configuration and failure handling
 
-`maru_read_hints=true` enables scheduler hints with deferred loading. `maru_read_hint_on_arrival=true` requests an earlier advisory hint through a vLLM hook; an incompatible hook logs a warning and keeps lookup-time hints. Hints are queued outside the load path. A full hint queue drops advisory work; stale or rejected hints do not change the load result.
+`maru_read_hints=true` enables scheduler hints with async loads. `maru_read_hint_on_arrival=true` requests an earlier advisory hint through a vLLM hook; an incompatible hook logs a warning and keeps lookup-time hints. Hints are queued outside the load path. A full hint queue drops advisory work; stale or rejected hints do not change the load result.
 
 Memory nodes advertise accepted actions. A `local_cxl` memory node loads its extension from the `maru.region_extensions` entry-point group:
 

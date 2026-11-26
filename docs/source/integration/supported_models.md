@@ -29,7 +29,7 @@ Pipeline parallelism and decode or prefill context parallelism are refused at st
 
 `cxl` and node-local `dram` and `local_cxl` use the connector's mapped-pool transfer modes. Remote nodes use worker-owned registered staging and direct RDMA, and accept chunkwise storage only: layerwise format and overlapped loads are rejected. The node namespace includes model and KV geometry; different TP sizes do not share node keys.
 
-TP and multiple KV groups require deferred loading. Requests containing multimodal inputs, LoRA adapters, cache salts or prompt embeddings are computed without Maru caching. These requests can still run in the engine. See {ref}`vllm-hybrid-models` for group and MLA format restrictions and {doc}`../getting_started/migrating_to_maru_node` for the store support matrix.
+TP and multiple KV groups require async loads. Requests containing multimodal inputs, LoRA adapters, cache salts or prompt embeddings are computed without Maru caching. These requests can still run in the engine. See {ref}`vllm-hybrid-models` for group and MLA format restrictions and {doc}`../getting_started/migrating_to_maru_node` for the store support matrix.
 
 ## Reporting results
 

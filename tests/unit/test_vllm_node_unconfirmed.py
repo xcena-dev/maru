@@ -4,7 +4,7 @@
 stops the worker and keeps what the copies use; once stopped nothing is given
 back, published or reported; any other error is handled as before.
 
-The node load paths (inline and loader-thread batches, parked loads, FETCHes
+The node load paths (sync and loader-thread batches, async loads, FETCHes
 in flight) and store paths (WRITE_DONE, write-behind, chunks waiting for
 credit) on fake handlers and streams; CPU only."""
 
@@ -34,6 +34,7 @@ from tests.unit.test_vllm_node import (
     Done,
     FailedWait,
     Pending,
+    async_loader,
     behind_meta,
     external_meta,
     fetching_loader,
@@ -43,12 +44,11 @@ from tests.unit.test_vllm_node import (
     lease,
     node_store_worker,
     page,
-    park,
-    park_group,
-    parked_loader,
     pinning_worker,
     released,
     run,
+    run_async_group_load,
+    run_async_load,
     sentinel_kv,
     stopped,
     submit,
@@ -67,7 +67,7 @@ from tests.unit.vllm_connector_helpers import (
 
 
 def inline_reader(reads: list):
-    """A node worker whose inline loads read ``reads``."""
+    """A node worker whose sync loads read ``reads``."""
     worker = pinning_worker()
     worker._handler.retrieve_capacity.return_value = None
     worker._handler.batch_retrieve.side_effect = lambda keys, **_: reads[: len(keys)]
@@ -164,7 +164,7 @@ def test_copy_ahead_wait_cuda_error_keeps_all_batches(monkeypatch):
     gc.collect()
     assert len(alive) == 2 and all(ref() is not None for ref in alive)
     worker._handler.release_retrieved.assert_not_called()
-    assert not worker._failed_load_blocks and not worker._deferred_done
+    assert not worker._failed_load_blocks and not worker._async_load_done
     assert stopped(worker, "req r1")
 
 
@@ -196,8 +196,8 @@ def test_an_inline_node_copy_failing_otherwise_recomputes_as_before():
 
 def test_a_loader_batch_copy_cuda_error_keeps_every_batch_still_copying(monkeypatch):
     """The first batch's copies may still run with the second's: both keep
-    their reads, the load neither parks nor is reported."""
-    worker, stream, log, reads = parked_loader(monkeypatch)
+    their reads, the load is neither left copying nor reported."""
+    worker, stream, log, reads = async_loader(monkeypatch)
     copies = []
 
     def copy(layers, entries, attn, stream=None, wait=True):
@@ -207,16 +207,16 @@ def test_a_loader_batch_copy_cuda_error_keeps_every_batch_still_copying(monkeypa
         return set()
 
     worker._load_packed = copy
-    park(worker, "r1")
+    run_async_load(worker, "r1")
     worker._handler.release_retrieved.assert_not_called()
     assert holds(worker, reads[0]) and holds(worker, reads[1])
-    assert not worker._parked_loads and not worker._deferred_done
+    assert not worker._copying_async_loads and not worker._async_load_done
     assert stopped(worker, "req r1")
 
 
 def test_a_loader_wait_for_room_that_raises_a_cuda_error_stops(monkeypatch):
     """One slot: the second batch waits for the first one's copies."""
-    worker, stream, log, reads = parked_loader(monkeypatch, slots=1)
+    worker, stream, log, reads = async_loader(monkeypatch, slots=1)
 
     def first_waits(event):
         event.wait_error = cuda_error()
@@ -224,11 +224,11 @@ def test_a_loader_wait_for_room_that_raises_a_cuda_error_stops(monkeypatch):
 
     record = stream.record_event
     stream.record_event = lambda: first_waits(record())
-    park(worker, "r1")
+    run_async_load(worker, "r1")
     assert log == ["read 0", "copy r1", "wait e0"]
     worker._handler.release_retrieved.assert_not_called()
     assert holds(worker, reads[0])
-    assert not worker._deferred_done and not worker._failed_load_blocks
+    assert not worker._async_load_done and not worker._failed_load_blocks
     assert stopped(worker, "req r1")
 
 
@@ -249,34 +249,34 @@ def test_an_answer_taken_once_stopped_is_kept_uncopied(monkeypatch):
     assert "copy r1" not in log
     worker._handler.release_retrieved.assert_not_called()
     assert holds(worker, reads[0]) and holds(worker, reads[1])
-    assert not worker._deferred_done and not worker._inflight_deferred_req_ids
+    assert not worker._async_load_done and not worker._inflight_async_load_req_ids
     assert stopped(worker, "req r0")
 
 
-def test_vllms_poll_once_stopped_gives_back_no_parked_batch(monkeypatch):
-    """Even batches whose copies ended stay with the parked load."""
-    worker, stream, log, reads = parked_loader(monkeypatch)
-    park(worker, "r1")
+def test_vllms_poll_once_stopped_gives_back_no_async_batch(monkeypatch):
+    """Even batches whose copies ended stay with the async load."""
+    worker, stream, log, reads = async_loader(monkeypatch)
+    run_async_load(worker, "r1")
     for event in stream.events:
         event.ended = True
     stop(worker)
-    assert worker._settle_parked_loads() is False
+    assert worker._settle_copying_async_loads() is False
     with pytest.raises(_UnconfirmedCopyError):
         worker.get_finished_loading()
     worker._handler.release_retrieved.assert_not_called()
-    assert len(worker._parked_loads["r1"][1]) == 2
+    assert len(worker._copying_async_loads["r1"][1]) == 2
 
 
-def test_a_parked_group_query_failing_otherwise_recomputes_it(monkeypatch):
+def test_an_async_group_query_failing_otherwise_recomputes_it(monkeypatch):
     """Not a CUDA error: the load is recomputed by its id, its reads keep
     their slots, and the worker goes on."""
     worker, stream, log, reads = group_loader(monkeypatch)
-    park_group(worker, "r1")
+    run_async_group_load(worker, "r1")
     stream.events[0].error = RuntimeError("query failed")
     assert worker.get_finished_loading() == {"r1"}
     assert worker.take_failed_recv_req_ids({"r1"}) == {"r1"}
     worker._handler.release_retrieved.assert_not_called()
-    assert not worker._parked_loads and worker._stopped is None
+    assert not worker._copying_async_loads and worker._stopped is None
 
 
 def test_a_layerwise_drain_cuda_error_keeps_retained_and_queued_reads():
@@ -284,15 +284,15 @@ def test_a_layerwise_drain_cuda_error_keeps_retained_and_queued_reads():
     vLLM reuses them, and keeps the reads never issued and those issued."""
     worker = pinning_worker()
     retained, queued = [lease("retained")], [lease("queued")]
-    worker._deferred_layerwise_loads["r1"] = ("meta", 1, torch.zeros(1), retained)
-    worker._deferred_layerwise_events["r2"] = {"layer": FailedWait()}
-    worker._deferred_events["r2"] = Pending()
-    worker._deferred_refs["r2"] = [queued]
+    worker._async_layerwise_loads["r1"] = ("meta", 1, torch.zeros(1), retained)
+    worker._async_layerwise_events["r2"] = {"layer": FailedWait()}
+    worker._async_load_events["r2"] = Pending()
+    worker._async_load_refs["r2"] = [queued]
     with pytest.raises(_UnconfirmedCopyError):
         worker._drain_layerwise_copies({"r1", "r2"}, report=True)
     worker._handler.release_retrieved.assert_not_called()
     assert holds(worker, retained[0]) and holds(worker, queued[0])
-    assert not worker._deferred_done
+    assert not worker._async_load_done
 
 
 @pytest.mark.parametrize("node", [True, False], ids=["maru_node", "cxl"])
@@ -332,19 +332,19 @@ def test_a_loader_job_whose_streams_cannot_be_drained_keeps_its_reads():
     worker = inline_reader(reads)
     worker._issue_layerwise_copies_offthread = MagicMock(side_effect=_QueuedCopyError)
     worker._layerwise_streams = [BrokenWait()]
-    worker._inflight_deferred_req_ids.add("r1")
+    worker._inflight_async_load_req_ids.add("r1")
     meta = external_meta(True, layerwise_load=True)
     layers = [(f"model.layers.{i}.self_attn", None, i) for i in range(2)]
-    worker._deferred_load_job(meta, layers, torch.device("cpu"))
+    worker._async_load_job(meta, layers, torch.device("cpu"))
     worker._handler.release_retrieved.assert_not_called()
-    assert worker._deferred_done == {"r1"}
+    assert worker._async_load_done == {"r1"}
     assert worker.take_failed_load_blocks() == {1, 2}
     assert worker._stopped is None
 
 
-def test_shutdown_once_stopped_keeps_parked_reads_and_the_node_handler(monkeypatch):
-    worker, stream, log, reads = parked_loader(monkeypatch)
-    park(worker, "r1")
+def test_shutdown_once_stopped_keeps_async_reads_and_the_node_handler(monkeypatch):
+    worker, stream, log, reads = async_loader(monkeypatch)
+    run_async_load(worker, "r1")
     handler = worker._handler
     worker._node_handler = handler
     stop(worker)
@@ -352,7 +352,7 @@ def test_shutdown_once_stopped_keeps_parked_reads_and_the_node_handler(monkeypat
     handler.release_retrieved.assert_not_called()
     handler.close.assert_not_called()
     assert worker._handler is handler and worker._node_handler is handler
-    assert len(worker._parked_loads["r1"][1]) == 2 and is_kept(worker)
+    assert len(worker._copying_async_loads["r1"][1]) == 2 and is_kept(worker)
 
 
 def test_read_leases_are_kept_once_stopped():
@@ -471,8 +471,8 @@ def test_a_write_behind_job_after_a_stop_publishes_nothing():
     handle, slab = page(), torch.zeros(4)
     wait_on(worker, "r", "k", "d")
     stop(worker)
-    deferred = [("d", slab, {})]
-    worker._finish_write_behind_store(Done(), ["k"], [handle], [], deferred)
+    credit_waiting = [("d", slab, {})]
+    worker._finish_write_behind_store(Done(), ["k"], [handle], [], credit_waiting)
     worker._handler.store_async.assert_not_called()
     worker._handler.free.assert_not_called()
     assert worker._credit_executor is None
@@ -483,14 +483,14 @@ def test_a_write_behind_job_after_a_stop_publishes_nothing():
 def test_a_credit_wait_after_a_stop_allocates_nothing():
     worker = write_behind_worker()
     slab = torch.zeros(4)
-    worker._deferred_bytes = 16
+    worker._credit_wait_bytes = 16
     stop(worker)
-    deferred = [("d", slab, {})]
-    worker._store_after_credit(worker._handler, deferred)
+    credit_waiting = [("d", slab, {})]
+    worker._store_after_credit(worker._handler, credit_waiting)
     worker._handler.alloc.assert_not_called()
     worker._handler.store_async.assert_not_called()
-    assert deferred == [("d", slab, {})] and holds(worker, slab)
-    assert worker._deferred_bytes == 16
+    assert credit_waiting == [("d", slab, {})] and holds(worker, slab)
+    assert worker._credit_wait_bytes == 16
 
 
 def test_a_node_store_copy_cuda_error_stops_the_step(monkeypatch):

@@ -43,16 +43,16 @@ from tests.unit.test_vllm_kv_groups import (
     unbounded_kv_caches,
 )
 from tests.unit.test_vllm_node import (
+    async_meta,
     behind_meta,
     fetching_loader,
     group_loader,
     in_flight,
     node_extra,
-    park_group,
-    parked_meta,
     pinning_worker,
     released,
     run,
+    run_async_group_load,
     submit,
     wait_worker,
 )
@@ -95,7 +95,7 @@ def group_worker(kind=GROUP_FULL, layerwise=False):
         False,
         num_matched_chunks=1,
         group_block_ids=[[1, 2]],
-        deferred_load=True,
+        async_load=True,
     )
     return worker, cache, meta
 
@@ -140,7 +140,7 @@ def test_group_load_copy_errors_keep_the_actual_tensor_arguments(monkeypatch, ki
 
 
 @pytest.mark.parametrize("failure", ["kernel", "record", "none"])
-def test_group_kernel_arguments_survive_launch_and_park(monkeypatch, failure):
+def test_group_kernel_arguments_survive_launch_while_left_copying(monkeypatch, failure):
     worker, cache, meta = group_worker()
     read = CpuReadLease(memoryview(bytearray(cache.group.object_bytes(8))), "a", None)
     worker._group_load_plan = lambda _: (1, [(cache, 0, None)], ["a"])
@@ -337,22 +337,22 @@ def test_shared_group_chunks_are_published_once_with_immediate_replies():
 def test_loader_failures_finish_the_request_and_its_accounting(group, failure):
     worker = pinning_worker()
     worker._multi_group = group
-    meta = parked_meta("r1")
+    meta = async_meta("r1")
     if group:
         meta = dataclasses.replace(meta, group_block_ids=[meta.block_ids])
-    worker._inflight_deferred_req_ids.add("r1")
+    worker._inflight_async_load_req_ids.add("r1")
     worker._abandoned_req_ids.add("r1")
     job = MagicMock()
 
     if failure == "submit":
-        worker._deferred_executor = MagicMock()
-        worker._deferred_executor.submit.side_effect = RuntimeError("executor closed")
+        worker._async_load_executor = MagicMock()
+        worker._async_load_executor.submit.side_effect = RuntimeError("executor closed")
         worker._submit_load_job(meta, job)
     else:
         worker._loader_jobs = 1
         job.side_effect = StorageUnavailableError("catalog closed")
         worker._run_load_job(meta, job)
-    assert worker._loader_jobs == 0 and not worker._inflight_deferred_req_ids
+    assert worker._loader_jobs == 0 and not worker._inflight_async_load_req_ids
     assert not worker._abandoned_req_ids and worker._stopped is None
     assert worker.get_finished_loading() == {"r1"}
     if group:
@@ -417,15 +417,15 @@ def test_node_event_record_failure_drains_and_cleans_the_whole_batch(
     if cuda_drain_error:
         assert worker._stopped is not None
         assert "r1" in worker._request_pending_store_keys
-        assert worker._deferred_bytes == (2 - ready) * 64
+        assert worker._credit_wait_bytes == (2 - ready) * 64
         worker._handler.free.assert_not_called()
     else:
-        assert worker._stopped is None and worker._deferred_bytes == 0
+        assert worker._stopped is None and worker._credit_wait_bytes == 0
         assert worker._handler.free.call_count == ready
         assert not worker._pending_store_keys and not worker._store_key_waiters
         assert worker.get_finished_saving({"r1"}) == {"r1"}
         worker.shutdown()
-        assert worker._deferred_bytes == 0
+        assert worker._credit_wait_bytes == 0
 
 
 @pytest.mark.parametrize("bounded", [True, False])
@@ -457,14 +457,14 @@ def test_deepseek_step_credit_counts_only_stored_layers_and_markers(bounded, lay
 
 
 @pytest.mark.parametrize("slots", range(1, 8))
-def test_group_load_uses_free_slots_before_waiting_for_parked_copies(
+def test_group_load_uses_free_slots_before_waiting_for_async_load_copies(
     monkeypatch, slots
 ):
     worker, stream, log, reads = group_loader(
         monkeypatch, slots=max(2, slots), pipeline=None
     )
     assert connector_module._LOAD_PIPELINE_CHUNKS == 8
-    park_group(worker, "r1")
+    run_async_group_load(worker, "r1")
     first = stream.events[0]
     assert log == ["read 0", "copy r1"]
     worker._handler.retrieve_capacity.side_effect = lambda _wanted=None: (
@@ -475,7 +475,7 @@ def test_group_load_uses_free_slots_before_waiting_for_parked_copies(
         [(None, i, None) for i in range(5)],
         list("abcde"),
     )
-    park_group(worker, "r2")
+    run_async_group_load(worker, "r2")
     if slots > 2:
         assert log[2:4] == ["read 2", "copy r2"]
         assert len(worker._handler.batch_retrieve.call_args_list[1].args[0]) == min(
@@ -513,7 +513,7 @@ def test_group_load_uses_free_slots_before_waiting_for_parked_copies(
 
 def test_a_queued_copy_error_is_logged_without_a_second_drain(monkeypatch, caplog):
     worker = pinning_worker()
-    meta = parked_meta("r1")
+    meta = async_meta("r1")
     reads = [CpuReadLease(memoryview(bytearray(4)), "a", None)]
     stream = MagicMock()
     stream.synchronize.side_effect = [RuntimeError("wait failed"), None]
@@ -536,7 +536,7 @@ def test_a_queued_copy_error_is_logged_without_a_second_drain(monkeypatch, caplo
             [("layer", torch.zeros(1), 0)],
             torch.device("cpu"),
         )
-    worker._deferred_load_failed(meta, caught.value, reads)
+    worker._async_load_failed(meta, caught.value, reads)
     assert stream.synchronize.call_count == 1
     worker._handler.release_retrieved.assert_not_called()
     assert worker.get_finished_loading() == {"r1"}
@@ -557,13 +557,13 @@ def test_answered_fetches_are_copied_before_older_unanswered_fetches(monkeypatch
 def test_default_node_group_stores_reserve_no_device_slabs_or_wait_budget():
     worker, _, meta = group_worker()
     assert not worker._write_behind
-    worker._reserve_deferred = MagicMock()
+    worker._reserve_credit_wait = MagicMock()
     worker.wait_for_save(
         MaruConnectorMetadata(
             requests=[dataclasses.replace(meta, is_store=True, num_scheduled_tokens=8)]
         )
     )
-    worker._reserve_deferred.assert_not_called()
+    worker._reserve_credit_wait.assert_not_called()
     worker._handler.alloc.assert_called_once()
     assert worker._handler.alloc.call_args.kwargs == {}
-    assert worker._deferred_bytes == 0
+    assert worker._credit_wait_bytes == 0

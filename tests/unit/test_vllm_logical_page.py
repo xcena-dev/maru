@@ -31,9 +31,9 @@ from maru_vllm.connector import _chunk_keys, _logical_page_format
 from maru_vllm.kv_layout import _detect_kv_layout, _vllm_kv_cache_layout
 from tests.unit.vllm_connector_helpers import (
     attach_capturing_handler,
-    deferred_metadata,
     fake_new_request_data,
     fake_scheduler_output,
+    load_metadata,
     make_bare_worker,
     make_flash_attn_metadata,
     make_scheduler,
@@ -404,11 +404,11 @@ class TestPackedSlab:
                 },
                 attn_metadata=make_flash_attn_metadata(),
             ),
-            deferred_metadata(
+            load_metadata(
                 token_ids=token_ids,
                 block_ids=list(range(self.NUM_BLOCKS)),
                 num_matched_chunks=len(_chunk_keys(token_ids, self.CHUNK)),
-                deferred_load=False,
+                async_load=False,
             ),
         )
         if device == "cuda":
@@ -503,7 +503,7 @@ class TestPackedSlab:
         )
         reader.start_load_kv(
             forward_context,
-            deferred_metadata(
+            load_metadata(
                 token_ids=token_ids,
                 block_ids=list(range(self.NUM_BLOCKS)),
                 num_matched_chunks=len(_chunk_keys(token_ids, self.CHUNK)),
@@ -526,7 +526,7 @@ class TestPackedSlab:
     @pytest.mark.parametrize("name", LAYOUTS)
     def test_kernel_writes_and_reads_pinned_slabs_in_place(self, name):
         """Pinned host slabs, as a CUDA-registered CXL mapping hands them out:
-        the store kernel writes them and an inline load's kernel reads them,
+        the store kernel writes them and a sync load's kernel reads them,
         with no device copy in between."""
         k, v = self._kv()
         src = dict(zip(self._names(), logical_pages(name, k, v, "cuda"), strict=True))
@@ -595,11 +595,11 @@ class TestPackedSlab:
                 },
                 attn_metadata=meta,
             ),
-            deferred_metadata(
+            load_metadata(
                 token_ids=token_ids,
                 block_ids=list(range(self.NUM_BLOCKS)),
                 num_matched_chunks=chunks,
-                deferred_load=False,
+                async_load=False,
             ),
         )
         torch.cuda.synchronize()
@@ -692,11 +692,11 @@ class TestPackedSlab:
                 },
                 attn_metadata=meta,
             ),
-            deferred_metadata(
+            load_metadata(
                 token_ids=token_ids,
                 block_ids=list(range(self.NUM_BLOCKS)),
                 num_matched_chunks=chunks,
-                deferred_load=False,
+                async_load=False,
             ),
         )
         torch.cuda.synchronize()

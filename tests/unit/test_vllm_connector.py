@@ -35,12 +35,12 @@ from tests.unit.vllm_connector_helpers import (
     attach_capturing_handler,
     capture_float32,
     cuda_error,
-    deferred_metadata,
-    deferred_req_meta,
     fake_cached_reqs,
     fake_new_request_data,
     fake_scheduler_output,
     holds,
+    load_metadata,
+    load_req_meta,
     make_bare_worker,
     make_flash_attn_metadata,
     make_scheduler,
@@ -94,7 +94,7 @@ class TestRenamedKnobs:
     )
     def test_scheduler_wiring_matches_under_either_name(self, config):
         scheduler = make_scheduler(block_size=4, kv_chunk_tokens=4, extra_config=config)
-        assert scheduler._deferred_loading is True
+        assert scheduler._async_loading is True
         assert scheduler._write_behind is True
 
     @pytest.mark.parametrize(
@@ -144,7 +144,7 @@ class TestRenamedKnobs:
         )
         worker = make_worker(block_size=4, kv_chunk_tokens=4, extra_config=naru_extra)
 
-        assert scheduler._deferred_loading is True
+        assert scheduler._async_loading is True
         assert scheduler._write_behind is True
         assert worker._write_behind is True
         assert worker._load_admission_window == 1
@@ -1456,7 +1456,7 @@ class TestStoreLoadRoundtripModernLayout:
         )
         reader.start_load_kv(
             fwd,
-            deferred_metadata(
+            load_metadata(
                 token_ids=token_ids,
                 block_ids=list(range(16)),
                 num_matched_chunks=len(chunk_keys),
@@ -1583,7 +1583,7 @@ class TestPackedStoreLoadRoundtrip:
 
         reader.start_load_kv(
             forward_context,
-            deferred_metadata(
+            load_metadata(
                 token_ids=token_ids,
                 block_ids=list(range(self.NUM_BLOCKS)),
                 num_matched_chunks=len(chunk_keys),
@@ -1596,7 +1596,7 @@ class TestPackedStoreLoadRoundtrip:
             torch.testing.assert_close(dst[name], src[name])
 
     def test_a_step_that_loads_stores_only_what_it_computes(self):
-        """An inline load and the store of the chunks computed after it (#111)."""
+        """A sync load and the store of the chunks computed after it (#111)."""
         src = self._source_caches()
         stored, token_ids = self._store(src)
         chunk_keys = _chunk_keys(token_ids, self.CHUNK)
@@ -1613,11 +1613,11 @@ class TestPackedStoreLoadRoundtrip:
         block_ids = list(range(self.NUM_BLOCKS))
         metadata = MaruConnectorMetadata(
             requests=[
-                deferred_req_meta(
+                load_req_meta(
                     token_ids=token_ids,
                     block_ids=block_ids,
                     num_matched_chunks=hit,
-                    deferred_load=False,
+                    async_load=False,
                 ),
                 store_req_meta(
                     token_ids=token_ids,
@@ -1688,11 +1688,11 @@ class TestPackedStoreLoadRoundtrip:
         step(
             MaruConnectorMetadata(
                 requests=[
-                    deferred_req_meta(
+                    load_req_meta(
                         token_ids=token_ids,
                         block_ids=block_ids,
                         num_matched_chunks=hit,
-                        deferred_load=False,
+                        async_load=False,
                     ),
                     store("r1", token_ids),
                     store("r2", other_ids),
@@ -1708,16 +1708,16 @@ class TestPackedStoreLoadRoundtrip:
         step(MaruConnectorMetadata(finished_req_ids={"r1"}))
         assert not worker._unsound_kv_req_ids
 
-    def test_a_parked_load_failing_on_the_loader_thread_still_stores(self):
-        """The loader hands a parked remote load's batches on as inline parts."""
+    def test_an_async_load_failing_on_the_loader_thread_still_stores(self):
+        """The loader hands an async remote load's batches on as sync-load parts."""
         worker = self._make_worker(self._source_caches())
-        part = deferred_req_meta(
+        part = load_req_meta(
             token_ids=list(range(self.PROMPT)),
             block_ids=list(range(self.NUM_BLOCKS)),
             num_matched_chunks=2,
-            deferred_load=False,
+            async_load=False,
         )
-        worker._inflight_deferred_req_ids.add(part.req_id)
+        worker._inflight_async_load_req_ids.add(part.req_id)
         worker._fail_load(part, RuntimeError("copy failed"))
         assert worker.take_failed_load_blocks()
         assert not worker._unsound_kv_req_ids
@@ -1858,7 +1858,7 @@ class TestPackedKernelRoundtripGPU:
         worker.shutdown()
         return pool, token_ids
 
-    def _load(self, pool, token_ids, num_chunks, *, deferred=True):
+    def _load(self, pool, token_ids, num_chunks, *, is_async=True):
         """Read the pool back into zeroed caches; return them."""
         src = self._source_caches()
         dst = {name: torch.zeros_like(tensor) for name, tensor in src.items()}
@@ -1873,15 +1873,15 @@ class TestPackedKernelRoundtripGPU:
         )
         reader.start_load_kv(
             forward_context,
-            deferred_metadata(
+            load_metadata(
                 token_ids=token_ids,
                 block_ids=list(range(self.NUM_BLOCKS)),
                 num_matched_chunks=num_chunks,
-                deferred_load=deferred,
+                async_load=is_async,
             ),
         )
-        if deferred:
-            # On CUDA a deferred packed load always goes to the background
+        if is_async:
+            # On CUDA an async packed load always goes to the background
             # loader thread, so the request is reported on a later call.
             deadline = time.monotonic() + 30.0
             finished = None
@@ -1907,7 +1907,7 @@ class TestPackedKernelRoundtripGPU:
     def test_roundtrip_restores_every_layer(self, write_behind, pinning):
         """Either store variant round-trips every layer of every chunk exactly.
 
-        The deferred load reads back slabs whose region may have failed CUDA
+        The async load reads back slabs whose region may have failed CUDA
         registration, so every pin state must survive it too.
         """
         src = self._source_caches()
@@ -1950,7 +1950,7 @@ class TestPackedKernelRoundtripGPU:
         [(True,), (False,), (True, False)],
         ids=["pinned", "pageable", "mixed"],
     )
-    def test_inline_roundtrip_with_pin_states(self, pinning, monkeypatch):
+    def test_sync_roundtrip_with_pin_states(self, pinning, monkeypatch):
         """Failed pinning must preserve KV bytes without staging pinned pages."""
         import maru_kv_ops
 
@@ -1964,7 +1964,7 @@ class TestPackedKernelRoundtripGPU:
         monkeypatch.setattr(maru_kv_ops, "multi_layer_kv_transfer", record_transfer)
         src = self._source_caches()
         pool, token_ids = self._store(src, write_behind=False, pinning=pinning)
-        dst = self._load(pool, token_ids, self.PROMPT // self.CHUNK, deferred=False)
+        dst = self._load(pool, token_ids, self.PROMPT // self.CHUNK, is_async=False)
         for name in self._layer_names():
             torch.testing.assert_close(dst[name], src[name], rtol=0, atol=0)
 
@@ -1987,8 +1987,8 @@ class TestPackedKernelRoundtripGPU:
                 staging_ptrs.add(store[2])
         assert len(staging_ptrs) <= 1
 
-    def test_inline_load_from_pageable_write_behind_store(self):
-        """Exercise inline load independently of the direct store fallback."""
+    def test_sync_load_from_pageable_write_behind_store(self):
+        """Exercise sync load independently of the direct store fallback."""
         import maru_kv_ops
 
         src = self._source_caches()
@@ -1998,7 +1998,7 @@ class TestPackedKernelRoundtripGPU:
             "multi_layer_kv_transfer",
             wraps=maru_kv_ops.multi_layer_kv_transfer,
         ) as transfer:
-            dst = self._load(pool, token_ids, self.PROMPT // self.CHUNK, deferred=False)
+            dst = self._load(pool, token_ids, self.PROMPT // self.CHUNK, is_async=False)
         for name in self._layer_names():
             torch.testing.assert_close(dst[name], src[name], rtol=0, atol=0)
         # Some GPUs can access pageable DRAM directly; even there, verify the
@@ -2111,7 +2111,7 @@ class TestBuildConnectorMetaStoreAccumulation:
         assert req.block_ids == list(range(15))
         assert req.num_computed_tokens == 58
 
-    def test_inline_load_stores_the_chunks_computed_after_it(self):
+    def test_sync_load_stores_the_chunks_computed_after_it(self):
         """A request that loads a hit stores what it computes past it (#111)."""
         sched = self._make_scheduler()
         sched._count_matched_chunks = lambda tokens, keys=None: 2
@@ -2333,7 +2333,7 @@ class TestStoreStartsPastTheHit:
     """A request stores none of the chunks its lookup found in Maru.
 
     Each case drives one request (8-token chunks, 4-token blocks) through the
-    scheduler as vLLM does: lookup, allocation, the parked load when
+    scheduler as vLLM does: lookup, allocation, the async load when
     ``maru_async_load`` is on, and prefill steps, with a preemption and a
     resume where the case needs one. The V1 model runner sends a resumed
     request as a cached one ("resumed"), the V2 runner as a new one ("new").
@@ -2355,7 +2355,7 @@ class TestStoreStartsPastTheHit:
         """Look the request up and allocate it; return its computed tokens.
 
         Maru holds the prompt's first ``cached_chunks`` chunks and vLLM's own
-        prefix cache its first ``local`` tokens. A parked load completes.
+        prefix cache its first ``local`` tokens. An async load completes.
         """
         sched._known_keys.clear()
         sched._handler.batch_exists.side_effect = lambda keys: [
@@ -2366,11 +2366,11 @@ class TestStoreStartsPastTheHit:
             prompt_token_ids=list(range(tokens)),
             all_token_ids=list(range(tokens)),
         )
-        matched, parked = sched.get_num_new_matched_tokens(request, local)
+        matched, is_async = sched.get_num_new_matched_tokens(request, local)
         blocks = MagicMock()
         blocks.get_block_ids.return_value = (self._blocks(tokens),)
         sched.update_state_after_alloc(request, blocks, matched)
-        if parked and matched:
+        if is_async and matched:
             sched.build_connector_meta(fake_scheduler_output([], None, {}))
             sched.update_state_after_alloc(request, blocks, 0)
         return local + matched
@@ -2407,7 +2407,7 @@ class TestStoreStartsPastTheHit:
         output.preempted_req_ids = {"r1"}
         sched.build_connector_meta(output)
 
-    def test_a_parked_full_hit_stores_nothing(self):
+    def test_an_async_full_hit_stores_nothing(self):
         sched = self._scheduler(async_load=True)
         computed = self._admit(sched, 40, cached_chunks=5)
         assert computed == 36
@@ -2421,7 +2421,7 @@ class TestStoreStartsPastTheHit:
         assert self._step(sched, 40, computed, 4, "new") == []
 
     @pytest.mark.parametrize("how", ["resumed", "new"])
-    @pytest.mark.parametrize("async_load", [False, True], ids=["inline", "parked"])
+    @pytest.mark.parametrize("async_load", [False, True], ids=["sync", "async"])
     def test_a_full_hit_after_a_preemption_stores_nothing(self, async_load, how):
         """The start kept from before the preemption stays past the hit."""
         sched = self._scheduler(async_load)
@@ -2432,7 +2432,7 @@ class TestStoreStartsPastTheHit:
         assert self._step(sched, 40, computed, 4, how) == []
 
     @pytest.mark.parametrize("how", ["resumed", "new"])
-    @pytest.mark.parametrize("async_load", [False, True], ids=["inline", "parked"])
+    @pytest.mark.parametrize("async_load", [False, True], ids=["sync", "async"])
     def test_a_partial_hit_after_a_preemption_stores_from_its_end(
         self, async_load, how
     ):
@@ -2445,7 +2445,7 @@ class TestStoreStartsPastTheHit:
         (store,) = self._step(sched, 40, computed, 24, how)
         assert store.store_start_token == 16
 
-    def test_a_failed_parked_load_stores_what_it_computes(self):
+    def test_a_failed_async_load_stores_what_it_computes(self):
         """vLLM recomputes the request, and the chunks it lost may be gone."""
         sched = self._scheduler(async_load=True)
         assert self._admit(sched, 40, cached_chunks=3) == 24
@@ -2620,19 +2620,19 @@ class TestUncacheableRequests:
 
 
 # =============================================================================
-# Deferred (between-step) loading
+# Async (between-step) loading
 # =============================================================================
 
 
-class TestDeferredLoading:
+class TestAsyncLoading:
     CHUNK = 8
 
-    def _make_scheduler(self, deferred=True, layerwise_overlap=False):
+    def _make_scheduler(self, is_async=True, layerwise_overlap=False):
         sched = make_scheduler(
             block_size=4,
             kv_chunk_tokens=self.CHUNK,
             extra_config={
-                "maru_enable_deferred_loading": deferred,
+                "maru_enable_deferred_loading": is_async,
                 "maru_enable_layerwise_overlap": layerwise_overlap,
             },
         )
@@ -2655,12 +2655,12 @@ class TestDeferredLoading:
         assert matched == 64 and load_async is True
 
     def test_sync_mode_reports_sync(self):
-        sched = self._make_scheduler(deferred=False)
+        sched = self._make_scheduler(is_async=False)
         sched._handler.batch_exists.return_value = [True] * 8
         _, load_async = sched.get_num_new_matched_tokens(self._request(), 0)
         assert load_async is False
 
-    def test_deferred_meta_emitted_once_with_alloc_blocks(self):
+    def test_async_load_meta_emitted_once_with_alloc_blocks(self):
         sched = self._make_scheduler()
         sched._handler.batch_exists.return_value = [True] * 8
         request = self._request()
@@ -2674,7 +2674,7 @@ class TestDeferredLoading:
         meta = sched.build_connector_meta(out)
         assert len(meta.requests) == 1
         req = meta.requests[0]
-        assert req.deferred_load and not req.is_store
+        assert req.async_load and not req.is_store
         assert req.block_ids == [3, 4, 5]
         assert req.num_matched_chunks == 8
         # Emitted exactly once
@@ -2683,7 +2683,7 @@ class TestDeferredLoading:
     def test_second_alloc_call_after_load_is_ignored(self):
         sched = self._make_scheduler()
         sched.update_state_after_alloc(self._request(), MagicMock(), 0)
-        assert sched._pending_deferred_loads == {}
+        assert sched._pending_async_loads == {}
 
     def test_second_alloc_activates_layerwise_load_once(self):
         sched = self._make_scheduler(layerwise_overlap=True)
@@ -2695,7 +2695,7 @@ class TestDeferredLoading:
 
         empty = fake_scheduler_output()
         first = sched.build_connector_meta(empty)
-        assert first.requests[0].deferred_load
+        assert first.requests[0].async_load
         assert first.requests[0].layerwise_load
         assert first.layerwise_load_req_ids == set()
 
@@ -2734,7 +2734,7 @@ class TestDeferredLoading:
 
         assert len(metadata.requests) == 2
         assert all(request.layerwise_load for request in metadata.requests)
-        assert sched._deferred_layerwise_waiting == {"r1", "r2"}
+        assert sched._async_layerwise_waiting == {"r1", "r2"}
 
     def test_overlap_off_keeps_every_request_on_the_whole_request_path(self):
         sched = self._make_scheduler(layerwise_overlap=False)
@@ -2751,9 +2751,9 @@ class TestDeferredLoading:
         metadata = sched.build_connector_meta(fake_scheduler_output())
 
         assert not any(request.layerwise_load for request in metadata.requests)
-        assert sched._deferred_layerwise_waiting == set()
+        assert sched._async_layerwise_waiting == set()
 
-    def test_staggered_admission_tracks_live_deferred_requests(self):
+    def test_staggered_admission_tracks_live_async_load_requests(self):
         sched = self._make_scheduler(layerwise_overlap=True)
         output = fake_scheduler_output()
 
@@ -2776,27 +2776,27 @@ class TestDeferredLoading:
         second = sched.build_connector_meta(output)
 
         assert second.requests[0].layerwise_load
-        assert sched._active_deferred_req_ids == {"r1", "r2"}
+        assert sched._active_async_load_req_ids == {"r1", "r2"}
 
         finished = SimpleNamespace(**vars(output))
         finished.finished_req_ids = {"r1"}
         sched.build_connector_meta(finished)
-        assert sched._active_deferred_req_ids == {"r2"}
+        assert sched._active_async_load_req_ids == {"r2"}
 
-    def test_failed_deferred_load_reports_blocks_and_completion(self):
+    def test_failed_async_load_reports_blocks_and_completion(self):
         worker = make_worker(block_size=4, kv_chunk_tokens=self.CHUNK)
-        meta = deferred_req_meta(
+        meta = load_req_meta(
             token_ids=list(range(64)),
             block_ids=[7, 8, 9],
             num_matched_chunks=8,
         )
-        worker._fail_deferred_load(meta)
+        worker._handle_unavailable_kv(meta)
         assert worker.get_finished_loading() == {"r1"}
         assert worker.get_finished_loading() is None
         assert worker.take_failed_load_blocks() == {7, 8, 9}
         assert worker.take_failed_load_blocks() == set()
 
-    def test_cpu_deferred_load_completes_synchronously(self):
+    def test_cpu_async_load_completes_synchronously(self):
         worker = make_worker(block_size=4, kv_chunk_tokens=self.CHUNK)
         kv = torch.zeros(2, 16, 4, 1)
         chunk_bytes = 2 * self.CHUNK * 4  # K/V x tokens x fp32
@@ -2815,7 +2815,7 @@ class TestDeferredLoading:
 
         layer = SimpleNamespace(kv_cache=kv)
         fwd = SimpleNamespace(no_compile_layers={"l0": layer}, attn_metadata=None)
-        metadata = deferred_metadata(
+        metadata = load_metadata(
             token_ids=list(range(64)),
             block_ids=list(range(16)),
             num_matched_chunks=8,
@@ -2831,7 +2831,7 @@ class TestDeferredLoading:
         vLLM calls start_load_kv outside its own try, so a raise here kills
         the engine. The request's blocks must go through the failed-blocks
         path (get_block_ids_with_load_errors) so vLLM recomputes them, and
-        the request must still unpark via get_finished_loading.
+        the request must still resume via get_finished_loading.
         """
         worker = make_worker(block_size=4, kv_chunk_tokens=self.CHUNK)
         chunk_bytes = 2 * self.CHUNK * 4
@@ -2850,7 +2850,7 @@ class TestDeferredLoading:
             no_compile_layers={"l0": SimpleNamespace(kv_cache=bad_cache)},
             attn_metadata=None,
         )
-        metadata = deferred_metadata(
+        metadata = load_metadata(
             token_ids=list(range(64)),
             block_ids=list(range(16)),
             num_matched_chunks=8,
@@ -2861,16 +2861,16 @@ class TestDeferredLoading:
         assert worker.take_failed_load_blocks() == set(range(16))
 
 
-class TestAsyncDeferredPackedLoad:
-    """True-async deferred loads: retrieve + H2D run on the loader thread."""
+class TestAsyncPackedLoad:
+    """Truly asynchronous loads: retrieve + H2D run on the loader thread."""
 
     CHUNK = 8
 
     def _make_worker(self):
         return make_worker(block_size=4, kv_chunk_tokens=self.CHUNK)
 
-    def _deferred_meta(self):
-        return deferred_req_meta(
+    def _async_load_meta(self):
+        return load_req_meta(
             token_ids=list(range(64)),
             block_ids=list(range(16)),
             num_matched_chunks=8,
@@ -2891,13 +2891,13 @@ class TestAsyncDeferredPackedLoad:
 
     def test_submit_refused_without_registered_caches(self):
         worker = self._make_worker()
-        assert worker._try_submit_deferred_load(self._deferred_meta()) is False
+        assert worker._try_submit_async_load(self._async_load_meta()) is False
 
     def test_submit_refused_on_cpu_caches(self):
         worker = self._make_worker()
         worker._kv_caches = {"l0": torch.zeros(2, 16, 4, 1)}
         worker._num_layers = 1
-        assert worker._try_submit_deferred_load(self._deferred_meta()) is False
+        assert worker._try_submit_async_load(self._async_load_meta()) is False
 
     def test_layerwise_mode_background_job_stops_after_retrieve(self):
         worker = make_worker(
@@ -2920,20 +2920,20 @@ class TestAsyncDeferredPackedLoad:
         ]
         worker._handler = MagicMock()
         worker._handler.batch_retrieve.return_value = infos
-        meta = self._deferred_meta()
+        meta = self._async_load_meta()
         meta.layerwise_load = True
 
-        worker._deferred_load_job(
+        worker._async_load_job(
             meta,
             [("l0", torch.zeros(2, 16, 4, 1), 0)],
             torch.device("cpu"),
         )
 
         assert worker.get_finished_loading() == {"r1"}
-        retained = worker._deferred_layerwise_loads["r1"]
+        retained = worker._async_layerwise_loads["r1"]
         assert retained[0] is meta
         assert retained[3] == infos
-        assert worker._deferred_events == {}
+        assert worker._async_load_events == {}
 
     def test_layerwise_activation_cpu_fallback_preserves_chunkwise_layout(self):
         from maru_vllm.connector import MaruConnectorMetadata
@@ -2954,10 +2954,10 @@ class TestAsyncDeferredPackedLoad:
             region_id=0,
             page_index=0,
         )
-        meta = self._deferred_meta()
+        meta = self._async_load_meta()
         meta.num_matched_chunks = 1
         meta.block_ids = [0]
-        worker._deferred_layerwise_loads["r1"] = (
+        worker._async_layerwise_loads["r1"] = (
             meta,
             1,
             torch.arange(4),
@@ -2980,7 +2980,7 @@ class TestAsyncDeferredPackedLoad:
 
         torch.testing.assert_close(kv0, source[:, 0].view_as(kv0))
         torch.testing.assert_close(kv1, source[:, 1].view_as(kv1))
-        assert worker._deferred_layerwise_loads == {}
+        assert worker._async_layerwise_loads == {}
         assert worker._layer_load_events == {}
 
     def test_a_failed_layerwise_activation_stops_its_request_storing(self):
@@ -2997,12 +2997,12 @@ class TestAsyncDeferredPackedLoad:
         )
         worker._handler = MagicMock()
         worker._num_layers = 2
-        meta = self._deferred_meta()
+        meta = self._async_load_meta()
         meta.num_matched_chunks = 1
         meta.block_ids = [0]
         # Too short for a chunk slab: the copy into the layers fails.
         info = SimpleNamespace(view=memoryview(bytearray(4)), region_id=0, page_index=0)
-        worker._deferred_layerwise_loads["r1"] = (meta, 1, torch.arange(4), [info])
+        worker._async_layerwise_loads["r1"] = (meta, 1, torch.arange(4), [info])
         kv = torch.zeros(2, 1, 4, 1)
         forward = SimpleNamespace(
             no_compile_layers={
@@ -3034,7 +3034,7 @@ class TestAsyncDeferredPackedLoad:
 
     @pytest.mark.parametrize("layerwise", [False, True], ids=["chunkwise", "layerwise"])
     def test_layerwise_activation_cpu_fallback_places_an_mla_latent(self, layerwise):
-        """A parked load can resume before any forward has given attention
+        """An async load can resume before any forward has given attention
         metadata to tell MLA by; the worker knows it from the model. A
         chunkwise slab holds one latent plane per layer."""
         from maru_vllm.connector import MaruConnectorMetadata
@@ -3065,10 +3065,10 @@ class TestAsyncDeferredPackedLoad:
             if layerwise
             else [info(source)]
         )
-        meta = self._deferred_meta()
+        meta = self._async_load_meta()
         meta.num_matched_chunks = 1
         meta.block_ids = [0]
-        worker._deferred_layerwise_loads["r1"] = (meta, 1, torch.arange(4), infos)
+        worker._async_layerwise_loads["r1"] = (meta, 1, torch.arange(4), infos)
         kv0 = torch.zeros(1, 4, 3)  # [blocks, block, latent]
         kv1 = torch.zeros_like(kv0)
         forward = SimpleNamespace(
@@ -3113,10 +3113,10 @@ class TestAsyncDeferredPackedLoad:
             for i in range(2)
         ]
         worker._effective_page_size_bytes = page_bytes
-        meta = self._deferred_meta()
+        meta = self._async_load_meta()
         meta.num_matched_chunks = 2
         meta.block_ids = [0, 1]
-        worker._deferred_layerwise_loads["r1"] = (
+        worker._async_layerwise_loads["r1"] = (
             meta,
             2,
             torch.arange(8),
@@ -3158,11 +3158,11 @@ class TestAsyncDeferredPackedLoad:
                 "maru_enable_layerwise_overlap": True,
             },
         )
-        worker._deferred_layerwise_loads["r1"] = MagicMock()
+        worker._async_layerwise_loads["r1"] = MagicMock()
 
         worker.handle_preemptions(MaruConnectorMetadata(preempted_req_ids={"r1"}))
 
-        assert worker._deferred_layerwise_loads == {}
+        assert worker._async_layerwise_loads == {}
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
     @pytest.mark.parametrize("timing", [False, True])
@@ -3186,7 +3186,7 @@ class TestAsyncDeferredPackedLoad:
         worker._handler = MagicMock()
         worker._handler.batch_retrieve.return_value = infos
 
-        assert worker._try_submit_deferred_load(self._deferred_meta()) is True
+        assert worker._try_submit_async_load(self._async_load_meta()) is True
         assert self._poll_finished(worker) == {"r1"}
         assert worker.take_failed_load_blocks() == set()
         torch.cuda.synchronize()
@@ -3221,15 +3221,15 @@ class TestAsyncDeferredPackedLoad:
         ]
         worker._handler = MagicMock()
         worker._handler.batch_retrieve.return_value = infos
-        meta = self._deferred_meta()
+        meta = self._async_load_meta()
 
-        worker._deferred_load_job(
+        worker._async_load_job(
             meta,
             [("l0", kv, 0)],
             kv.device,
         )
 
-        refs = worker._deferred_refs["r1"]
+        refs = worker._async_load_refs["r1"]
         assert refs[0] == infos
         assert refs[1].device.type == "cpu"
         assert refs[1].is_pinned()
@@ -3245,7 +3245,7 @@ class TestAsyncDeferredPackedLoad:
         worker._handler = MagicMock()
         worker._handler.batch_retrieve.side_effect = RuntimeError("rpc down")
 
-        assert worker._try_submit_deferred_load(self._deferred_meta()) is True
+        assert worker._try_submit_async_load(self._async_load_meta()) is True
         assert self._poll_finished(worker) == {"r1"}
         assert worker.take_failed_load_blocks() == set(range(16))
 
@@ -3257,13 +3257,13 @@ class TestAsyncDeferredPackedLoad:
         worker._handler = MagicMock()
         worker._handler.batch_retrieve.return_value = [None] * 8
 
-        assert worker._try_submit_deferred_load(self._deferred_meta()) is True
+        assert worker._try_submit_async_load(self._async_load_meta()) is True
         assert self._poll_finished(worker) == {"r1"}
         assert worker.take_failed_load_blocks() == set(range(16))
 
 
 class TestPreIssuedLayerwiseHandoff:
-    """Copies queued while a request was parked reach the forward as events.
+    """Copies queued during a request's async load reach the forward as events.
 
     The forward must not re-issue them, and a batch may mix pre-issued
     requests with ones whose copies still have to be issued in the forward.
@@ -3300,11 +3300,11 @@ class TestPreIssuedLayerwiseHandoff:
 
         worker = self._worker()
         events = {name: MagicMock() for name in self.LAYERS}
-        worker._deferred_layerwise_events["r1"] = dict(events)
+        worker._async_layerwise_events["r1"] = dict(events)
         reissued: list[set[str]] = []
         monkeypatch.setattr(
             worker,
-            "_schedule_deferred_layerwise_loads",
+            "_schedule_async_layerwise_loads",
             lambda layers, req_ids, attn: reissued.append(set(req_ids)),
         )
 
@@ -3317,7 +3317,7 @@ class TestPreIssuedLayerwiseHandoff:
         assert worker._layer_load_events == {
             name: [event] for name, event in events.items()
         }
-        assert worker._deferred_layerwise_events == {}
+        assert worker._async_layerwise_events == {}
 
     def test_mixed_batch_issues_only_the_request_without_queued_copies(
         self, monkeypatch
@@ -3326,11 +3326,11 @@ class TestPreIssuedLayerwiseHandoff:
 
         worker = self._worker()
         events = {name: MagicMock() for name in self.LAYERS}
-        worker._deferred_layerwise_events["r1"] = dict(events)
+        worker._async_layerwise_events["r1"] = dict(events)
         reissued: list[set[str]] = []
         monkeypatch.setattr(
             worker,
-            "_schedule_deferred_layerwise_loads",
+            "_schedule_async_layerwise_loads",
             lambda layers, req_ids, attn: reissued.append(set(req_ids)),
         )
 
@@ -3352,13 +3352,13 @@ class TestPreIssuedLayerwiseHandoff:
         events = {self.LAYERS[1]: second, self.LAYERS[0]: first}
         layers = [(self.LAYERS[0], None, 0), (self.LAYERS[1], None, 1)]
 
-        assert worker._unpark_gate_event(events, layers) is first
+        assert worker._async_load_gate_event(events, layers) is first
 
     def test_release_gate_is_none_without_queued_copies(self):
         worker = self._worker()
         layers = [(name, None, i) for i, name in enumerate(self.LAYERS)]
 
-        assert worker._unpark_gate_event({}, layers) is None
+        assert worker._async_load_gate_event({}, layers) is None
 
     def test_release_gate_clamps_to_the_layers_that_exist(self):
         worker = self._worker(maru_overlap_release_after_layers=99)
@@ -3366,7 +3366,7 @@ class TestPreIssuedLayerwiseHandoff:
         events = {self.LAYERS[0]: first, self.LAYERS[1]: second}
         layers = [(self.LAYERS[0], None, 0), (self.LAYERS[1], None, 1)]
 
-        assert worker._unpark_gate_event(events, layers) is second
+        assert worker._async_load_gate_event(events, layers) is second
 
     def test_traced_load_reports_gate_layer_in_execution_order(self, capsys):
         """maru_log_timing hands the queued copies to the poller with K."""
@@ -3381,7 +3381,7 @@ class TestPreIssuedLayerwiseHandoff:
         layers = [(self.LAYERS[0], None, 0), (self.LAYERS[1], None, 1)]
         events.start, events.nbytes = start, 1024
 
-        gate = worker._unpark_gate_event(events, layers)
+        gate = worker._async_load_gate_event(events, layers)
         worker._trace_queued_load("r1", events, layers, gate)
 
         assert tracked == [("r1", start, second, first, 1024, 2)]
@@ -3394,7 +3394,7 @@ class TestPreIssuedLayerwiseHandoff:
         events = {self.LAYERS[1]: second, self.LAYERS[0]: first}
         layers = [(self.LAYERS[0], None, 0), (self.LAYERS[1], None, 1)]
 
-        assert worker._unpark_gate_event(events, layers) is second
+        assert worker._async_load_gate_event(events, layers) is second
 
     def test_release_gate_parses_its_knob(self):
         """The default is what shipped; a higher count is a sweep's answer."""
@@ -3436,7 +3436,7 @@ class TestPreIssuedLayerwiseHandoff:
 
         worker = self._worker()
         events = {name: MagicMock() for name in self.LAYERS}
-        worker._deferred_layerwise_events["r1"] = dict(events)
+        worker._async_layerwise_events["r1"] = dict(events)
 
         worker.handle_preemptions(MaruConnectorMetadata(preempted_req_ids={"r1"}))
 
@@ -3444,30 +3444,30 @@ class TestPreIssuedLayerwiseHandoff:
         # rather than be forgotten while still writing.
         for event in events.values():
             event.synchronize.assert_called_once_with()
-        assert worker._deferred_layerwise_events == {}
+        assert worker._async_layerwise_events == {}
 
-    def test_aborting_a_parked_request_drains_before_reporting_it(self):
+    def test_aborting_an_async_request_drains_before_reporting_it(self):
         """An aborted request's blocks are freed the moment loading is
         reported, and its forward never runs to wait on the later layers."""
         from maru_vllm.connector import MaruConnectorMetadata
 
         worker = self._worker()
         events = {name: MagicMock() for name in self.LAYERS}
-        worker._deferred_layerwise_events["r1"] = dict(events)
-        # Gate has not fired: the request is still parked mid-transfer.
+        worker._async_layerwise_events["r1"] = dict(events)
+        # Gate has not fired: the request is still waiting mid-transfer.
         gate = MagicMock()
         gate.query.return_value = False
-        worker._deferred_events["r1"] = gate
+        worker._async_load_events["r1"] = gate
 
         worker.handle_preemptions(MaruConnectorMetadata(finished_req_ids={"r1"}))
 
         for event in events.values():
             event.synchronize.assert_called_once_with()
-        assert worker._deferred_layerwise_events == {}
+        assert worker._async_layerwise_events == {}
         # The report is still owed — vLLM holds the blocks until it arrives —
         # but only now that every copy has landed.
         assert worker.get_finished_loading() == {"r1"}
-        assert worker._deferred_events == {}
+        assert worker._async_load_events == {}
         # And exactly once: the request is gone from vLLM after the free.
         assert worker.get_finished_loading() is None
 
@@ -3477,7 +3477,7 @@ class TestPreIssuedLayerwiseHandoff:
         from maru_vllm.connector import MaruConnectorMetadata
 
         worker = self._worker()
-        worker._inflight_deferred_req_ids.add("r1")
+        worker._inflight_async_load_req_ids.add("r1")
 
         worker.handle_preemptions(MaruConnectorMetadata(finished_req_ids={"r1"}))
 
@@ -3487,7 +3487,7 @@ class TestPreIssuedLayerwiseHandoff:
 
         # The loader queues them a moment later and finds the request gone.
         events = {name: MagicMock() for name in self.LAYERS}
-        meta = deferred_req_meta(
+        meta = load_req_meta(
             token_ids=list(range(8)),
             block_ids=[0, 1],
             num_matched_chunks=2,
@@ -3502,17 +3502,17 @@ class TestPreIssuedLayerwiseHandoff:
             lambda *args, **kwargs: events,
         )
 
-        worker._deferred_load_job(meta, [], torch.device("cpu"))
+        worker._async_load_job(meta, [], torch.device("cpu"))
 
         # Copies finished before the report that frees the blocks.
         for event in events.values():
             event.synchronize.assert_called_once_with()
         assert worker.get_finished_loading() == {"r1"}
         # No handoff was installed for a request that will never run.
-        assert worker._deferred_layerwise_events == {}
-        assert worker._deferred_events == {}
+        assert worker._async_layerwise_events == {}
+        assert worker._async_load_events == {}
         assert worker._abandoned_req_ids == set()
-        assert worker._inflight_deferred_req_ids == set()
+        assert worker._inflight_async_load_req_ids == set()
 
     def test_abort_landing_between_queueing_and_publishing_is_not_lost(
         self, monkeypatch
@@ -3522,9 +3522,9 @@ class TestPreIssuedLayerwiseHandoff:
         from maru_vllm.connector import MaruConnectorMetadata
 
         worker = self._worker()
-        worker._inflight_deferred_req_ids.add("r1")
+        worker._inflight_async_load_req_ids.add("r1")
         events = {name: MagicMock() for name in self.LAYERS}
-        meta = deferred_req_meta(
+        meta = load_req_meta(
             token_ids=list(range(8)),
             block_ids=[0, 1],
             num_matched_chunks=2,
@@ -3542,19 +3542,19 @@ class TestPreIssuedLayerwiseHandoff:
             worker, "_issue_layerwise_copies_offthread", issue_then_abort
         )
 
-        worker._deferred_load_job(meta, [], torch.device("cpu"))
+        worker._async_load_job(meta, [], torch.device("cpu"))
 
         for event in events.values():
             event.synchronize.assert_called_once_with()
         assert worker.get_finished_loading() == {"r1"}
-        assert worker._deferred_events == {}
+        assert worker._async_load_events == {}
 
     def test_draining_an_already_reported_request_does_not_report_again(self):
         from maru_vllm.connector import MaruConnectorMetadata
 
         worker = self._worker()
         events = {name: MagicMock() for name in self.LAYERS}
-        worker._deferred_layerwise_events["r1"] = dict(events)
+        worker._async_layerwise_events["r1"] = dict(events)
         # No gate: get_finished_loading() already reported this request.
 
         worker.handle_preemptions(MaruConnectorMetadata(finished_req_ids={"r1"}))
@@ -3563,7 +3563,7 @@ class TestPreIssuedLayerwiseHandoff:
             event.synchronize.assert_called_once_with()
         assert worker.get_finished_loading() is None
 
-    def test_finishing_a_request_that_never_parked_costs_nothing(self):
+    def test_finishing_a_request_that_never_loaded_async_costs_nothing(self):
         from maru_vllm.connector import MaruConnectorMetadata
 
         worker = self._worker()
@@ -3580,13 +3580,13 @@ class TestPreIssuedLayerwiseHandoff:
 
         worker = self._worker()
         pre_issued = {name: MagicMock() for name in self.LAYERS}
-        worker._deferred_layerwise_events["r1"] = dict(pre_issued)
-        failing = deferred_req_meta(
+        worker._async_layerwise_events["r1"] = dict(pre_issued)
+        failing = load_req_meta(
             token_ids=list(range(8)),
             block_ids=[7, 8],
             num_matched_chunks=2,
         )
-        worker._deferred_layerwise_loads["r2"] = (
+        worker._async_layerwise_loads["r2"] = (
             failing,
             2,
             torch.arange(8),
@@ -3694,7 +3694,7 @@ class TestLayerwiseFormatOverlap:
         assert out.shape == (3 * obj_elems,)
         torch.testing.assert_close(out, src)
 
-    def test_scheduler_marks_layerwise_load_on_deferred_meta(self):
+    def test_scheduler_marks_layerwise_load_on_async_load_meta(self):
         sched = make_scheduler(
             block_size=4, kv_chunk_tokens=self.CHUNK, extra_config=dict(self.CONFIG)
         )
@@ -3706,7 +3706,7 @@ class TestLayerwiseFormatOverlap:
         sched.update_state_after_alloc(request, blocks, 64)
 
         meta = sched.build_connector_meta(fake_scheduler_output())
-        assert meta.requests[0].deferred_load
+        assert meta.requests[0].async_load
         assert meta.requests[0].layerwise_load
 
     def _layerwise_worker(self, num_layers=2):
@@ -3717,8 +3717,8 @@ class TestLayerwiseFormatOverlap:
         worker._num_layers = num_layers
         return worker
 
-    def _deferred_meta(self):
-        meta = deferred_req_meta(
+    def _async_load_meta(self):
+        meta = load_req_meta(
             token_ids=list(range(64)),
             block_ids=list(range(16)),
             num_matched_chunks=8,
@@ -3742,9 +3742,9 @@ class TestLayerwiseFormatOverlap:
             for i in range(16)  # 8 chunks x 2 layers
         ]
         worker._handler.batch_retrieve.return_value = infos
-        meta = self._deferred_meta()
+        meta = self._async_load_meta()
 
-        worker._deferred_load_job(
+        worker._async_load_job(
             meta,
             [("l0", torch.zeros(2, 16, 4, 1), 0), ("l1", torch.zeros(2, 16, 4, 1), 1)],
             torch.device("cpu"),
@@ -3757,11 +3757,11 @@ class TestLayerwiseFormatOverlap:
         worker._handler.batch_retrieve.assert_called_once_with(expected_keys)
         # CPU makes the off-thread issue fail, so the job retains the views
         # for the resumed forward — keyed by true layer index.
-        retained = worker._deferred_layerwise_loads["r1"]
+        retained = worker._async_layerwise_loads["r1"]
         assert retained[3] == {0: infos[:8], 1: infos[8:]}
         assert worker.get_finished_loading() == {"r1"}
 
-    def test_offthread_job_miss_recomputes_while_parked(self):
+    def test_offthread_job_miss_recomputes_during_its_async_load(self):
         """Any missing (chunk, layer) object fails the whole load before the
         request is released — vLLM recomputes instead of consuming holes."""
         worker = self._layerwise_worker()
@@ -3775,8 +3775,8 @@ class TestLayerwiseFormatOverlap:
         infos[12] = None  # one (chunk, layer) object of the last layer evicted
         worker._handler.batch_retrieve.return_value = infos
 
-        worker._deferred_load_job(
-            self._deferred_meta(),
+        worker._async_load_job(
+            self._async_load_meta(),
             [("l0", torch.zeros(2, 16, 4, 1), 0), ("l1", torch.zeros(2, 16, 4, 1), 1)],
             torch.device("cpu"),
         )
@@ -3786,12 +3786,12 @@ class TestLayerwiseFormatOverlap:
         assert len(retrieved_keys) == 16
         assert worker.get_finished_loading() == {"r1"}
         assert worker.take_failed_load_blocks() == set(range(16))
-        assert worker._deferred_layerwise_loads == {}
-        assert worker._deferred_layerwise_events == {}
+        assert worker._async_layerwise_loads == {}
+        assert worker._async_layerwise_events == {}
 
-    def test_offthread_job_truncated_retrieve_recomputes_while_parked(self):
+    def test_offthread_job_truncated_retrieve_recomputes_during_its_async_load(self):
         """A short batch_retrieve response (fewer infos than keys, no Nones)
-        must fail the load while parked — never inject an uninitialized
+        must fail the load during its async load — never inject an uninitialized
         staging tail as if it were a successful cache hit."""
         worker = self._layerwise_worker()
         obj_bytes = 2 * self.CHUNK * 4
@@ -3803,16 +3803,16 @@ class TestLayerwiseFormatOverlap:
         ]
         worker._handler.batch_retrieve.return_value = infos
 
-        worker._deferred_load_job(
-            self._deferred_meta(),
+        worker._async_load_job(
+            self._async_load_meta(),
             [("l0", torch.zeros(2, 16, 4, 1), 0), ("l1", torch.zeros(2, 16, 4, 1), 1)],
             torch.device("cpu"),
         )
 
         assert worker.get_finished_loading() == {"r1"}
         assert worker.take_failed_load_blocks() == set(range(16))
-        assert worker._deferred_layerwise_loads == {}
-        assert worker._deferred_layerwise_events == {}
+        assert worker._async_layerwise_loads == {}
+        assert worker._async_layerwise_events == {}
 
     def test_sync_path_truncated_retrieve_recomputes(self, caplog):
         """The synchronous load path rejects a short retrieve response the
@@ -3832,7 +3832,7 @@ class TestLayerwiseFormatOverlap:
                 view=memoryview(bytearray(obj_bytes)), region_id=0, page_index=0
             )
         ]  # one short of 1 chunk x 2 layers
-        meta = deferred_req_meta(
+        meta = load_req_meta(
             token_ids=list(range(4)), block_ids=[0], num_matched_chunks=1
         )
 
@@ -3862,11 +3862,11 @@ class TestLayerwiseFormatOverlap:
         reaching it means a wiring bug, and silently recomputing would look
         like a cache-hit-rate drop with no diagnostic."""
         worker = self._layerwise_worker()
-        meta = self._deferred_meta()
+        meta = self._async_load_meta()
         meta.layerwise_load = False
 
         with caplog.at_level("ERROR"):
-            worker._deferred_load_job(
+            worker._async_load_job(
                 meta,
                 [("l0", torch.zeros(2, 16, 4, 1), 0)],
                 torch.device("cpu"),
@@ -3898,10 +3898,10 @@ class TestLayerwiseFormatOverlap:
             ]
             for li, src in enumerate(sources)
         }
-        meta = self._deferred_meta()
+        meta = self._async_load_meta()
         meta.num_matched_chunks = 1
         meta.block_ids = [0]
-        worker._deferred_layerwise_loads["r1"] = (meta, 1, torch.arange(4), payload)
+        worker._async_layerwise_loads["r1"] = (meta, 1, torch.arange(4), payload)
         kv0 = torch.zeros(2, 1, 4, 1)
         kv1 = torch.zeros_like(kv0)
         forward = SimpleNamespace(
@@ -3919,7 +3919,7 @@ class TestLayerwiseFormatOverlap:
 
         torch.testing.assert_close(kv0, sources[0].view_as(kv0))
         torch.testing.assert_close(kv1, sources[1].view_as(kv1))
-        assert worker._deferred_layerwise_loads == {}
+        assert worker._async_layerwise_loads == {}
         assert worker._layer_load_events == {}
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
@@ -3950,10 +3950,10 @@ class TestLayerwiseFormatOverlap:
                 )
                 for ci in range(2)
             ]
-        meta = self._deferred_meta()
+        meta = self._async_load_meta()
         meta.num_matched_chunks = 2
         meta.block_ids = [0, 1]
-        worker._deferred_layerwise_loads["r1"] = (meta, 2, torch.arange(8), payload)
+        worker._async_layerwise_loads["r1"] = (meta, 2, torch.arange(8), payload)
         kv0 = torch.zeros(2, 2, 4, 1, device="cuda")
         kv1 = torch.zeros_like(kv0)
         forward = SimpleNamespace(
@@ -3995,10 +3995,10 @@ class TestLayerwiseFormatOverlap:
         submitted: list[str] = []
         monkeypatch.setattr(
             worker,
-            "_try_submit_deferred_load",
+            "_try_submit_async_load",
             lambda req_meta: submitted.append(req_meta.req_id) or True,
         )
-        meta = self._deferred_meta()
+        meta = self._async_load_meta()
 
         worker.start_load_kv(
             self._forward(torch.zeros(2, 16, 4, 1), torch.zeros(2, 16, 4, 1)),
@@ -4020,7 +4020,7 @@ class TestLayerwiseFormatOverlap:
         submitted: list[str] = []
         monkeypatch.setattr(
             worker,
-            "_try_submit_deferred_load",
+            "_try_submit_async_load",
             lambda req_meta: submitted.append(req_meta.req_id) or True,
         )
         sources = [
@@ -4036,7 +4036,7 @@ class TestLayerwiseFormatOverlap:
             )
             for li, src in enumerate(sources)
         ]
-        meta = deferred_req_meta(
+        meta = load_req_meta(
             token_ids=list(range(4)), block_ids=[0], num_matched_chunks=1
         )
         assert meta.layerwise_load is False  # overlap off: scheduler never marks
@@ -4059,7 +4059,7 @@ class TestLayerwiseFormatOverlap:
     @pytest.mark.parametrize("timing", [False, True])
     def test_offthread_overlap_end_to_end_on_cuda(self, timing, capsys):
         """Loader thread queues per-layer copies from layerwise objects, the
-        gate unparks the request, and the resumed forward waits per layer."""
+        gate resumes the request, and the resumed forward waits per layer."""
         import time as _time
 
         from maru_vllm.connector import MaruConnectorMetadata
@@ -4094,7 +4094,7 @@ class TestLayerwiseFormatOverlap:
             )
         worker._handler = MagicMock()
         worker._handler.batch_retrieve.return_value = infos
-        meta = deferred_req_meta(
+        meta = load_req_meta(
             token_ids=list(range(8)), block_ids=[0, 1], num_matched_chunks=2
         )
         meta.layerwise_load = True
@@ -4157,7 +4157,7 @@ class _FakeAdmissionEvent:
 
 
 class TestLoadAdmissionWindow:
-    """Enqueue-time admission: bound in-flight deferred loads."""
+    """Enqueue-time admission: bound in-flight async loads."""
 
     def _make_worker(self, window):
         return make_worker(
@@ -4178,7 +4178,7 @@ class TestLoadAdmissionWindow:
         worker = self._make_worker(1)
         oldest = _FakeAdmissionEvent()
         newer = _FakeAdmissionEvent()
-        worker._deferred_events = {"r1": oldest, "r2": newer}
+        worker._async_load_events = {"r1": oldest, "r2": newer}
 
         worker._wait_for_load_admission("r3")
 
@@ -4190,7 +4190,7 @@ class TestLoadAdmissionWindow:
     def test_gate_passes_below_window_without_waiting(self):
         worker = self._make_worker(2)
         outstanding = _FakeAdmissionEvent()
-        worker._deferred_events = {"r1": outstanding}
+        worker._async_load_events = {"r1": outstanding}
 
         worker._wait_for_load_admission("r2")
 
@@ -4199,7 +4199,7 @@ class TestLoadAdmissionWindow:
     def test_gate_ignores_completed_events(self):
         worker = self._make_worker(1)
         done = _FakeAdmissionEvent(complete=True)
-        worker._deferred_events = {"r1": done}
+        worker._async_load_events = {"r1": done}
 
         worker._wait_for_load_admission("r2")
 
@@ -4210,7 +4210,7 @@ class TestLoadAdmissionWindow:
 
         worker._wait_for_load_admission("r1")
 
-        assert worker._deferred_events == {}
+        assert worker._async_load_events == {}
 
 
 # =============================================================================
@@ -5452,11 +5452,11 @@ class TestPackedStorage:
 
 
 class TestStartLoadKvEarlyReturnSafety:
-    """Early returns must strand no parked request and leak no per-step state.
+    """Early returns must release waiting requests and reset per-step state.
 
     ``start_load_kv`` can return before iterating ``metadata.requests``
-    (worker handler in connect backoff, no attention layers). Deferred
-    requests are already parked in WAITING_FOR_REMOTE_KVS and must degrade
+    (worker handler in connect backoff, no attention layers). Requests in
+    WAITING_FOR_REMOTE_KVS must be released for recomputation
     to recompute via ``get_finished_loading``/``take_failed_load_blocks``
     instead of hanging. Independently, the previous step's packed-store
     dispatch state (``_store_layers_seen``, incomplete ``_pending_slabs``)
@@ -5474,12 +5474,12 @@ class TestStartLoadKvEarlyReturnSafety:
         worker._handler_retry_after = _time.monotonic() + 60.0
         return worker
 
-    def _metadata(self, deferred=True):
-        return deferred_metadata(
+    def _metadata(self, is_async=True):
+        return load_metadata(
             token_ids=list(range(16)),
             block_ids=[0, 1, 2, 3],
             num_matched_chunks=2,
-            deferred_load=deferred,
+            async_load=is_async,
         )
 
     def _forward(self, with_layer=True):
@@ -5490,7 +5490,7 @@ class TestStartLoadKvEarlyReturnSafety:
             )
         return SimpleNamespace(no_compile_layers=layers, attn_metadata=None)
 
-    def test_handler_outage_degrades_deferred_load_to_recompute(self):
+    def test_handler_outage_degrades_async_load_to_recompute(self):
         worker = self._worker_in_backoff()
 
         worker.start_load_kv(self._forward(), self._metadata())
@@ -5498,7 +5498,7 @@ class TestStartLoadKvEarlyReturnSafety:
         assert worker.get_finished_loading() == {"r1"}
         assert worker.take_failed_load_blocks() == {0, 1, 2, 3}
 
-    def test_no_attention_layers_degrades_deferred_load_to_recompute(self):
+    def test_no_attention_layers_degrades_async_load_to_recompute(self):
         worker = self._make_worker()
         worker._handler = MagicMock()
 
@@ -5507,22 +5507,22 @@ class TestStartLoadKvEarlyReturnSafety:
         assert worker.get_finished_loading() == {"r1"}
         assert worker.take_failed_load_blocks() == {0, 1, 2, 3}
 
-    def test_inline_load_unaffected_by_handler_outage(self):
+    def test_sync_load_unaffected_by_handler_outage(self):
         worker = self._worker_in_backoff()
 
-        worker.start_load_kv(self._forward(), self._metadata(deferred=False))
+        worker.start_load_kv(self._forward(), self._metadata(is_async=False))
 
         assert worker.get_finished_loading() is None
         assert worker.take_failed_load_blocks() == set()
 
-    def test_zero_matched_chunks_degrades_deferred_load_to_recompute(self):
-        """A parked request with nothing to load must still be reported.
+    def test_zero_matched_chunks_degrades_async_load_to_recompute(self):
+        """A request waiting for KV needs a completion even with zero chunks.
 
         `update_state_after_alloc` defaults its match result to 0 when the
-        entry is missing, so the scheduler can emit a deferred request with
+        entry is missing, so the scheduler can emit an async load with
         `num_matched_chunks=0`. The worker reaches its request loop normally
         in that case — the early returns never fire — so the loop itself has
-        to report the request or it stays parked forever.
+        to report the request or it stays waiting forever.
         """
         worker = self._make_worker()
         worker._handler = MagicMock()
@@ -5534,10 +5534,10 @@ class TestStartLoadKvEarlyReturnSafety:
         assert worker.get_finished_loading() == {"r1"}
         assert worker.take_failed_load_blocks() == {0, 1, 2, 3}
 
-    def test_zero_matched_chunks_inline_load_unaffected(self):
+    def test_zero_matched_chunks_sync_load_unaffected(self):
         worker = self._make_worker()
         worker._handler = MagicMock()
-        metadata = self._metadata(deferred=False)
+        metadata = self._metadata(is_async=False)
         metadata.requests[0].num_matched_chunks = 0
 
         worker.start_load_kv(self._forward(), metadata)
@@ -5585,7 +5585,7 @@ class TestStartLoadKvEarlyReturnSafety:
         """An outage must neither leak the handle nor leave it reusable.
 
         The sweep cannot free a handle while the handler is down, so it
-        parks it. Leaving the entry in ``_pending_slabs`` instead would let
+        queues it. Leaving the entry in ``_pending_slabs`` instead would let
         a later layer of the same chunk — once the handler recovers
         mid-step — resume writing into a slab that was already condemned,
         mixing planes written in different steps.
@@ -5808,14 +5808,14 @@ class TestKvOpsResolution:
         )
 
 
-class TestDeferredAdmissionFitsCache:
-    """Parked loads must leave room for the oldest one to resume.
+class TestAsyncLoadAdmissionFitsCache:
+    """Async loads must leave room for the oldest one to resume.
 
-    A request parked for a deferred load holds blocks for its loaded prefix
+    A request waiting for its async load holds blocks for its loaded prefix
     only, yet resumes only when its whole prompt fits. vLLM checks that fit
     for each request against the blocks free at that moment, so several
-    parked requests can together hold the pool while the oldest still needs
-    more. With nothing running, nothing frees a block and the engine stops.
+    requests waiting for KV can fill the pool while the oldest still needs more
+    blocks. With nothing running, nothing frees a block and the engine stops.
     """
 
     # 200 tokens with 12 cached chunks: 24 blocks held, 50 needed in all.
@@ -5852,20 +5852,20 @@ class TestDeferredAdmissionFitsCache:
             KVConnectorOutput(finished_sending=None, finished_recving=set(req_ids))
         )
 
-    def test_oldest_parked_request_resumes(self, tmp_path):
+    def test_oldest_async_request_resumes(self, tmp_path):
         from vllm.v1.request import RequestStatus
 
         engine = self._engine(tmp_path)
         requests = [self._add(engine, name) for name in self.PROMPTS]
         engine.schedule()
-        parked = [
+        is_async = [
             r.request_id
             for r in requests
             if r.status == RequestStatus.WAITING_FOR_REMOTE_KVS
         ]
-        assert "big" in parked
+        assert "big" in is_async
 
-        self._finish_loads(engine, parked)
+        self._finish_loads(engine, is_async)
         output = engine.schedule()
         assert output.num_scheduled_tokens.get("big", 0) > 0
 
@@ -5886,7 +5886,7 @@ class TestDeferredAdmissionFitsCache:
         engine.add_request(running)  # 16 blocks, nothing in Maru
         engine.schedule()
         self._add(engine, "mid")
-        engine.schedule()  # mid parks
+        engine.schedule()  # mid waits for its async load
         big, small = self._add(engine, "big"), self._add(engine, "small")
         engine.schedule()  # both wait for the budget, big first
         self._finish_loads(engine, ["mid"])
@@ -5901,7 +5901,7 @@ class TestDeferredAdmissionFitsCache:
         assert big.status == RequestStatus.WAITING_FOR_REMOTE_KVS
         assert small.status == RequestStatus.WAITING  # big 50 + small 15 > 63
 
-    def test_requests_parked_alone_still_resume(self, tmp_path):
+    def test_requests_loading_async_alone_still_resume(self, tmp_path):
         from vllm.v1.request import RequestStatus
 
         engine = self._engine(tmp_path)
@@ -5938,13 +5938,13 @@ class TestDeferredAdmissionFitsCache:
             engine.add_request(request)
             requests.append(request)
         engine.schedule()
-        parked = [
+        is_async = [
             r.request_id
             for r in requests
             if r.status == RequestStatus.WAITING_FOR_REMOTE_KVS
         ]
-        assert "big" in parked
-        self._finish_loads(engine, parked)
+        assert "big" in is_async
+        self._finish_loads(engine, is_async)
         assert any(
             engine.schedule().num_scheduled_tokens.get("big", 0) > 0 for _ in range(4)
         )
@@ -5988,8 +5988,8 @@ class TestDeferredAdmissionFitsCache:
             engine.add_request(request)
         engine.schedule()
         # Without lookahead slots both prompts fit (50 + 13 of 63 blocks), so
-        # Maru holds neither back. Whether small parks too is vLLM's call:
-        # 0.31+ reserves every speculative method's draft slots for a parked
+        # Maru holds neither back. Whether small loads async too is vLLM's call:
+        # 0.31+ reserves every speculative method's draft slots for an async
         # load itself (Scheduler._spec_decode_step_blocks), older vLLM none.
         assert sched._num_lookahead_tokens == 0
         assert not sched._admission_waiters
@@ -6025,17 +6025,17 @@ class TestDeferredAdmissionFitsCache:
         # 17 blocks including lookahead, both fit the 67 usable blocks, so
         # Maru admits both. vLLM 0.31+ also reserves big's draft slots
         # itself and may hold small back on its own account.
-        assert sched._parked_blocks.get("big") == 50
+        assert sched._async_load_blocks.get("big") == 50
         assert not sched._admission_waiters
         assert requests[0].status == RequestStatus.WAITING_FOR_REMOTE_KVS
         if not hasattr(engine, "_spec_decode_step_blocks"):
             assert requests[1].status == RequestStatus.WAITING_FOR_REMOTE_KVS
-        parked = [
+        is_async = [
             r.request_id
             for r in requests
             if r.status == RequestStatus.WAITING_FOR_REMOTE_KVS
         ]
-        self._finish_loads(engine, parked)
+        self._finish_loads(engine, is_async)
         assert engine.schedule().num_scheduled_tokens.get("big", 0) > 0
 
     def test_upstream_reservation_allows_overlapping_loads(self, tmp_path):
@@ -6072,7 +6072,7 @@ class TestDeferredAdmissionFitsCache:
             request_id=name, prompt_token_ids=list(range(n)), num_tokens=n
         )
 
-    def _park(self, sched, request):
+    def _start_async_load(self, sched, request):
         matched, load_async = sched.get_num_new_matched_tokens(request, 0)
         assert matched and load_async
         blocks = MagicMock()
@@ -6081,7 +6081,7 @@ class TestDeferredAdmissionFitsCache:
 
     def test_load_that_would_overfill_the_cache_waits(self):
         sched = self._sched()
-        self._park(sched, self._request("big"))
+        self._start_async_load(sched, self._request("big"))
         mid = self._request("mid")
         assert sched.get_num_new_matched_tokens(mid, 0) == (None, False)
         assert "mid" not in sched._last_match_result
@@ -6089,7 +6089,7 @@ class TestDeferredAdmissionFitsCache:
     def test_waiting_request_keeps_its_place(self):
         sched = self._sched()
         big, mid, small = (self._request(n) for n in ("big", "mid", "small"))
-        self._park(sched, big)
+        self._start_async_load(sched, big)
         assert sched.get_num_new_matched_tokens(mid, 0)[0] is None
         # 50 + 15 fits 64 only without mid; mid asked first, so small waits.
         sched._num_gpu_blocks = 66
@@ -6101,7 +6101,7 @@ class TestDeferredAdmissionFitsCache:
     def test_let_through_request_waits_until_it_gets_blocks(self):
         sched = self._sched()
         big, mid, small = (self._request(n) for n in ("big", "mid", "small"))
-        self._park(sched, mid)
+        self._start_async_load(sched, mid)
         assert sched.get_num_new_matched_tokens(big, 0)[0] is None
         assert sched.get_num_new_matched_tokens(small, 0)[0] is None
         sched.update_state_after_alloc(mid, MagicMock(), 0)  # mid resumed
@@ -6110,13 +6110,13 @@ class TestDeferredAdmissionFitsCache:
         assert sched.get_num_new_matched_tokens(small, 0) == (None, False)
         assert sched.get_num_new_matched_tokens(big, 0)[1] is True  # asked again
         assert sched.get_num_new_matched_tokens(small, 0) == (None, False)
-        self._park(sched, big)  # vLLM gave big its blocks
+        self._start_async_load(sched, big)  # vLLM gave big its blocks
         assert "big" not in sched._admission_waiters
 
     def test_finished_requests_release_their_room(self):
         sched = self._sched()
         big, mid = self._request("big"), self._request("mid")
-        self._park(sched, big)
+        self._start_async_load(sched, big)
         assert sched.get_num_new_matched_tokens(mid, 0)[0] is None
         sched.build_connector_meta(self._finished("big"))
         assert sched.get_num_new_matched_tokens(mid, 0)[1] is True
@@ -6124,7 +6124,7 @@ class TestDeferredAdmissionFitsCache:
     def test_abandoned_waiter_stops_blocking(self):
         sched = self._sched(num_gpu_blocks=66)  # big 50 + small 15 fits
         big, mid, small = (self._request(n) for n in ("big", "mid", "small"))
-        self._park(sched, big)
+        self._start_async_load(sched, big)
         assert sched.get_num_new_matched_tokens(mid, 0)[0] is None
         assert sched.get_num_new_matched_tokens(small, 0)[0] is None
         sched.build_connector_meta(self._finished("mid"))
@@ -6151,7 +6151,7 @@ class TestDeferredAdmissionFitsCache:
         engine.schedule()
         assert "big" not in sched._last_match_result
         assert "big" not in sched._admission_waiters
-        assert "big" not in sched._parked_blocks
+        assert "big" not in sched._async_load_blocks
 
     def test_failed_load_asked_again_drops_its_old_room(self):
         # A failed load that invalidates the first block sends the request
@@ -6160,7 +6160,7 @@ class TestDeferredAdmissionFitsCache:
         # against the waiter it shares room with.
         sched = self._sched(num_gpu_blocks=70)
         big, mid = self._request("big"), self._request("mid")
-        self._park(sched, big)
+        self._start_async_load(sched, big)
         assert sched.get_num_new_matched_tokens(mid, 0)[0] is None
         assert sched.get_num_new_matched_tokens(big, 0) == (0, False)
         assert sched.get_num_new_matched_tokens(mid, 0)[1] is True
@@ -6176,7 +6176,7 @@ class TestDeferredAdmissionFitsCache:
 
         sched._count_matched_chunks = count
         big, mid = self._request("big"), self._request("mid")
-        self._park(sched, big)
+        self._start_async_load(sched, big)
         assert sched.get_num_new_matched_tokens(mid, 0)[0] is None
         lookups.clear()
         for _ in range(3):  # vLLM asks again every step
@@ -6189,7 +6189,7 @@ class TestDeferredAdmissionFitsCache:
     def test_waiter_whose_prefix_is_gone_computes_once_it_fits(self):
         sched = self._sched()
         big, mid = self._request("big"), self._request("mid")
-        self._park(sched, big)
+        self._start_async_load(sched, big)
         assert sched.get_num_new_matched_tokens(mid, 0)[0] is None
         # Evicted while it waited.
         sched._count_matched_chunks = lambda ids, keys=None: 0
@@ -6243,11 +6243,11 @@ class TestDeferredAdmissionFitsCache:
 
     def test_no_limit_without_block_count(self):
         sched = self._sched(num_gpu_blocks=None)
-        self._park(sched, self._request("big"))
+        self._start_async_load(sched, self._request("big"))
         assert sched.get_num_new_matched_tokens(self._request("mid"), 0)[1] is True
 
 
-class TestAbortDeferredWriteBehind:
+class TestAbortAsyncLoadWriteBehind:
     """Exercise both completion channels against vLLM's scheduler consumer."""
 
     @pytest.mark.parametrize("overlap", [False, True])
@@ -6269,8 +6269,8 @@ class TestAbortDeferredWriteBehind:
         # the test follows the installed vLLM's own retention rules.
         engine = make_vllm_scheduler(tmp_path, 4, 8, config)
         sched = engine.connector._scheduler
-        # One chunk of the 8-token prompt is in Maru, so vLLM parks the
-        # request in WAITING_FOR_REMOTE_KVS for a deferred load.
+        # One chunk of the 8-token prompt is in Maru, so vLLM holds the
+        # request in WAITING_FOR_REMOTE_KVS for an async load.
         sched._count_matched_chunks = lambda token_ids, keys=None: 1
         worker = make_worker(4, 8, config)
         facade = SimpleNamespace(_worker=worker, _scheduler=sched)
@@ -6290,7 +6290,7 @@ class TestAbortDeferredWriteBehind:
 
         early = (None, None)
         if timing != "pending":
-            worker._deferred_done.add("r1")
+            worker._async_load_done.add("r1")
         if timing in ("in_transit", "received"):
             early = MaruKVConnector.get_finished(facade, set())
         if timing == "received":
@@ -6310,7 +6310,7 @@ class TestAbortDeferredWriteBehind:
         if timing == "pending":
             assert result == (None, None)  # No early send frees a live H2D target.
             assert pool.get_num_free_blocks() < free_blocks
-            worker._deferred_done.add("r1")
+            worker._async_load_done.add("r1")
             result = MaruKVConnector.get_finished(facade, set())
         # A second report for the same request would trip vLLM's own
         # ``req_id in self.requests`` assertion inside consume().
@@ -6319,7 +6319,7 @@ class TestAbortDeferredWriteBehind:
         assert not engine.requests
         assert pool.get_num_free_blocks() == free_blocks
         assert not worker._recv_only_finished_req_ids
-        assert not sched._awaiting_deferred_recv
+        assert not sched._awaiting_async_load_recv
 
     def test_recv_only_abort_does_not_wait_for_unrelated_stores(self):
         from maru_vllm.connector import MaruConnectorMetadata
@@ -6340,7 +6340,7 @@ class TestAbortDeferredWriteBehind:
         sched = make_scheduler(4, 8, {"maru_async_store": True})
         worker = make_worker(4, 8, {"maru_async_store": True})
         request = SimpleNamespace(request_id="r1")
-        sched._awaiting_deferred_recv.add("r1")
+        sched._awaiting_async_load_recv.add("r1")
         sched.update_connector_output(SimpleNamespace(finished_recving={"r1"}))
         assert sched.request_finished(request, [0, 1]) == (True, None)
         TestWriteBehindStoreLifecycle._reserve(worker)
@@ -6352,7 +6352,7 @@ class TestAbortDeferredWriteBehind:
 @pytest.mark.parametrize("factory", [make_scheduler, make_worker])
 @pytest.mark.parametrize("knob", ["maru_async_load", "maru_enable_deferred_loading"])
 @pytest.mark.parametrize("version", ["0.14.0", "0.15.1", "0.16.0rc1", "unknown"])
-def test_deferred_loading_rejects_unsafe_vllm(monkeypatch, factory, knob, version):
+def test_async_loading_rejects_unsafe_vllm(monkeypatch, factory, knob, version):
     import vllm
 
     monkeypatch.setattr(vllm, "__version__", version)
@@ -6363,7 +6363,7 @@ def test_deferred_loading_rejects_unsafe_vllm(monkeypatch, factory, knob, versio
 
 @pytest.mark.parametrize("factory", [make_scheduler, make_worker])
 @pytest.mark.parametrize("version", ["0.16.0", "0.16.0+local", "0.22.1rc1.dev31"])
-def test_deferred_loading_accepts_supported_vllm(monkeypatch, factory, version):
+def test_async_loading_accepts_supported_vllm(monkeypatch, factory, version):
     import vllm
 
     monkeypatch.setattr(vllm, "__version__", version)
@@ -6412,17 +6412,17 @@ class TestRequestTrace:
                 # A real executor may start the job before submit returns.
                 job(*args)
 
-        worker._deferred_executor = ImmediateExecutor()
+        worker._async_load_executor = ImmediateExecutor()
 
         def job(req_meta, layers, device):
             if timing:
                 worker._trace_worker_req("job_start", req_meta.req_id)
 
-        monkeypatch.setattr(worker, "_deferred_load_job", job)
-        req_meta = deferred_req_meta(
+        monkeypatch.setattr(worker, "_async_load_job", job)
+        req_meta = load_req_meta(
             token_ids=list(range(8)), block_ids=[0, 1], num_matched_chunks=1
         )
-        assert worker._try_submit_deferred_load(req_meta)
+        assert worker._try_submit_async_load(req_meta)
         events = [line.split()[1] for line in capsys.readouterr().err.splitlines()]
         assert events == (["retrieve_submit", "job_start"] if timing else [])
 
@@ -6436,8 +6436,8 @@ class TestRequestTrace:
             SimpleNamespace(view=memoryview(bytearray(2 * 8 * 4)))
         ]
         device = torch.device("cpu")
-        worker._deferred_stream = MagicMock()
-        worker._deferred_stream_device = device
+        worker._async_load_stream = MagicMock()
+        worker._async_load_stream_device = device
         monkeypatch.setattr(torch.cuda, "set_device", lambda device: None)
         monkeypatch.setattr(
             torch.cuda, "stream", lambda stream: contextlib.nullcontext()
@@ -6468,12 +6468,10 @@ class TestRequestTrace:
             trace(event, req_id, **fields)
 
         monkeypatch.setattr(worker, "_trace_worker_req", trace_req)
-        req_meta = deferred_req_meta(
+        req_meta = load_req_meta(
             token_ids=list(range(8)), block_ids=[0, 1], num_matched_chunks=1
         )
-        worker._deferred_load_job(
-            req_meta, [("l0", torch.zeros(2, 2, 4, 1), 0)], device
-        )
+        worker._async_load_job(req_meta, [("l0", torch.zeros(2, 2, 4, 1), 0)], device)
 
         assert ready_at_enqueue == [None]
         assert worker.take_failed_load_blocks() == set()
@@ -6612,8 +6610,8 @@ class TestRequestTrace:
         reloading = engine.schedule()
         assert reloading.preempted_req_ids == {"r1"}
         assert request.status == RequestStatus.WAITING_FOR_REMOTE_KVS
-        assert "r1" in scheduler._awaiting_deferred_recv
-        assert "r1" in scheduler._deferred_layerwise_waiting
+        assert "r1" in scheduler._awaiting_async_load_recv
+        assert "r1" in scheduler._async_layerwise_waiting
         capsys.readouterr()
 
         engine._update_from_kv_xfer_finished(KVConnectorOutput(finished_recving={"r1"}))
@@ -6666,9 +6664,7 @@ class TestRequestTrace:
 
     @pytest.mark.parametrize("timing", [True, False])
     @pytest.mark.parametrize("preempted", [False, True], ids=["new", "resumed"])
-    def test_scheduler_traces_a_deferred_load(
-        self, tmp_path, capsys, timing, preempted
-    ):
+    def test_scheduler_traces_an_async_load(self, tmp_path, capsys, timing, preempted):
         from vllm.sampling_params import SamplingParams
         from vllm.v1.outputs import KVConnectorOutput
         from vllm.v1.request import Request, RequestStatus
