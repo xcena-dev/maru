@@ -127,6 +127,7 @@ The previous column identifies the replaced behavior; it is not a list of availa
 | CUDA graphs | Removed backends required eager execution | Yes |
 | Pipeline or context parallelism | Rejected | Rejected |
 | Model layouts | Backend-specific restrictions | See {doc}`../integration/supported_models`; remote uses chunkwise format |
+| Quantized (FP8) KV cache | Rejected by `cpu` and `remote_cxl` | Yes, except scales calculated at runtime (`calculate_kv_scales`), which are rejected at startup |
 | Multimodal, LoRA, salted or embedding requests | Uncacheable | Computed without Maru caching |
 | Read hints and promote | Agent extension | Remote memory-node extension; `cxl` keeps handler plugins |
 | Write hint and bounded write wait | Agent extension | Remote reservation; configured on GPU service |
@@ -140,7 +141,7 @@ Node-local keys can be read by other engines on that node when their namespace a
 
 Remote keys become visible only after the memory node commits them. Reads use worker-owned registered staging; there is no GPU-node read cache. Concurrent reads can share an in-progress READ within one worker, without sharing staging across workers.
 
-A full GPU `dram` or `local_cxl` store skips new stores. A full memory-node store evicts unpinned keys using one shared LRU. Source pins protect reads; a GPU-service restart preserves orphan pins for old live workers until their reads end or their exit is verified.
+A full GPU `dram` or `local_cxl` store skips new stores. A full memory-node store evicts unpinned keys using one shared LRU. Source pins protect reads; a GPU-service restart preserves orphan pins for old live workers until their reads end or their exit is verified. If a `remote` worker's connection to its GPU service ends while that service keeps running, the worker stops remote loads and stores until its vLLM process restarts, and keeps in-flight reads until they finish. After a GPU-service restart, workers attach to the new run and recover. `dram` and `local_cxl` workers attach again to the same run.
 
 A Catalog restart loses all keys. Service runs using DRAM lose their pools. Local CXL reuse requires matching Catalog, boot and memory generation plus safe region adoption. A memory reset invalidates that memory node's old keys.
 
