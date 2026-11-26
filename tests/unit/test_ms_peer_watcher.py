@@ -67,12 +67,20 @@ def test_proc_read_errors_are_unknown_and_close_the_pidfd(watcher, monkeypatch, 
     def unknown(pid):
         raise error
 
+    closed = []
+    close = os.close
+
+    def track_close(fd):
+        closed.append(fd)
+        close(fd)
+
     monkeypatch.setattr(os, "pidfd_open", record)
+    monkeypatch.setattr(os, "close", track_close)
     monkeypatch.setattr(peer_watcher, "process_start_time", unknown)
     assert watcher.watch("self", os.getpid(), 7) is None
     assert not watcher.watching("self")
-    with pytest.raises(OSError, match="Bad file descriptor"):
-        os.fstat(opened[0])
+    # Another thread may reuse the fd number at once, so check the close call
+    assert opened[0] in closed
 
 
 def test_unknown_rewatch_preserves_the_existing_watch(watcher, monkeypatch):
