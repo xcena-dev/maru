@@ -155,8 +155,15 @@ import json
 import sys
 import urllib.request
 
-prompt = " ".join(f"Line {i}: Maru shares KV cache between engines." for i in range(200))
-body = {"model": "Qwen/Qwen3-0.6B", "prompt": prompt, "max_tokens": 16, "temperature": 0}
+prompt = " ".join(
+    f"Line {i}: Maru shares KV cache between engines." for i in range(200)
+)
+body = {
+    "model": "Qwen/Qwen3-0.6B",
+    "prompt": prompt,
+    "max_tokens": 16,
+    "temperature": 0,
+}
 request = urllib.request.Request(
     f"{sys.argv[1]}/v1/completions",
     data=json.dumps(body).encode(),
