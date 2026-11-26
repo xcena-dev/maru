@@ -43,7 +43,9 @@ def _engine():
     worker._num_layers = 1
     worker._kv_layout = worker._resolve_kv_layout(worker._kv_caches)
     stored = attach_capturing_handler(worker, capture=bytearray)
-    worker._handler.batch_exists.side_effect = lambda keys: [k in stored for k in keys]
+    worker._handler.batch_exists.side_effect = lambda keys, strict=False: [
+        k in stored for k in keys
+    ]
     scheduler._handler = MagicMock()
     scheduler._handler.batch_exists.side_effect = lambda keys: [
         k in stored for k in keys
@@ -105,8 +107,22 @@ def test_a_skipped_key_the_server_still_has_stays_known():
     _compute(scheduler, worker, kv, "r1")
     worker._is_stored(keys[1])
     worker.confirm_skipped_stores()
-    worker._handler.batch_exists.assert_called_once_with([keys[1]])
+    worker._handler.batch_exists.assert_called_once_with([keys[1]], strict=True)
     assert keys[1] in worker._stored_keys
     worker.confirm_skipped_stores()  # Nothing skipped since: no request.
     assert worker._handler.batch_exists.call_count == 1
+    worker.shutdown()
+
+
+def test_skipped_keys_are_kept_when_the_server_cannot_be_asked():
+    scheduler, worker, kv, stored = _engine()
+    keys = _chunk_keys(list(range(TOKENS)), CHUNK)
+    _compute(scheduler, worker, kv, "r1")
+    known = set(worker._stored_keys)
+    worker._handler.batch_exists.side_effect = ConnectionError("MaruServer is down")
+
+    _compute(scheduler, worker, kv, "r2")  # Every chunk is skipped, then asked.
+
+    worker._handler.batch_exists.assert_called_once_with(sorted(keys), strict=True)
+    assert worker._stored_keys == known
     worker.shutdown()

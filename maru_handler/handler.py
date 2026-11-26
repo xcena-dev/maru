@@ -1329,7 +1329,13 @@ class MaruHandler:
         self._record_stats("batch_store", total_bytes, (time.monotonic() - t0) * 1e6)
         return results
 
-    def batch_exists(self, keys: list[str], route_key: str | None = None) -> list[bool]:
+    def batch_exists(
+        self,
+        keys: list[str],
+        route_key: str | None = None,
+        *,
+        strict: bool = False,
+    ) -> list[bool]:
         """Check if multiple keys exist.
 
         Uses a single batch RPC call instead of N individual calls.
@@ -1338,6 +1344,10 @@ class MaruHandler:
             keys: List of chunk key strings
             route_key: The request's first chunk key. With several remote_cxl
                 pools it picks the pool; other backends ignore it.
+            strict: Raise if MaruServer cannot be asked, so that False always
+                means MaruServer answered that the key is absent. By default a
+                failed request answers False for every key. The storage-client
+                backends ignore it.
 
         Returns:
             List of booleans indicating existence for each key
@@ -1351,6 +1361,8 @@ class MaruHandler:
             batch_resp = self._rpc.batch_exists_kv(keys)
         except Exception:
             logger.error("batch_exists RPC failed", exc_info=True)
+            if strict:
+                raise
             return [False] * len(keys)
         hits = sum(batch_resp.results)
         self._record_stats(

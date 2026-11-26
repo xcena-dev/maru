@@ -688,6 +688,17 @@ class TestMaruHandlerCoverage:
 
         handler.close()
 
+    def test_batch_exists_strict_raises_when_the_rpc_fails(self):
+        """strict=True: a failed request is not reported as absent keys."""
+        handler = _make_mock_handler()
+
+        handler._rpc.batch_exists_kv = MagicMock(side_effect=RuntimeError("RPC failed"))
+
+        with pytest.raises(RuntimeError, match="RPC failed"):
+            handler.batch_exists(keys=["1", "2", "3"], strict=True)
+
+        handler.close()
+
     # =================================================================
     # Properties
     # =================================================================

@@ -9283,9 +9283,9 @@ class MaruWorkerConnector:
         store a chunk again is the sign that a lookup did not find it, so the
         keys skipped in the step are checked with one ``batch_exists``. A key
         that is gone leaves the set, and the chunk is stored the next time it
-        is computed. If MaruServer cannot be asked, the handler answers False
-        for every key: the chunks are then copied again and ``batch_store``
-        sorts out which of them exist.
+        is computed. If MaruServer cannot be asked, nothing is forgotten: no
+        answer is not a delete, and forgetting every skipped key would copy
+        all of them again in the next step.
         """
         if not self._skipped_as_stored:
             return
@@ -9295,11 +9295,13 @@ class MaruWorkerConnector:
             return
         keys = sorted(skipped)
         try:
-            exists = handler.batch_exists(keys)
+            exists = handler.batch_exists(keys, strict=True)
         except Exception:
             logger.debug("Maru could not confirm skipped stores", exc_info=True)
             return
-        gone = [key for key, found in zip(keys, exists, strict=False) if not found]
+        if len(exists) != len(keys):
+            return
+        gone = [key for key, found in zip(keys, exists, strict=True) if not found]
         if gone:
             self._stored_keys.difference_update(gone)
             logger.info(
