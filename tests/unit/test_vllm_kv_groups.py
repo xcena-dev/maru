@@ -52,6 +52,7 @@ from maru_vllm.kv_groups import (
     GROUP_SLIDING_WINDOW,
     GROUP_UNSUPPORTED,
     KVGroup,
+    _fills_its_span,
     _spec_kind,
     check_multi_group_support,
     check_one_group_support,
@@ -504,11 +505,9 @@ def test_connector_starts_with_dsv41_without_bounded_replay(setting, chunk, laye
     assert connector._scheduler._kv_chunk_tokens == chunk
 
 
-@pytest.mark.parametrize("ratio", [1, 2], ids=["same-block", "larger-block"])
-def test_a_mamba_group_beside_an_mla_group_is_refused(ratio):
-    """A Mamba group pins the chunk to one block, which holds no whole block
-    of an MLA group with larger blocks. The pair (GLM-5.3-Flash's Kimi Delta
-    Attention states and DSA caches) is refused whatever the block sizes."""
+def _kda_beside_dsa(ratio, side):
+    """GLM-5.3-Flash's shape: Kimi Delta Attention states beside a group of
+    DSA caches, MLA caches alone, on blocks ``ratio`` times the states'."""
     mamba = dataclasses.replace(_mamba_spec(), block_size=DSV41_BLOCK)
     mla = {
         name: MLAAttentionSpec(
@@ -519,15 +518,81 @@ def test_a_mamba_group_beside_an_mla_group_is_refused(ratio):
         )
         for name, size in DSV41_MEMBERS.items()
     }
-    config = SimpleNamespace(
+    return SimpleNamespace(
         kv_cache_groups=[
             KVCacheGroupSpec(["layers.0.kda", "layers.1.kda"], mamba),
-            _group(mla, "worker"),
+            _group(mla, side),
         ],
         num_blocks=NUM_BLOCKS,
     )
-    with pytest.raises(ValueError, match="Mamba-type and an MLA"):
+
+
+def test_a_mamba_group_beside_a_group_of_mla_caches_alone_is_refused():
+    """GLM-5.3-Flash has not been run. Only Qwen3.8-Flash-Next's pair is
+    supported, whose MLA group is of full-attention layers that each keep an
+    MLA cache (see ``flash_next_config``)."""
+    with pytest.raises(ValueError, match="Mamba-type and an MLA .* GLM-5.3-Flash"):
+        _check_dsv41(_kda_beside_dsa(1, "worker"))
+
+
+def test_only_the_worker_tells_a_group_of_mla_caches_alone():
+    """The scheduler sees the group's first member, an MLA cache in
+    Qwen3.8-Flash-Next too, so the worker's refusal stops the engine."""
+    _check_dsv41(_kda_beside_dsa(1, "scheduler"))
+
+
+def test_a_mamba_group_beside_a_plain_mla_group_is_refused_by_the_worker():
+    """Without packing vLLM hands the worker a group of MLA caches as one
+    plain spec, as it hands every such group to the scheduler. The worker
+    knows it sees every member, so the group has no full-attention one."""
+    config = _kda_beside_dsa(1, "scheduler")  # the plain spec, on either side
+    groups = describe_kv_groups(config)
+    assert groups[1].member_specs == ()
+    check = {
+        "block_size": DSV41_BLOCK,
+        "use_layerwise": False,
+        "speculative_method": None,
+        "inline_loads": False,
+    }
+    check_multi_group_support(groups, **check)
+    with pytest.raises(ValueError, match="Mamba-type and an MLA .* GLM-5.3-Flash"):
+        check_multi_group_support(groups, sees_members=True, **check)
+
+
+def test_only_the_worker_role_refuses_a_plain_mla_group_beside_a_mamba_group():
+    config = _kda_beside_dsa(1, "scheduler")
+    connector = MaruKVConnector(
+        _connector_config(DSV41_BLOCK), KVConnectorRole.SCHEDULER, config
+    )
+    assert connector._scheduler._multi_group
+    with pytest.raises(ValueError, match="Mamba-type and an MLA .* GLM-5.3-Flash"):
+        MaruKVConnector(_connector_config(DSV41_BLOCK), KVConnectorRole.WORKER, config)
+
+
+def test_a_mamba_group_beside_a_windowed_mla_group_is_refused():
+    """A window group keeps only the blocks its window reaches."""
+    window = _window_mla(DSV41_BLOCK, bounded_replay=False)
+    config = SimpleNamespace(
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                ["layers.0.kda"],
+                dataclasses.replace(_mamba_spec(), block_size=DSV41_BLOCK),
+            ),
+            _group({"layers.1.attn.swa": window}, "worker"),
+        ],
+        num_blocks=NUM_BLOCKS,
+    )
+    assert describe_kv_groups(config)[1].windowed
+    with pytest.raises(ValueError, match="with a sliding window"):
         _check_dsv41(config)
+
+
+@pytest.mark.parametrize("side", ["worker", "scheduler"])
+def test_a_mamba_group_beside_an_mla_group_on_larger_blocks_is_refused(side):
+    """A Mamba group pins the chunk to one block, which holds no whole block
+    of an MLA group with larger blocks."""
+    with pytest.raises(ValueError, match="only when the MLA group uses the block"):
+        _check_dsv41(_kda_beside_dsa(2, side))
 
 
 def test_a_refused_model_does_not_first_warn_about_its_chunk(caplog):
@@ -562,15 +627,20 @@ def test_a_group_mixing_mla_and_window_layers_is_refused():
         _check_dsv41(config)
 
 
-def test_mamba_states_in_one_uniform_group_are_refused():
-    """vLLM wraps GLM-5.3-Flash's KDA states this way."""
+def test_mamba_states_in_one_uniform_group_are_a_mamba_group():
+    """vLLM wraps GLM-5.3-Flash's KDA states this way, and Qwen3.8-Flash-
+    Next's. Beside DeepSeek-V4.1's group of MLA caches alone they are still
+    refused, as GLM-5.3-Flash is."""
     names = ["layers.0.kda", "layers.1.kda"]
     states = UniformTypeKVCacheSpecs(
         block_size=DSV41_BLOCK, kv_cache_specs={n: _mamba_spec() for n in names}
     )
     config = dsv41_config()
     config.kv_cache_groups[5] = KVCacheGroupSpec(names, states)
-    with pytest.raises(ValueError, match="UniformTypeKVCacheSpecs"):
+    group = describe_kv_groups(config)[5]
+    assert (group.kind, group.state_bytes) == (GROUP_MAMBA, TINY_STATE)
+    assert (group.slot_bytes, group.mamba_cache_mode) == (TINY_SLOT, "align")
+    with pytest.raises(ValueError, match="Mamba-type and an MLA .* GLM-5.3-Flash"):
         _check_dsv41(config)
 
 
@@ -4412,3 +4482,510 @@ def test_tp_lookup_log_names_a_missing_rank_slice(caplog):
     with caplog.at_level(logging.INFO, logger="maru_vllm.connector"):
         assert _hit(_qwen35_scheduler(stored, **QWEN35_TP2), a) == 0
     assert any("a TP rank's slice" in r.getMessage() for r in caplog.records)
+
+
+# =============================================================================
+# Qwen3.8-Flash-Next
+# =============================================================================
+
+# The groups vLLM 0.32 builds for Qwen3.8-Flash-Next at tiny sizes: Gated
+# DeltaNet states, the PLE layer's conv state, the indexer's raw-key ring, and
+# the indexed-attention layers, whose KV and compressed keys (one per four
+# tokens) share a block table. The model's pages differ in size, so vLLM uses
+# a block-outermost layout: block b of every group starts at b x FN_STRIDE,
+# and a group's layers follow one another from there.
+FN_KEY_PAGE = TINY_BLOCK // 4 * 8 * 2  # 64 B: four bf16 keys of size 8
+FN_PAGE = 2 * (FN_KEY_PAGE + TINY_SLOT)  # 2,176 B: group 5's bytes per block
+FN_STRIDE = FN_PAGE  # the widest group sets vLLM's bytes per block
+FN_PLE_STATE = 3 * 16 * 2  # 96 B
+FN_NUM_BLOCKS = 16
+FN_GROUP = 5
+FN_STATES = range(4)  # three GDN groups and the PLE layer's
+FN_LAYERS = {
+    "layers.3.indexer.key": "key",
+    "layers.3.attn": "attn",
+    "layers.7.indexer.key": "key",
+    "layers.7.attn": "attn",
+}
+
+
+def _fn_key_spec(block=TINY_BLOCK):
+    if "tokens_per_state" not in {f.name for f in dataclasses.fields(MLAAttentionSpec)}:
+        pytest.skip("this vLLM keeps one state per token")
+    return MLAAttentionSpec(
+        block_size=block,
+        num_kv_heads=1,
+        head_size=8,
+        dtype=torch.bfloat16,
+        tokens_per_state=4,
+    )
+
+
+def _fn_ple_spec():
+    replicated = "tp_replicated" in {f.name for f in dataclasses.fields(MambaSpec)}
+    return MambaSpec(
+        block_size=TINY_BLOCK,
+        shapes=((3, 16),),
+        dtypes=(torch.bfloat16,),
+        page_size_padded=TINY_SLOT,
+        mamba_cache_mode="align",
+        **({"tp_replicated": True} if replicated else {}),
+    )
+
+
+def flash_next_config(side="worker", layers=FN_LAYERS, key_block=TINY_BLOCK):
+    """The worker sees every group as a UniformTypeKVCacheSpecs and the
+    scheduler its first member, as vLLM hands them over."""
+    specs = {"key": _fn_key_spec(key_block), "attn": FullAttentionSpec(**_attn_kw())}
+    groups = [
+        _group({f"layers.{i}.linear_attn": _mamba_spec() for i in gdn}, side)
+        for gdn in TINY_GDN
+    ]
+    groups.append(_group({"layers.1.ple": _fn_ple_spec()}, side))
+    groups.append(_group({f"layers.{i}.indexer.ring": _ring(4) for i in (3, 7)}, side))
+    groups.append(_group({name: specs[kind] for name, kind in layers.items()}, side))
+    return SimpleNamespace(kv_cache_groups=groups, num_blocks=FN_NUM_BLOCKS)
+
+
+def _fn_shared(rank=0):
+    return (
+        (torch.arange(FN_NUM_BLOCKS * FN_STRIDE, dtype=torch.int64) + 97 * rank)
+        .remainder(251)
+        .to(torch.uint8)
+    )
+
+
+def _fn_view(shared, dtype, shape, strides, offset):
+    """``shape`` per block at byte ``offset`` of each block; strides in bytes."""
+    size = torch.empty(0, dtype=dtype).element_size()
+    return torch.as_strided(
+        shared.view(dtype),
+        (FN_NUM_BLOCKS, *shape),
+        tuple(s // size for s in (FN_STRIDE, *strides)),
+        offset // size,
+    )
+
+
+def flash_next_kv_caches(shared):
+    """The tensors vLLM registers: states as int8 rows, the keys and the KV
+    as ``[blocks, heads, states, width]`` over memory laid out state by state."""
+    caches = {}
+    for gdn in TINY_GDN:
+        for p, i in enumerate(gdn):
+            caches[f"layers.{i}.linear_attn"] = _fn_view(
+                shared,
+                torch.int8,
+                (1, 1, TINY_STATE),
+                (TINY_STATE, TINY_STATE, 1),
+                p * TINY_SLOT,
+            )
+    caches["layers.1.ple"] = _fn_view(
+        shared, torch.int8, (1, 1, FN_PLE_STATE), (FN_PLE_STATE, FN_PLE_STATE, 1), 0
+    )
+    for p, i in enumerate((3, 7)):
+        caches[f"layers.{i}.indexer.ring"] = _fn_view(
+            shared, torch.uint8, (1, 4, 8), (8, 8, 1), p * 32
+        )
+        caches[f"layers.{i}.indexer.key"] = _fn_view(
+            shared, torch.bfloat16, (1, 4, 8), (16, 16, 2), p * FN_KEY_PAGE
+        )
+        # Two heads of a token side by side: the head axis is not outermost.
+        caches[f"layers.{i}.attn"] = _fn_view(
+            shared,
+            torch.bfloat16,
+            (2, TINY_BLOCK, 16),
+            (32, 64, 2),
+            2 * FN_KEY_PAGE + p * TINY_SLOT,
+        )
+    return caches
+
+
+def _fn_check(config, side="worker", **kwargs):
+    kwargs.setdefault("use_layerwise", False)
+    kwargs.setdefault("speculative_method", None)
+    kwargs.setdefault("sees_members", side == "worker")
+    check_multi_group_support(
+        describe_kv_groups(config),
+        block_size=TINY_BLOCK,
+        inline_loads=False,
+        **kwargs,
+    )
+
+
+@pytest.mark.parametrize("side", ["worker", "scheduler"])
+def test_flash_next_groups_are_states_a_skipped_ring_and_blocks(side):
+    groups = describe_kv_groups(flash_next_config(side))
+    assert [g.kind for g in groups] == [GROUP_MAMBA] * 4 + [GROUP_SKIP, GROUP_MLA]
+    assert [g.state_bytes for g in groups] == [TINY_STATE] * 3 + [FN_PLE_STATE, 0, 0]
+    assert {g.slot_bytes for g in groups[:4]} == {TINY_SLOT}
+    assert {g.mamba_cache_mode for g in groups[:4]} == {"align"}
+    assert not groups[FN_GROUP].windowed
+    # Only the worker, which sees every member, knows a block's bytes.
+    assert groups[FN_GROUP].group_page_bytes == (FN_PAGE if side == "worker" else 0)
+
+
+def test_flash_next_sides_agree_on_every_object_key():
+    worker, scheduler = (
+        describe_kv_groups(flash_next_config(side)) for side in ("worker", "scheduler")
+    )
+    keys = [
+        [g.object_key("k", TINY_BLOCK) for g in side] for side in (worker, scheduler)
+    ]
+    assert keys[0] == keys[1]
+    assert keys[0][FN_GROUP] == f"k_c{TINY_BLOCK}_g{FN_GROUP}_b{TINY_BLOCK}"
+
+
+@pytest.mark.parametrize("side", ["worker", "scheduler"])
+def test_flash_next_passes_the_support_check(side):
+    _fn_check(flash_next_config(side), side)
+
+
+def test_flash_next_is_refused_in_the_layerwise_format():
+    with pytest.raises(ValueError, match="maru_use_layerwise=false"):
+        _fn_check(flash_next_config(), use_layerwise=True)
+
+
+@pytest.mark.parametrize("method", ["mtp", "dspark"])
+def test_flash_next_is_refused_with_speculative_decoding(method):
+    """Its Mamba-type groups rule out every method, the checkpoint's MTP too."""
+    with pytest.raises(ValueError, match="with a Mamba-type KV cache group"):
+        _fn_check(flash_next_config(), speculative_method=method)
+
+
+def test_flash_next_keys_on_other_blocks_are_refused():
+    """With a Mamba-type group a chunk is one block, which holds no whole
+    block of an MLA group with larger ones."""
+    with pytest.raises(ValueError, match="only when the MLA group uses the block"):
+        _fn_check(flash_next_config(key_block=2 * TINY_BLOCK))
+
+
+def test_indexed_attention_with_the_kv_first_is_refused():
+    """The scheduler would see the group's first member, full attention, and
+    key the group another way than the worker."""
+    layers = dict(reversed(FN_LAYERS.items()))
+    groups = describe_kv_groups(flash_next_config(layers=layers))
+    assert groups[FN_GROUP].kind == GROUP_UNSUPPORTED
+    with pytest.raises(ValueError, match="FullAttentionSpec, MLAAttentionSpec"):
+        _fn_check(flash_next_config(layers=layers))
+
+
+@pytest.mark.parametrize(
+    "other",
+    [
+        {"shapes": ((3, 16),), "dtypes": (torch.bfloat16,)},
+        {"dtypes": (torch.float16, torch.float32)},
+        {"page_size_padded": 2 * TINY_SLOT},
+    ],
+    ids=["shapes", "dtypes", "page"],
+)
+def test_mamba_states_that_differ_within_one_group_are_refused(other):
+    """One state view serves every layer of a group."""
+    config = flash_next_config()
+    members = {
+        "layers.0.linear_attn": _mamba_spec(),
+        "layers.4.linear_attn": dataclasses.replace(_mamba_spec(), **other),
+    }
+    config.kv_cache_groups[0] = _group(members, "worker")
+    assert describe_kv_groups(config)[0].kind == GROUP_UNSUPPORTED
+    with pytest.raises(ValueError, match="UniformTypeKVCacheSpecs of MambaSpec"):
+        _fn_check(config)
+
+
+def test_connector_starts_with_flash_next(caplog):
+    with caplog.at_level(logging.WARNING, logger="maru_vllm.connector"):
+        connector = MaruKVConnector(
+            _connector_config(TINY_BLOCK),
+            KVConnectorRole.SCHEDULER,
+            flash_next_config("scheduler"),
+        )
+    assert connector._kv_chunk_tokens == TINY_BLOCK
+    assert connector._scheduler._multi_group
+    assert any("a Mamba group keeps" in r.getMessage() for r in caplog.records)
+
+
+def test_the_worker_role_starts_with_flash_next():
+    connector = MaruKVConnector(
+        _connector_config(TINY_BLOCK), KVConnectorRole.WORKER, flash_next_config()
+    )
+    assert connector._kv_chunk_tokens == TINY_BLOCK
+    assert [g.kind for g in connector._worker._kv_groups] == (
+        [GROUP_MAMBA] * 4 + [GROUP_SKIP, GROUP_MLA]
+    )
+
+
+def test_flash_next_hit_needs_every_block_chunk_and_the_last_states():
+    groups = describe_kv_groups(flash_next_config("scheduler"))
+
+    def has(i, g):
+        return i < 3 if g.kind == GROUP_MLA else i == 1
+
+    # The blocks reach chunk 2, the states only chunk 1.
+    assert hit_chunks(groups, 4, TINY_BLOCK, has) == (2, 3)
+
+
+def _fn_worker(shared, **kwargs):
+    worker = _worker(flash_next_config(), TINY_BLOCK, **kwargs)
+    worker.register_kv_caches(flash_next_kv_caches(shared))
+    return worker
+
+
+def _fn_block(shared, block, offset=0, size=FN_PAGE):
+    return bytes(shared[block * FN_STRIDE + offset :][:size])
+
+
+def test_flash_next_registers_states_and_one_view_of_the_blocks():
+    shared = _fn_shared()
+    worker = _fn_worker(shared)
+    assert [c.group.group_id for c in worker._group_caches] == [0, 1, 2, 3, FN_GROUP]
+    for cache in worker._group_caches[:3]:
+        assert [tuple(t.shape) for t in cache.tensors] == [
+            (FN_NUM_BLOCKS, TINY_STATE)
+        ] * 2
+        # Blocks are a whole vLLM block apart, not one layer's slot.
+        assert {t.stride() for t in cache.tensors} == {(FN_STRIDE, 1)}
+    second = worker._group_caches[0].tensors[1]
+    assert bytes(second[5]) == _fn_block(shared, 5, TINY_SLOT, TINY_STATE)
+    (ple,) = worker._group_caches[3].tensors
+    assert tuple(ple.shape) == (FN_NUM_BLOCKS, FN_PLE_STATE)
+    cache = _cache_of(worker, FN_GROUP)
+    (blocks,) = cache.tensors
+    assert tuple(blocks.shape) == (FN_NUM_BLOCKS, FN_PAGE)
+    assert blocks.stride() == (FN_STRIDE, 1)
+    # Each layer's bytes of a block, in the group's layer order.
+    assert cache.spans == (
+        (0, FN_KEY_PAGE),
+        (2 * FN_KEY_PAGE, TINY_SLOT),
+        (FN_KEY_PAGE, FN_KEY_PAGE),
+        (2 * FN_KEY_PAGE + TINY_SLOT, TINY_SLOT),
+    )
+    # The page holds the largest object: the blocks, above two state slots.
+    assert worker._page_size_bytes == FN_PAGE
+
+
+def test_flash_next_block_view_writes_reach_the_kv():
+    shared = torch.zeros(FN_NUM_BLOCKS * FN_STRIDE, dtype=torch.uint8)
+    caches = flash_next_kv_caches(shared)
+    worker = _worker(flash_next_config(), TINY_BLOCK)
+    worker.register_kv_caches(caches)
+    (blocks,) = _cache_of(worker, FN_GROUP).tensors
+    blocks[3].fill_(1)
+    for name in FN_LAYERS:
+        assert bool((caches[name][3].view(torch.uint8) == 1).all())
+        assert not bool(caches[name][2].view(torch.uint8).any())
+
+
+def test_a_state_may_not_overlap_the_next_block():
+    """Blocks nearer than a layer's slot would share bytes of a state."""
+    caches = flash_next_kv_caches(_fn_shared())
+    caches["layers.0.linear_attn"] = torch.as_strided(
+        _fn_shared().view(torch.int8),
+        (FN_NUM_BLOCKS, 1, 1, TINY_STATE),
+        (TINY_SLOT // 2, TINY_STATE, TINY_STATE, 1),
+    )
+    with pytest.raises(ValueError, match="blocks at least the 1024-byte slot apart"):
+        _worker(flash_next_config(), TINY_BLOCK).register_kv_caches(caches)
+
+
+def test_kv_kept_head_by_head_is_refused():
+    """vLLM's BLHNC layout holds a block's same bytes in another order, under
+    the same object key: an engine on it and one on the default BLNHC would
+    load each other's blocks scrambled."""
+    shared = _fn_shared()
+    caches = flash_next_kv_caches(shared)
+    for p, i in enumerate((3, 7)):
+        caches[f"layers.{i}.attn"] = _fn_view(
+            shared,
+            torch.bfloat16,
+            (2, TINY_BLOCK, 16),
+            (TINY_SLOT // 2, 32, 2),
+            2 * FN_KEY_PAGE + p * TINY_SLOT,
+        )
+    assert caches["layers.3.attn"][0].is_contiguous()
+    with pytest.raises(ValueError, match="head by head"):
+        _worker(flash_next_config(), TINY_BLOCK).register_kv_caches(caches)
+
+
+def test_one_kv_head_is_taken_in_either_order():
+    """A TP rank holding one head keeps the same bytes in both layouts."""
+    shared = _fn_shared()
+    caches = flash_next_kv_caches(shared)
+    for p, i in enumerate((3, 7)):
+        caches[f"layers.{i}.attn"] = _fn_view(
+            shared,
+            torch.bfloat16,
+            (1, 2 * TINY_BLOCK, 16),
+            (TINY_SLOT, 32, 2),
+            2 * FN_KEY_PAGE + p * TINY_SLOT,
+        )
+    worker = _worker(flash_next_config(), TINY_BLOCK)
+    worker.register_kv_caches(caches)
+    assert _cache_of(worker, FN_GROUP).tensors[0].shape == (FN_NUM_BLOCKS, FN_PAGE)
+
+
+@pytest.mark.parametrize(
+    ("shape", "strides", "fills"),
+    [
+        ((2, 16, 16), (16, 32, 1), True),  # token by token
+        ((2, 16, 16), (256, 16, 1), True),  # head by head
+        ((1, 4, 8), (8, 8, 1), True),
+        ((2, 16, 16), (16, 64, 1), False),  # a gap after each token
+        (
+            (2, 2, 2),
+            (1, 1, 5),
+            False,
+        ),  # as many elements as its span, but not each once
+    ],
+)
+def test_fills_its_span_needs_every_element_once(shape, strides, fills):
+    t = torch.as_strided(torch.zeros(4096), shape, strides)
+    assert _fills_its_span(t) is fills
+
+
+# Request A, 40 tokens whose first step ends at token 32: a state block where
+# the step ends, one ring block, and a block per chunk of group 5.
+FN_BLOCKS_A = ([0, 1], [0, 2], [0, 3], [0, 4], [5], [6, 7])
+# Request B: a state block where the hit ends, and blocks of its own.
+FN_BLOCKS_B = ([0, 8], [0, 9], [0, 10], [0, 11], [12], [13, 14, 15])
+
+
+def _fn_storing_worker(shared, **kwargs):
+    worker = _fn_worker(shared, **kwargs)
+    return worker, attach_capturing_handler(worker)
+
+
+def _fn_keys(tokens, suffix="", state_suffix=""):
+    """Request A's object keys: group 5's two chunks, the states of chunk 1."""
+    groups = describe_kv_groups(flash_next_config())
+    k0, k1 = _chunk_keys(tokens, TINY_BLOCK)
+    return {
+        "blocks": [
+            groups[FN_GROUP].object_key(k + suffix, TINY_BLOCK) for k in (k0, k1)
+        ],
+        "states": [
+            groups[g].object_key(k1 + state_suffix, TINY_BLOCK) for g in FN_STATES
+        ],
+    }
+
+
+def test_flash_next_step_stores_its_blocks_and_the_states_at_its_end():
+    shared = _fn_shared()
+    worker, store = _fn_storing_worker(shared)
+    tokens = list(range(40))
+    worker.wait_for_save(_store_meta(tokens, FN_BLOCKS_A, 0, 32))
+
+    keys = _fn_keys(tokens)
+    assert set(store) == {*keys["blocks"], *keys["states"]}
+    # Group 5: the block as vLLM lays it out, compressed keys and KV together.
+    for key, block in zip(keys["blocks"], FN_BLOCKS_A[FN_GROUP], strict=True):
+        assert store[key] == _fn_block(shared, block)
+    # A state object holds each layer's state at a stride of one slot.
+    for g, key in zip(range(3), keys["states"], strict=False):
+        assert len(store[key]) == 2 * TINY_SLOT
+        for p in range(2):
+            assert store[key][p * TINY_SLOT :][:TINY_STATE] == _fn_block(
+                shared, FN_BLOCKS_A[g][1], p * TINY_SLOT, TINY_STATE
+            )
+    ple = store[keys["states"][3]]
+    assert len(ple) == TINY_SLOT
+    assert ple[:FN_PLE_STATE] == _fn_block(shared, FN_BLOCKS_A[3][1], 0, FN_PLE_STATE)
+    assert worker._handler.batch_store.call_count == 1
+
+
+def test_flash_next_parked_load_restores_the_blocks_and_the_states():
+    source = _fn_shared()
+    stored, store = _fn_storing_worker(source)
+    tokens = list(range(40))
+    stored.wait_for_save(_store_meta(tokens, FN_BLOCKS_A, 0, 32))
+
+    target = torch.zeros_like(source)
+    worker, _ = _fn_storing_worker(target)
+    _serve(worker, store)
+    worker.start_load_kv(
+        _FORWARD, _load_meta(tokens, FN_BLOCKS_B, 2, deferred_load=True)
+    )
+    assert worker.take_failed_load_blocks() == set()
+
+    loaded = set()
+    for a, b in zip(FN_BLOCKS_A[FN_GROUP], FN_BLOCKS_B[FN_GROUP], strict=False):
+        assert _fn_block(target, b) == _fn_block(source, a)
+        loaded.add(b)
+    for g in FN_STATES:
+        a, b = FN_BLOCKS_A[g][1], FN_BLOCKS_B[g][1]
+        layers = len(_cache_of(worker, g).tensors)
+        size = FN_PLE_STATE if g == 3 else TINY_STATE
+        for p in range(layers):
+            assert _fn_block(target, b, p * TINY_SLOT, size) == _fn_block(
+                source, a, p * TINY_SLOT, size
+            )
+        loaded.add(b)
+    # The ring's block and the block B computes itself stay as they were.
+    for block in set(range(FN_NUM_BLOCKS)) - loaded:
+        assert not any(_fn_block(target, block))
+
+
+def test_flash_next_tp_ranks_store_and_load_their_own_blocks_and_states():
+    """TP=2 over the model's two KV heads: each rank holds one head, its own
+    bytes of the compressed keys and its part of every state."""
+    server = FirstWinsServer()
+    tokens = list(range(40))
+    sources = [_fn_shared(rank) for rank in range(2)]
+    for rank in range(2):
+        worker = _fn_worker(sources[rank], **_tp_shards(rank, 2, 2))
+        worker._handler = server.handler()
+        worker.wait_for_save(_store_meta(tokens, FN_BLOCKS_A, 0, 32))
+    expected = set()
+    for head, part in (("_h0-1", "_tp2_r0"), ("_h1-2", "_tp2_r1")):
+        keys = _fn_keys(tokens, head, part)
+        expected |= {*keys["blocks"], *keys["states"]}
+    assert set(server.objects) == expected
+
+    for rank in range(2):
+        target = torch.zeros_like(sources[rank])
+        worker = _fn_worker(target, **_tp_shards(rank, 2, 2))
+        worker._handler = server.handler()
+        worker.start_load_kv(
+            _FORWARD, _load_meta(tokens, FN_BLOCKS_B, 2, deferred_load=True)
+        )
+        assert worker.take_failed_load_blocks() == set()
+        for a, b in zip(FN_BLOCKS_A[FN_GROUP], FN_BLOCKS_B[FN_GROUP], strict=False):
+            assert _fn_block(target, b) == _fn_block(sources[rank], a)
+        a, b = FN_BLOCKS_A[0][1], FN_BLOCKS_B[0][1]
+        assert _fn_block(target, b, 0, TINY_STATE) == _fn_block(
+            sources[rank], a, 0, TINY_STATE
+        )
+
+
+def test_flash_next_replica_rank_loads_the_writers_blocks_and_keeps_its_states():
+    """TP=4 over two KV heads: rank 1 holds the same head as rank 0, so it
+    stores no blocks and loads rank 0's, but stores and loads its own part of
+    every state."""
+    server = FirstWinsServer()
+    tokens = list(range(40))
+    sources = [_fn_shared(rank) for rank in range(2)]
+    for rank in range(2):
+        worker = _fn_worker(sources[rank], **_tp_shards(rank, 4, 2))
+        worker._handler = server.handler()
+        worker.wait_for_save(_store_meta(tokens, FN_BLOCKS_A, 0, 32))
+        if rank == 1:
+            assert _registered_keys(worker) == set(
+                _fn_keys(tokens, "_h0-1", "_tp4_r1")["states"]
+            )
+    assert set(server.objects) == {
+        *_fn_keys(tokens, "_h0-1", "_tp4_r0")["blocks"],
+        *_fn_keys(tokens, "_h0-1", "_tp4_r0")["states"],
+        *_fn_keys(tokens, "_h0-1", "_tp4_r1")["states"],
+    }
+
+    target = torch.zeros_like(sources[1])
+    worker = _fn_worker(target, **_tp_shards(1, 4, 2))
+    worker._handler = server.handler()
+    worker.start_load_kv(
+        _FORWARD, _load_meta(tokens, FN_BLOCKS_B, 2, deferred_load=True)
+    )
+    assert worker.take_failed_load_blocks() == set()
+    for a, b in zip(FN_BLOCKS_A[FN_GROUP], FN_BLOCKS_B[FN_GROUP], strict=False):
+        assert _fn_block(target, b) == _fn_block(sources[0], a)
+    a, b = FN_BLOCKS_A[0][1], FN_BLOCKS_B[0][1]
+    assert _fn_block(target, b, 0, TINY_STATE) == _fn_block(
+        sources[1], a, 0, TINY_STATE
+    )

@@ -953,6 +953,9 @@ def _cpu_engine_config(
     if (
         getattr(config, "lora_config", None) is not None
         or getattr(model, "use_mla", False)
+        # Qwen3.8-Flash-Next is no MLA model to vLLM, but keeps its indexer's
+        # compressed keys in an MLA group, copied block by block like one.
+        or any(g.kind == GROUP_MLA for g in kv_groups)
         # A request with multimodal inputs neither loads nor stores on any
         # backend (_uncacheable_request), so remote_cxl serves the text
         # requests of a multimodal model, such as Qwen3.5's, as cxl does.
@@ -1935,6 +1938,9 @@ class MaruKVConnector(KVConnectorBase_V1, *_HYBRID_SUPPORT):
                 use_layerwise=bool(extra.get("maru_use_layerwise", False)),
                 speculative_method=_speculative_method(vllm_config),
                 inline_loads=not _get_knob(extra, "maru_async_load"),
+                # vLLM hands the scheduler a group whose layers keep different
+                # specs as its first member alone.
+                sees_members=role == KVConnectorRole.WORKER,
             )
 
         # Ensure chunk_tokens is a multiple of block_size, and with several

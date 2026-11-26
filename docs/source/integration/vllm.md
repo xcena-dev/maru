@@ -829,11 +829,11 @@ The key names the chunk length because a chunk key hashes the prompt only up to 
 
 The connector refuses to start a model with several groups unless:
 
-- `maru_storage_backend` is `cxl` (the default) or `remote_cxl`. The CPU and mixed backends take one group only, and remote_cxl takes no MLA model, such as DeepSeek-V4.1.
+- `maru_storage_backend` is `cxl` (the default) or `remote_cxl`. The CPU and mixed backends take one group only, and remote_cxl takes no MLA model, such as DeepSeek-V4.1, and not Qwen3.8-Flash-Next, which has an MLA group.
 - `maru_use_layerwise` is `false` (the default), unless every group the connector stores is an MLA group, as DeepSeek-V4.1's are (see {ref}`vllm-deepseek-v41`).
 - Speculative decoding is off, or is DSpark (`"method": "dspark"`) on a model without a Mamba-type group, as on DeepSeek-V4.1-Flash (see {ref}`vllm-deepseek-v41`). The connector refuses every other method. It refuses DSpark too with a Mamba-type group: in `align` mode vLLM moves a Mamba state block among the request's last blocks without telling the connector.
 - Mamba-type groups use vLLM's `align` Mamba cache mode. vLLM picks it when prefix caching is on, which is the default. Keep prefix caching on: with `--no-enable-prefix-caching`, vLLM sets the mode to `none` even if `--mamba-cache-mode align` is given, and the connector refuses the model. Do not pass `--mamba-cache-mode all`.
-- The model does not have both Mamba-type groups and MLA groups, as GLM-5.3-Flash does.
+- The model does not have both Mamba-type groups and MLA groups, as GLM-5.3-Flash does. Qwen3.8-Flash-Next is the exception: its MLA group is of full-attention layers that each keep an MLA cache, on vLLM's `block_size` (see {ref}`vllm-qwen38-flash-next`).
 - Every group uses vLLM's one `block_size`, except MLA groups, which may use other block sizes, as DeepSeek-V4.1's do; `maru_kv_chunk_tokens` is then rounded to a multiple of every group's block size. vLLM normally sets the groups up this way.
 - Every attention group has the same KV heads per rank and head size. vLLM gives groups whose heads differ different block sizes, and the connector stores every group in one shape.
 - `maru_chunk_size`, if set, holds the largest (chunk, group) object. Leave it unset to size it automatically.
@@ -879,6 +879,35 @@ Both formats work. The model calls no per-layer connector method, so the layerwi
 ```bash
 vllm serve deepseek-ai/DeepSeek-V4.1-Flash-1017 \
     --tensor-parallel-size 4 --enable-expert-parallel --language-model-only \
+    --kv-transfer-config '{
+        "kv_connector": "MaruKVConnector",
+        "kv_connector_module_path": "maru_vllm",
+        "kv_role": "kv_both",
+        "kv_load_failure_policy": "recompute",
+        "kv_connector_extra_config": {
+            "maru_server_url": "tcp://localhost:5555",
+            "maru_pool_size": "32G"
+        }
+    }'
+```
+
+(vllm-qwen38-flash-next)=
+### Qwen3.8-Flash-Next
+
+Use vLLM 0.32.0, the version it was tested with. vLLM splits the model's KV cache into several groups, and the connector handles them as follows:
+
+- **The Gated DeltaNet groups and the PLE layer's group** are Mamba-type. Maru stores each layer's state at the chunks where a prefill step ended, as for Qwen3.5 (see "What differs from a model with one group" above).
+- **The indexed-attention group** holds each attention layer's KV and the compressed keys of its indexer, one key per four tokens. vLLM gives the two one block table, so they are one group. Maru copies it block by block, keeping the layout vLLM gives each block, as it copies DeepSeek-V4.1's MLA group: the object key names the block size, and a load of an object of another size, such as one stored with another KV cache dtype, fails and vLLM recomputes the request. Keep vLLM's default KV cache layout for the model (BLNHC): with `VLLM_KV_CACHE_LAYOUT=BLHNC` a block holds the KV of its heads in another order under the same key, and the connector refuses to start at TP=1, where a rank holds both KV heads.
+- **The indexer's raw-key ring**, which holds the keys of the four tokens being compressed, is not stored, since vLLM does not prefix-cache it. A hit ends at a block end, where no group of four is open.
+
+With a Mamba-type group a chunk is one vLLM block: 1,568 tokens at TP=1 and TP=2, with `maru_kv_chunk_tokens` overridden. Each chunk takes one page for the indexed-attention group, 3,311,616 bytes per attention layer at TP=1, and a chunk where a prefill step ended also takes one page per Mamba-type group. The settings in "Required settings" apply: the chunkwise format only, and no speculative decoding, the MTP head in the model's checkpoint included.
+
+vLLM's attention backend for the model declares that it does not support KV connectors (`supports_kv_connector()` returns false), but vLLM 0.32.0 does not act on it for this model, and the tests below found nothing wrong. A later vLLM may refuse the connector.
+
+The model was tested at TP=1 and TP=2 with randomly initialized weights (`--load-format dummy`) and 8 of its 48 layers, since its 360 GB checkpoint does not fit the test host. The 8 layers keep the model's pattern of three Gated DeltaNet layers and one indexed-attention layer, and so its kinds of KV cache groups. With such weights the output hardly depends on the prompt, so the test compared the KV cache on the GPU instead: after a load, every block and state of the hit held the bytes the storing request had held, and the next chunk computed on them matched a computation from scratch as closely as two computations from scratch match each other. Both TP ranks hold the same bytes with such weights, so the TP=2 run does not show that a rank loads its own objects rather than the other rank's; unit tests check that.
+
+```bash
+vllm serve Qwen/Qwen3.8-Flash-Next \
     --kv-transfer-config '{
         "kv_connector": "MaruKVConnector",
         "kv_connector_module_path": "maru_vllm",

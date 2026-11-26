@@ -15,11 +15,12 @@ same bytes per block slot in every group (Mamba state is padded up to it), so
 a group's object size is "layers in the group x slot bytes x blocks per
 object". Attention-type groups keep one slot per token block of the chunk;
 a Mamba group keeps only the state at the chunk's last block. An MLA group
-(DeepSeek-V4.1's compressed KV and indexer keys) keeps the chunk's blocks,
-copied block by block in the layout vLLM gives them. A group vLLM does not
-prefix-cache is not stored. A model with one group keeps the bare chunk key;
-with several, each object is keyed ``<chunk key>_c<chunk tokens>_g<group id>``
-(see :func:`group_object_key`).
+(DeepSeek-V4.1's compressed KV and indexer keys, or Qwen3.8-Flash-Next's
+full-attention KV with the indexer's compressed keys) keeps the chunk's
+blocks, copied block by block in the layout vLLM gives them. A group vLLM
+does not prefix-cache is not stored. A model with one group keeps the bare
+chunk key; with several, each object is keyed
+``<chunk key>_c<chunk tokens>_g<group id>`` (see :func:`group_object_key`).
 """
 
 from __future__ import annotations
@@ -179,6 +180,12 @@ def _spec_kind(spec_cls: type) -> str:
 # windows when vLLM prefix-caches them).
 _MLA_SPECS = frozenset({"MLAAttentionSpec", "SlidingWindowMLASpec"})
 
+# The members of a group of full-attention layers that each keep an MLA cache
+# beside their KV: Qwen3.8-Flash-Next's indexed attention, whose indexer keeps
+# one compressed key per four tokens. vLLM gives such a layer's KV and its
+# compressed keys one block table, so they are one group.
+_INDEXED_ATTENTION_SPECS = frozenset({"FullAttentionSpec", "MLAAttentionSpec"})
+
 
 def _group_kind(spec: Any) -> str:
     """Group kind of a vLLM KV cache group's spec.
@@ -191,18 +198,46 @@ def _group_kind(spec: Any) -> str:
     member has one MLA spec class. A group mixing the window class with the
     plain one is refused: a hit needs the one only near its end, the other
     whole.
+
+    When vLLM packs every group's layers side by side in each block (a
+    block-outermost KV cache layout, which a model whose pages differ in size
+    gets), the worker sees every group as a ``UniformTypeKVCacheSpecs``:
+
+    - Mamba states of one shape are a Mamba group, as the scheduler sees
+      them.
+    - Full-attention layers with an MLA cache each (Qwen3.8-Flash-Next) are
+      an MLA group, copied block by block, when the MLA cache is the first
+      member: the scheduler sees only that member, and both sides must give
+      the group one kind and one object key.
     """
     if not getattr(spec, "prefix_cacheable", True):
         return GROUP_SKIP
     members = getattr(spec, "kv_cache_specs", None)
     if isinstance(members, dict):
-        names = {type(member).__name__ for member in members.values()}
+        specs = list(members.values())
+        names = {type(member).__name__ for member in specs}
         if len(names) == 1 and names <= _MLA_SPECS:
             return GROUP_MLA
+        if (
+            names == _INDEXED_ATTENTION_SPECS
+            and type(specs[0]).__name__ == "MLAAttentionSpec"
+        ):
+            return GROUP_MLA
+        if names == {"MambaSpec"} and len({_state_layout(m) for m in specs}) == 1:
+            return GROUP_MAMBA
         return GROUP_UNSUPPORTED
     if type(spec).__name__ in _MLA_SPECS:
         return GROUP_MLA
     return _spec_kind(type(spec))
+
+
+def _state_layout(spec: Any) -> tuple:
+    """What tells one Mamba spec's state apart from another's in a block."""
+    return (
+        tuple(tuple(shape) for shape in spec.shapes),
+        tuple(spec.dtypes),
+        int(spec.page_size_bytes),
+    )
 
 
 def describe_kv_groups(
@@ -240,14 +275,17 @@ def describe_kv_groups(
                 ),
                 sliding_window=getattr(layer_spec, "sliding_window", None),
                 mamba_cache_mode=(
-                    getattr(spec, "mamba_cache_mode", None) or default_mamba_cache_mode
+                    getattr(layer_spec, "mamba_cache_mode", None)
+                    or default_mamba_cache_mode
                     if kind == GROUP_MAMBA
                     else None
                 ),
                 state_bytes=(
                     sum(
                         math.prod(shape) * dtype.itemsize
-                        for shape, dtype in zip(spec.shapes, spec.dtypes, strict=True)
+                        for shape, dtype in zip(
+                            layer_spec.shapes, layer_spec.dtypes, strict=True
+                        )
                     )
                     if kind == GROUP_MAMBA
                     else 0
@@ -453,15 +491,17 @@ def check_multi_group_support(
     use_layerwise: bool,
     speculative_method: str | None,
     inline_loads: bool,
+    sees_members: bool = False,
 ) -> None:
     """Reject group combinations the connector cannot store correctly.
 
     A model with one group passes (``check_one_group_support`` checks it).
     Several groups are supported in chunkwise (packed) format with full
     attention, sliding window, Mamba (``align``) and MLA groups whose
-    attention groups share one KV shape, but not a Mamba group beside an MLA
-    group, with parked loads; in layerwise format only when every stored
-    group is an MLA group (DeepSeek-V4.1). The one speculative decoding
+    attention groups share one KV shape, with parked loads; in layerwise
+    format only when every stored group is an MLA group (DeepSeek-V4.1). A
+    Mamba group beside an MLA group is supported only as Qwen3.8-Flash-Next
+    has them (see ``_check_mamba_beside_mla``). The one speculative decoding
     method supported is DSpark (``DSPARK_METHOD``), without a Mamba group:
     vLLM puts its draft layers in groups like any other layer (DeepSeek-V4.1's
     draft windows in the target's window groups), and the drafter writes a
@@ -483,6 +523,9 @@ def check_multi_group_support(
         inline_loads: Whether loads run inline (``maru_async_load`` set to
             false; ``MaruKVConnector`` turns it on for several groups unless
             set).
+        sees_members: Whether ``groups`` describe every layer of each group,
+            as the worker's do. The scheduler's describe a group whose layers
+            keep different specs by its first member alone.
 
     Raises:
         ValueError: With the reason and the setting to change.
@@ -544,13 +587,7 @@ def check_multi_group_support(
             f"not {speculative_method!r}{one_group_hint(groups)}"
         )
     if {GROUP_MAMBA, GROUP_MLA} <= kinds:
-        # A Mamba group pins the chunk to one block (chunk_tokens_for_groups),
-        # which holds no whole block of an MLA group with larger blocks, and
-        # the pair has not been run with equal ones either.
-        raise ValueError(
-            "MaruKVConnector does not support a model with both a Mamba-type "
-            "and an MLA KV cache group, such as GLM-5.3-Flash"
-        )
+        _check_mamba_beside_mla(stored, block_size, sees_members)
     for g in stored:
         if g.kind == GROUP_MAMBA and g.mamba_cache_mode != "align":
             # vLLM 0.30 sets "none" whenever prefix caching is off, even over
@@ -584,6 +621,57 @@ def check_multi_group_support(
             "'recompute' (vllm-project/vllm#49250). Remove "
             f"maru_async_load=false{one_group_hint(groups)}"
         )
+
+
+def _check_mamba_beside_mla(
+    stored: list[KVGroup], block_size: int, sees_members: bool
+) -> None:
+    """Refuse a Mamba group beside an MLA group, except Qwen3.8-Flash-Next's.
+
+    A Mamba group pins the chunk to one block (``chunk_tokens_for_groups``).
+    Qwen3.8-Flash-Next's MLA group, its full-attention layers with the
+    indexer's compressed keys, uses that block size and keeps every block, so
+    a chunk's object is its one block. Refused are:
+
+    - an MLA group with another block size, of which the chunk holds no
+      whole block, or with a sliding window;
+    - an MLA group of MLA caches alone, as GLM-5.3-Flash's DSA caches beside
+      its Kimi Delta Attention states, which has not been run. Only the
+      worker can tell: it sees every member of the group, and the scheduler
+      only the first, an MLA cache in both models. A worker that refuses
+      stops the engine at startup like any other.
+
+    Args:
+        stored: The groups the connector stores.
+        block_size: ``cache_config.block_size``, which the chunk is.
+        sees_members: Whether ``stored`` describe every layer of each group
+            (the worker's): an MLA group that names no full-attention member
+            then has none.
+
+    Raises:
+        ValueError: For a pair that is not supported.
+    """
+    for g in stored:
+        if g.kind != GROUP_MLA:
+            continue
+        if g.block_size != block_size or g.windowed:
+            raise ValueError(
+                "MaruKVConnector supports a Mamba-type KV cache group beside an "
+                "MLA group only when the MLA group uses the block size "
+                f"{block_size} and no sliding window: with a Mamba-type group a "
+                f"chunk is one block (group {g.group_id} has {g.block_size}-token "
+                f"blocks{', with a sliding window' if g.windowed else ''})"
+            )
+        if (g.member_specs or sees_members) and (
+            "FullAttentionSpec" not in g.member_specs
+        ):
+            raise ValueError(
+                "MaruKVConnector does not support a model with both a Mamba-type "
+                "and an MLA KV cache group, such as GLM-5.3-Flash, unless the MLA "
+                "group is of full-attention layers that each keep an MLA cache, "
+                f"as in Qwen3.8-Flash-Next (group {g.group_id} is a "
+                f"{_group_label(g)})"
+            )
 
 
 def _kv_shape_text(group: KVGroup) -> str:
@@ -652,10 +740,17 @@ def state_view(name: str, kv: Any, slot_bytes: int, state_bytes: int) -> torch.T
     whole state (0.30). Both become the same byte view, which aliases vLLM's
     memory: writing a row writes that block's state.
 
+    A layer's blocks are one slot apart when each layer keeps a region of
+    its own, and further apart when vLLM packs every layer of a group side
+    by side in each block (Qwen3.8-Flash-Next): a block then also holds the
+    group's other layers, and the bytes a wider group needs. The view steps
+    by the distance the tensors report.
+
     Args:
         name: Layer name, for errors.
         kv: The layer's registered value.
-        slot_bytes: Bytes between consecutive blocks.
+        slot_bytes: Bytes of the layer's slot in a block; consecutive blocks
+            are at least that far apart.
         state_bytes: Bytes of one block's state, from the group's spec.
 
     Raises:
@@ -665,17 +760,20 @@ def state_view(name: str, kv: Any, slot_bytes: int, state_bytes: int) -> torch.T
     tensors = list(kv) if isinstance(kv, (list, tuple)) else [kv]
     first = tensors[0]
     base = first.data_ptr()
+    block_bytes = first.stride(0) * first.element_size()
     registered = 0
     for t in tensors:
         if (
-            t.stride(0) * t.element_size() != slot_bytes
+            t.stride(0) * t.element_size() != block_bytes
+            or block_bytes < slot_bytes
             or t.data_ptr() != base + registered
             or not t[0].is_contiguous()
         ):
             raise ValueError(
                 f"MaruKVConnector cannot read the Mamba state of {name}: "
-                f"expected one contiguous state per {slot_bytes}-byte block "
-                f"slot (got shape {tuple(t.shape)}, stride {t.stride()})"
+                f"expected one contiguous state per block, blocks at least "
+                f"the {slot_bytes}-byte slot apart (got shape "
+                f"{tuple(t.shape)}, stride {t.stride()})"
             )
         registered += t[0].numel() * t.element_size()
     if registered != state_bytes:
@@ -689,9 +787,34 @@ def state_view(name: str, kv: Any, slot_bytes: int, state_bytes: int) -> torch.T
         storage,
         base - storage.data_ptr(),
         (first.shape[0], state_bytes),
-        (slot_bytes, 1),
+        (block_bytes, 1),
     )
     return view
+
+
+def _fills_its_span(t: torch.Tensor) -> bool:
+    """Whether ``t`` covers a range of memory with no gaps, in any axis order.
+
+    A layer's bytes of one block are then the ``numel`` elements from its
+    first one, whichever axis vLLM's layout puts outermost: Qwen3.8-Flash-
+    Next's KV is registered as ``[heads, tokens, K|V]`` over memory laid out
+    token by token. True when the axes, taken from the innermost outwards,
+    each step by the elements the axes inside them hold.
+    """
+    inner = 1
+    for stride, size in sorted(zip(t.stride(), t.shape, strict=True)):
+        if size == 1:
+            continue
+        if stride != inner:
+            return False
+        inner *= size
+    return True
+
+
+def _heads_before_tokens(t: torch.Tensor) -> bool:
+    """Whether a logical page ``[blocks, heads, states, width]`` keeps
+    several heads one after another in a block, each with all its states."""
+    return t.dim() == 4 and t.shape[1] > 1 and t.stride(1) > t.stride(2)
 
 
 def group_block_view(
@@ -702,7 +825,8 @@ def group_block_view(
     vLLM can keep every KV cache group in one buffer that gives each block id
     one range of bytes, each group laying its layers out one after another
     from the start of that range (DeepSeek-V4.1's block holds its compressed
-    KV and indexer keys side by side this way). Row ``b`` of the view is
+    KV and indexer keys side by side this way, and Qwen3.8-Flash-Next's its
+    compressed keys and full-attention KV). Row ``b`` of the view is
     block ``b``'s bytes for this group. It aliases vLLM's memory: writing a
     row writes that block of every layer in the group.
 
@@ -715,10 +839,17 @@ def group_block_view(
         The view, and each layer's ``(offset, bytes)`` inside a row, in the
         group's layer order.
 
+    A layer with several KV heads (Qwen3.8-Flash-Next's full-attention KV at
+    TP=1) must keep them token by token, as vLLM's default layout for the
+    model does (BLNHC). Head by head (BLHNC) the block holds the same bytes
+    in another order under the same object key, so engines that differ in
+    it would load each other's blocks scrambled; that order is refused.
+
     Raises:
         ValueError: The layers keep a tensor each (``group_page_bytes`` is
-            0), do not share one buffer and block stride, or do not fit in
-            the first ``group_page_bytes`` bytes of each block.
+            0), do not share one buffer and block stride, do not fit in the
+            first ``group_page_bytes`` bytes of each block, or keep several
+            heads head by head.
     """
     page = group.group_page_bytes
     if not page:
@@ -744,6 +875,13 @@ def group_block_view(
             f"MaruKVConnector: the layers of KV cache group {group.group_id} "
             f"differ in block count or block stride (got {sorted(geometry)})"
         )
+    if any(_heads_before_tokens(t) for t in tensors):
+        raise ValueError(
+            f"MaruKVConnector: KV cache group {group.group_id} keeps the KV of "
+            "several heads head by head in each block; Maru copies such a "
+            "group only when vLLM lays it out token by token, its default for "
+            "the model (unset VLLM_KV_CACHE_LAYOUT, or set it to BLNHC)"
+        )
     offsets = [t.data_ptr() - base for t in tensors]
     ends = [
         offset + t[0].numel() * t.element_size()
@@ -752,7 +890,7 @@ def group_block_view(
     start = min(offsets)
     if (
         any(
-            not 0 <= offset < stride or not t[0].is_contiguous()
+            not 0 <= offset < stride or not _fills_its_span(t[0])
             for offset, t in zip(offsets, tensors, strict=True)
         )
         or max(ends) - start > page
