@@ -354,9 +354,9 @@ def _groups_schema(layers, chunk_tokens=784):
     return {"format": "KV_GROUPS-v1", "chunk_tokens": chunk_tokens, "groups": groups}
 
 
-def test_a_schema_goes_as_its_format_and_digest():
+def test_a_schema_goes_as_its_format_and_hash():
     """Qwen3.8-27B's 64 layer names make its schema JSON longer than the 4096
-    characters MaruServer takes; its digest passes, and still tells apart
+    characters MaruServer takes; its hash passes, and still tells apart
     engines that store other objects."""
     schema = _groups_schema(64)
     assert len(json.dumps(schema, sort_keys=True)) > 4096

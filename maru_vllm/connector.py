@@ -733,7 +733,7 @@ def _storage_schema(schema: dict[str, Any]) -> str:
 
     MaruServer only compares schemas: a session reads the regions of its
     namespace when it names the same one. The schema goes as its format and
-    the SHA-256 digest of its JSON, as the cache namespace does: the JSON lists
+    the SHA-256 hash of its JSON, as the cache namespace does: the JSON lists
     every layer, which is longer than the 4096 characters MaruServer takes for
     a model with several KV cache groups and many layers (Qwen3.8-27B's 64
     layer names).
@@ -742,10 +742,10 @@ def _storage_schema(schema: dict[str, Any]) -> str:
         schema: The objects' format, with a ``"format"`` entry.
 
     Returns:
-        ``"<format>:sha256:<digest>"``.
+        ``"<format>:sha256:<hash>"``.
     """
-    digest = hashlib.sha256(json.dumps(schema, sort_keys=True).encode()).hexdigest()
-    return f"{schema['format']}:sha256:{digest}"
+    schema_hash = hashlib.sha256(json.dumps(schema, sort_keys=True).encode())
+    return f"{schema['format']}:sha256:{schema_hash.hexdigest()}"
 
 
 def _session_pool_key(extra: dict[str, Any]) -> str:
