@@ -707,16 +707,14 @@ class MaruHandler:
             if self._closing.is_set():
                 raise RuntimeError("Handler is closing")
 
-            # Duplicate skip
-            if key in self._key_to_location:
-                self._owned.free(handle._region_id, handle._page_index)
-                logger.debug("store: key=%s already in local map, skipping", key)
-                store_ok = True
-            elif self._rpc.exists_kv(key):
+            # Duplicate skip. The server decides whether the key exists: the
+            # local map does not learn of a delete by another client.
+            if self._rpc.exists_kv(key):
                 self._owned.free(handle._region_id, handle._page_index)
                 logger.debug("store: key=%s already exists on server, skipping", key)
                 store_ok = True
             else:
+                self._drop_deleted_key_locked(key)
                 region_id = handle._region_id
                 page_index = handle._page_index
                 offset = page_index * self._owned.get_chunk_size()
@@ -764,6 +762,26 @@ class MaruHandler:
 
         self._record_stats("store", store_size, (time.monotonic() - t0) * 1e6)
         return store_ok
+
+    def _drop_deleted_key_locked(self, key: str) -> None:
+        """Forget ``key`` and free its page: the server no longer has the key.
+
+        Call with ``_write_lock`` held, after the server answered that the key
+        does not exist. A key this handler stored and another client deleted
+        (or the server evicted) stays in the local map otherwise, and its page
+        allocated, until the handler closes.
+        """
+        location = self._key_to_location.pop(key, None)
+        if location is None:
+            return
+        region_id, page_index = location
+        self._owned.free(region_id, page_index)
+        logger.debug(
+            "key=%s was deleted on the server: freed its page (region=%d, page=%d)",
+            key,
+            region_id,
+            page_index,
+        )
 
     def retrieve(self, key: str) -> MemoryInfo | CpuReadLease | None:
         """Retrieve a mapped view or a backend-specific read lease.
@@ -1196,6 +1214,7 @@ class MaruHandler:
             allocations: dict[int, tuple[int, int]] = {}
 
             # Phase 1: Batch check which keys already exist
+            exists_known = True
             try:
                 exists_resp = self._rpc.batch_exists_kv(keys)
                 exists_results = exists_resp.results
@@ -1204,6 +1223,7 @@ class MaruHandler:
                     "batch_exists RPC failed, proceeding without check", exc_info=True
                 )
                 exists_results = [False] * len(keys)
+                exists_known = False
 
             skipped = sum(exists_results)
             if skipped > 0:
@@ -1215,12 +1235,6 @@ class MaruHandler:
 
             # Phase 2: Build register entries, free duplicates
             for i, (key, handle) in enumerate(zip(keys, handles, strict=True)):
-                if key in self._key_to_location:
-                    self._owned.free(handle._region_id, handle._page_index)
-                    logger.debug(
-                        "batch_store: key=%s already in local map, skipping", key
-                    )
-                    continue
                 if exists_results[i]:
                     self._owned.free(handle._region_id, handle._page_index)
                     logger.debug(
@@ -1228,6 +1242,17 @@ class MaruHandler:
                         key,
                     )
                     continue
+                if key in self._key_to_location:
+                    if exists_known:
+                        # Stored here, deleted by another client: store again.
+                        self._drop_deleted_key_locked(key)
+                    else:
+                        self._owned.free(handle._region_id, handle._page_index)
+                        logger.debug(
+                            "batch_store: key=%s already in local map, skipping",
+                            key,
+                        )
+                        continue
 
                 region_id = handle._region_id
                 page_index = handle._page_index
@@ -1304,7 +1329,13 @@ class MaruHandler:
         self._record_stats("batch_store", total_bytes, (time.monotonic() - t0) * 1e6)
         return results
 
-    def batch_exists(self, keys: list[str], route_key: str | None = None) -> list[bool]:
+    def batch_exists(
+        self,
+        keys: list[str],
+        route_key: str | None = None,
+        *,
+        strict: bool = False,
+    ) -> list[bool]:
         """Check if multiple keys exist.
 
         Uses a single batch RPC call instead of N individual calls.
@@ -1313,6 +1344,10 @@ class MaruHandler:
             keys: List of chunk key strings
             route_key: The request's first chunk key. With several remote_cxl
                 pools it picks the pool; other backends ignore it.
+            strict: Raise if MaruServer cannot be asked, so that False always
+                means MaruServer answered that the key is absent. By default a
+                failed request answers False for every key. The storage-client
+                backends ignore it.
 
         Returns:
             List of booleans indicating existence for each key
@@ -1326,6 +1361,8 @@ class MaruHandler:
             batch_resp = self._rpc.batch_exists_kv(keys)
         except Exception:
             logger.error("batch_exists RPC failed", exc_info=True)
+            if strict:
+                raise
             return [False] * len(keys)
         hits = sum(batch_resp.results)
         self._record_stats(
