@@ -728,6 +728,35 @@ def _remote_cxl_async(extra: dict[str, Any]) -> bool:
     )
 
 
+# MaruServer refuses a storage session whose schema is longer
+# (maru_server.replica_directory.ReplicaDirectory._text).
+_MAX_STORAGE_SCHEMA_CHARS = 4096
+
+
+def _storage_schema(schema: dict[str, Any]) -> str:
+    """The schema a storage session names its objects' format by.
+
+    MaruServer only compares schemas: a session reads the regions of its
+    namespace when it names the same one. The JSON goes as it is unless it is
+    longer than MaruServer takes, as it is for a model with several KV cache
+    groups and many layers (Qwen3.8-27B's 64 layer names). It then goes as its
+    format and the SHA-256 digest of the JSON, which engines with the same
+    objects still share. A schema that fits keeps its JSON, so regions that
+    MaruServer kept for engines of an earlier version stay readable.
+
+    Args:
+        schema: The objects' format, with a ``"format"`` entry.
+
+    Returns:
+        The schema to send, at most ``_MAX_STORAGE_SCHEMA_CHARS`` characters.
+    """
+    text = json.dumps(schema, sort_keys=True)
+    if len(text) <= _MAX_STORAGE_SCHEMA_CHARS:
+        return text
+    digest = hashlib.sha256(text.encode()).hexdigest()
+    return f"{schema['format']}:sha256:{digest}"
+
+
 def _session_pool_key(extra: dict[str, Any]) -> str:
     """The extra_config key that sizes a storage-session backend's space.
 
@@ -4183,7 +4212,7 @@ class MaruWorkerConnector:
             }
             self._extra_config = {
                 **self._extra_config,
-                "_maru_storage_schema": json.dumps(schema, sort_keys=True),
+                "_maru_storage_schema": _storage_schema(schema),
             }
         # Derive the CXL page size from the model's KV geometry so each
         # (chunk x layer) object fills exactly one page (no page-rounding waste).
@@ -4274,7 +4303,7 @@ class MaruWorkerConnector:
             }
             self._extra_config = {
                 **self._extra_config,
-                "_maru_storage_schema": json.dumps(schema, sort_keys=True),
+                "_maru_storage_schema": _storage_schema(schema),
             }
         self._group_kernels = {}
         for cache in self._group_caches:
