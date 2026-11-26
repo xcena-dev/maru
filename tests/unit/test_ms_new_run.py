@@ -261,6 +261,28 @@ def test_local_pins_close_once_the_run_ended(fake, nodes):
     assert node.wait_finished(10) and node.ended == "test" and node.new_run
 
 
+def test_a_stop_while_the_heartbeat_starts_joins_no_unstarted_thread(fake, monkeypatch):
+    from maru_storage_service.server_client import ServerClient
+
+    client = ServerClient(
+        fake.url, "solo", "run-1", rpc_timeout_s=0.2, host_boot_id="boot"
+    )
+    start = threading.Thread.start
+
+    def stop_first(thread):
+        client.stop()  # a node stop racing the run's start
+        start(thread)
+
+    try:
+        with monkeypatch.context() as patch:
+            patch.setattr(threading.Thread, "start", stop_first)
+            client.start_heartbeat(lambda: [], lambda response: None, lambda e: None)
+        client.stop()
+        assert not client._heartbeat.is_alive()
+    finally:
+        client.close()
+
+
 def test_an_op_is_never_resent_to_a_new_maruserver(fake):
     from maru_common.storage_types import PoolInfo, WorkerRef
     from maru_storage_service.server_client import ServerClient

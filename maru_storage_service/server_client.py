@@ -266,10 +266,13 @@ class ServerClient:
                 except Exception:
                     logger.exception("handling a heartbeat response failed")
 
-        self._heartbeat = threading.Thread(
+        heartbeat = threading.Thread(
             target=loop, name="maru-node-heartbeat", daemon=True
         )
-        self._heartbeat.start()
+        heartbeat.start()
+        # Published once started: stop() may run meanwhile and joins only a
+        # started thread; the loop sees _stop and ends.
+        self._heartbeat = heartbeat
 
     def heartbeat(self, usage: list[PoolUsage]) -> NodeHeartbeatResponse:
         """One NODE_HEARTBEAT."""
