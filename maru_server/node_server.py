@@ -1,11 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 XCENA Inc.
-"""maru-node-server: the Catalog of the node path in its own process.
-
-StorageServices (``maru-storage``) and the workers of ``maru_node`` engines
-talk to it; the storage backends keep talking to maru-server. Each run has its
-own server epoch: a node or worker that sees another one starts a new session.
-"""
+"""The Catalog for node services and maru_node workers."""
 
 import argparse
 import logging
@@ -59,12 +54,10 @@ class NodeServer:
         self.ms_service.stop()
 
 
-def main() -> None:
+def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(
-        description=(
-            "maru-node-server - the Catalog of Maru StorageServices (maru-storage) "
-            "and maru_node engines"
-        )
+        prog="maru-server --backend node",
+        description="Catalog for node services and maru_node engines.",
     )
     parser.add_argument(
         "--host",
@@ -133,7 +126,7 @@ def main() -> None:
             "reloaded when it changes"
         ),
     )
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     if args.policy_file is not None:
         try:
             load_policy(args.policy_file)
@@ -188,7 +181,7 @@ def main() -> None:
     previous = {
         sig: signal.signal(sig, on_signal) for sig in (signal.SIGINT, signal.SIGTERM)
     }
-    logger.info("Starting maru-node-server on %s:%d", args.host, args.port)
+    logger.info("Starting maru-server --backend node on %s:%d", args.host, args.port)
     try:
         rpc.start()
     finally:

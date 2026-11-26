@@ -414,13 +414,16 @@ def setup_logging(level: str) -> None:
         handler.setLevel(log_level)
 
 
-def main() -> None:
+def main(argv: list[str] | None = None) -> None:
     """Main entry point for the server."""
     # Import here to avoid circular import
     from .rpc_server import RpcServer
 
     parser = argparse.ArgumentParser(
-        description="MaruServer - Central metadata server for Maru shared memory KV cache"
+        prog="maru-server",
+        description="Central metadata server for the cxl backend.",
+        epilog="Select a backend with --backend {cxl,node} (default: cxl). "
+        "For Catalog options, run maru-server --backend node --help.",
     )
     parser.add_argument(
         "--host",
@@ -458,7 +461,7 @@ def main() -> None:
             "If omitted, any available pool is used."
         ),
     )
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     setup_logging(args.log_level)
 

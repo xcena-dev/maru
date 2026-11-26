@@ -389,8 +389,14 @@ def parse_node_config(raw: Any, source: str = "", *, role: str = "gpu") -> NodeC
         raise ValueError(f"unknown node role: {role!r}")
     if isinstance(raw, dict) and "role" in raw:
         raise NodeConfigError(
-            "config.role: run maru-storage for a GPU node or maru-memory-node for a memory node"
+            "config.role: run maru-storage with --role gpu or --role memory"
         )
+    if role == "gpu" and isinstance(raw, dict):
+        for key in sorted(MEMORY_KEYS):
+            if key in raw:
+                raise NodeConfigError(
+                    f"config.{key}: requires maru-storage --role memory"
+                )
     keys = _TOP_KEYS | (GPU_KEYS if role == "gpu" else MEMORY_KEYS)
     raw = _require_keys(raw, keys, "config")
     node_id = _str(raw, "node_id", "config")

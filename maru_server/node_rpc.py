@@ -10,7 +10,7 @@ gives up first counts a miss, a node sends its op again.
 
 Multi-storage requests (0x40-0x5F) go to the MsService, HANDSHAKE tells the
 server epoch, and any other request is refused: the storage backends are
-served by maru-server.
+served by maru-server --backend cxl.
 """
 
 import logging
@@ -172,8 +172,7 @@ class NodeRpcServer:
             }
         else:
             response = {
-                "error": f"message 0x{header.msg_type:02X} is not served here: "
-                "the storage backends use maru-server"
+                "error": "This server uses --backend node. CXL clients use maru-server --backend cxl."
             }
         return serializer.encode_response(header, response)
 

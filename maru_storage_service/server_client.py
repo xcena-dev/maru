@@ -38,6 +38,7 @@ from maru_common.protocol import (
     WorkerExitRequest,
     WorkerExitResponse,
 )
+from maru_common.serializer import MessageDecodeError
 from maru_common.storage_types import (
     EPOCH_SEQ_MAX,
     MAX_BATCH,
@@ -165,6 +166,13 @@ class ServerClient:
                     MessageType.NODE_OPEN, request
                 )
             except RpcUnknownError as e:
+                if (
+                    isinstance(e.__cause__, MessageDecodeError)
+                    and self._is_cxl_server()
+                ):
+                    raise NodeOpenError(
+                        f"{self.url} is not a --backend node server"
+                    ) from e
                 logger.warning("NODE_OPEN to %s: %s; trying again", self.url, e)
                 self._stop.wait(pause)
                 pause = min(pause * 2, RESEND_PAUSE_MAX_S)
@@ -185,6 +193,17 @@ class ServerClient:
                     f"{response.session_ttl_s} must be positive"
                 )
             return response
+
+    def _is_cxl_server(self) -> bool:
+        try:
+            hello = self._rpc.call(MessageType.HANDSHAKE, HandshakeRequest())
+        except RpcUnknownError:
+            return False
+        return (
+            hello.success
+            and hello.rm_address is not None
+            and hello.server_epoch is None
+        )
 
     def _take_session(self, response: NodeOpenResponse) -> None:
         """Caller holds _renew_lock."""

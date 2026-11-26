@@ -121,3 +121,21 @@ class TestUsageMonitorRendering:
         assert row0[1] == "vllm-0"
         # slack column == allocated - used
         assert int(row0[5]) == int(row0[3]) - int(row0[4])
+
+
+def test_discover_only_cxl_servers(monkeypatch, tmp_path):
+    from maru_tools import live
+
+    for pid, options in enumerate(
+        [[], ["--backend=cxl"], ["--backend", "node"], ["--backend=node"]], start=1
+    ):
+        process = tmp_path / str(pid)
+        process.mkdir()
+        argv = ["maru-server", *options, "--port", str(6000 + pid)]
+        (process / "cmdline").write_bytes("\0".join(argv).encode())
+
+    monkeypatch.setattr(live, "Path", lambda _: tmp_path)
+    assert sorted(live.discover_servers(self_pid=0)) == [
+        ("127.0.0.1", 6001, 1),
+        ("127.0.0.1", 6002, 2),
+    ]

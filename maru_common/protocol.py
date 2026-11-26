@@ -933,7 +933,7 @@ MESSAGE_CLASSES = {
     MessageType.SHUTDOWN: (ShutdownRequest, ShutdownResponse),
 }
 
-# Multi-storage messages, served by maru-node-server; the legacy table knows
+# Multi-storage messages, served by the Catalog; the legacy table knows
 # their codes too
 MS_MESSAGE_CLASSES = {
     MessageType.NODE_OPEN: (NodeOpenRequest, NodeOpenResponse),

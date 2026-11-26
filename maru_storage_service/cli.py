@@ -85,17 +85,15 @@ def config_to_dict(config: NodeConfig) -> dict[str, Any]:
 
 
 def main(argv: list[str] | None = None) -> int:
-    return _main(argv, "gpu", "maru-storage")
-
-
-def memory_main(argv: list[str] | None = None) -> int:
-    return _main(argv, "memory", "maru-memory-node")
-
-
-def _main(argv: list[str] | None, role: str, command: str) -> int:
     parser = argparse.ArgumentParser(
-        prog=command,
+        prog="maru-storage",
         description="StorageService: the pool manager of one maru node.",
+    )
+    parser.add_argument(
+        "--role",
+        choices=("gpu", "memory"),
+        default="gpu",
+        help="node service role (default: gpu)",
     )
     parser.add_argument("--config", required=True, help="node config file (JSON)")
     parser.add_argument(
@@ -107,8 +105,13 @@ def _main(argv: list[str] | None, role: str, command: str) -> int:
         "--log-level", default="INFO", help="logging level (default INFO)"
     )
     args = parser.parse_args(argv)
+    return _main(args.role, args.config, args.check, args.log_level)
+
+
+def _main(role: str, path: str, check: bool, log_level: str) -> int:
+    command = f"maru-storage --role {role}"
     try:
-        config = load_node_config(args.config, role=role)
+        config = load_node_config(path, role=role)
     except NodeConfigError as e:
         print(f"{command}: {e}", file=sys.stderr)
         return EXIT_CONFIG
@@ -119,10 +122,10 @@ def _main(argv: list[str] | None, role: str, command: str) -> int:
     except NotServableError as e:
         print(f"{command}: {e}", file=sys.stderr)
         return EXIT_NOT_SERVING
-    if args.check:
+    if check:
         print(json.dumps(config_to_dict(config), indent=2))
         return 0
-    return serve(config, args.log_level)
+    return serve(config, log_level)
 
 
 def _signal_handler(wfd: int):
@@ -148,7 +151,7 @@ def serve(config: NodeConfig, log_level: str = "INFO") -> int:
     from .server_client import NodeOpenError
     from .service import Node, NotServableError
 
-    command = "maru-memory-node" if config.role == "memory" else "maru-storage"
+    command = f"maru-storage --role {config.role}"
     logging.basicConfig(
         level=log_level.upper(),
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",

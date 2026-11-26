@@ -354,7 +354,7 @@ def test_extension_config_is_memory_cxl_only_and_round_trips():
     raw = raw_config()
     config = parse_node_config(raw, role="memory")
     assert parse_node_config(config_to_dict(config), role="memory") == config
-    with pytest.raises(NodeConfigError, match="unknown keys"):
+    with pytest.raises(NodeConfigError, match="requires maru-storage --role memory"):
         parse_node_config(raw, role="gpu")
     raw["tiers"] = [{"store": "dram", "size": 16 * PAGE}]
     with pytest.raises(NodeConfigError, match="requires local_cxl"):

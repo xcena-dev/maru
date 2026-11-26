@@ -69,10 +69,10 @@ class RealMaruServer:
             chosen = port or free_port()
             self.url = f"tcp://127.0.0.1:{chosen}"
             self.log_path = os.path.join(
-                workdir, f"maru-node-server-{chosen}-{os.urandom(3).hex()}.log"
+                workdir, f"catalog-{chosen}-{os.urandom(3).hex()}.log"
             )
             self._log = open(self.log_path, "wb")
-            args = [sys.executable, "-m", "maru_server.node_server"]
+            args = command_argv("maru-server", "--backend", "node")
             args += ["--host", "127.0.0.1", "--port", str(chosen)]
             args += ["--session-ttl-s", str(ttl_s), "--heartbeat-s", str(heartbeat_s)]
             if policy is not None:
@@ -535,7 +535,7 @@ def test_memory_node_command_restart(servers, workdir, store_kind):
         log = Path(workdir, f"memory-{run}.log")
         with log.open("wb") as out:
             proc = subprocess.Popen(
-                command_argv("maru-memory-node", "--config", str(path)),
+                command_argv("maru-storage", "--role", "memory", "--config", str(path)),
                 env=subprocess_env(),
                 cwd=WORKTREE,
                 stdout=out,

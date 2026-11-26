@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 XCENA Inc.
-"""maru-node-server options, and a run's own server epoch."""
+"""Metadata server options, and a run's own server epoch."""
 
 import gc
 import signal
@@ -14,7 +14,8 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from maru_server.node_server import NodeServer, main
+from maru_server.cli import main
+from maru_server.node_server import NodeServer
 from tests.unit.ms_fakes import FakeNode, Wire, key
 
 REPO = Path(__file__).resolve().parents[2]
@@ -33,7 +34,6 @@ def wait_until(pred, timeout: float = 10.0, interval: float = 0.01, what: str = 
 
 def run_main(*argv):
     with (
-        patch("sys.argv", ["maru-node-server", *argv]),
         patch("maru_server.node_server.setup_logging"),
         patch("maru_server.node_server.gc_freeze") as freeze,
         patch("maru_server.node_server.NodeServer") as server_cls,
@@ -41,7 +41,7 @@ def run_main(*argv):
         patch("signal.signal"),
     ):
         rpc_cls.return_value = MagicMock()
-        main()
+        main(["--backend", "node", *argv])
     freeze.start_freezer.assert_called_once_with()
     return server_cls, rpc_cls
 
@@ -93,7 +93,7 @@ def test_options_reach_the_server():
         ["--node-give-up-s", "-1"],
         ["--op-window", "0"],
         ["--op-bytes-max", "0"],
-        ["--cpu-only"],  # a maru-server option
+        ["--dax-path", "/dev/example"],
     ],
 )
 def test_bad_values_are_refused(argv):
@@ -142,7 +142,15 @@ def test_a_signal_stops_the_server_process(sig, tmp_path):
     port = _free_port()
     with log.open("wb") as out:
         proc = subprocess.Popen(
-            [sys.executable, "-m", "maru_server.node_server", "--port", str(port)],
+            [
+                sys.executable,
+                "-m",
+                "maru_server",
+                "--backend",
+                "node",
+                "--port",
+                str(port),
+            ],
             cwd=REPO,
             stdout=out,
             stderr=subprocess.STDOUT,
@@ -151,7 +159,7 @@ def test_a_signal_stops_the_server_process(sig, tmp_path):
         wait_until(
             lambda: "started on" in log.read_text() or proc.poll() is not None,
             timeout=30,
-            what="maru-node-server start",
+            what="Catalog start",
         )
         assert proc.poll() is None, log.read_text()
         proc.send_signal(sig)
@@ -183,3 +191,35 @@ def test_what_the_catalog_removes_is_freed_while_frozen():
     finally:
         gc.unfreeze()
         server.close()
+
+
+@pytest.mark.parametrize("backend", [[], ["--backend", "cxl"]])
+def test_cxl_dispatch(backend):
+    with patch("maru_server.server.main") as serve:
+        main([*backend, "--port", "6000"])
+    serve.assert_called_once_with(["--port", "6000"])
+
+
+@pytest.mark.parametrize(
+    "args", [["--backend", "both"], ["--backend", "cxl", "--heartbeat-s", "1"]]
+)
+def test_refuses_invalid_backend_or_option(args):
+    with pytest.raises(SystemExit) as exc:
+        main(args)
+    assert exc.value.code == 2
+
+
+@pytest.mark.parametrize(
+    "args, expected, absent",
+    [
+        ([], ["--backend", "cxl", "node", "--dax-path"], "--session-ttl-s"),
+        (["--backend", "node"], ["--session-ttl-s", "--heartbeat-s"], "--dax-path"),
+    ],
+)
+def test_help(args, expected, absent, capsys):
+    with pytest.raises(SystemExit) as exc:
+        main([*args, "--help"])
+    assert exc.value.code == 0
+    out = capsys.readouterr().out
+    assert all(word in out for word in expected)
+    assert absent not in out

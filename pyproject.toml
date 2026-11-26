@@ -48,10 +48,8 @@ docs = [
 ]
 
 [project.scripts]
-maru-server = "maru_server.server:main"
-maru-node-server = "maru_server.node_server:main"
+maru-server = "maru_server.cli:main"
 maru-storage = "maru_storage_service.cli:main"
-maru-memory-node = "maru_storage_service.cli:memory_main"
 install-maru-resource-manager = "maru_common.resource_manager_installer:main"
 marutop = "maru_tools.cli:main"
 

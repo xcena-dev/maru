@@ -14,7 +14,6 @@ from maru_storage_service.cli import (
     EXIT_NOT_SERVING,
     config_to_dict,
     main,
-    memory_main,
 )
 from maru_storage_service.config import (
     DEFAULT_RM,
@@ -36,7 +35,7 @@ T = 1 << 40
 GPU_NODE = {
     "node_id": "gpu-a",
     "socket": "/run/maru/node.sock",
-    "server": "tcp://maru-node-server:5556",
+    "server": "tcp://catalog:5556",
     "page_size": "32M",
     "tiers": [{"store": "dram", "size": "64G"}],
 }
@@ -489,17 +488,18 @@ def test_cli_and_start_refuse_unservable_config(tmp_path, capsys, check):
 
 
 @pytest.mark.parametrize(
-    "raw,role,command",
+    "raw,role",
     [
-        (GPU_NODE, "gpu", main),
-        (LOCAL_CXL_NODE, "gpu", main),
-        (MEMORY_NODE, "memory", memory_main),
+        (GPU_NODE, "gpu"),
+        (LOCAL_CXL_NODE, "gpu"),
+        (MEMORY_NODE, "memory"),
     ],
 )
-def test_check_prints_resolved_config(tmp_path, capsys, raw, role, command):
+def test_check_prints_resolved_config(tmp_path, capsys, raw, role):
     path = tmp_path / "node.json"
     path.write_text(json.dumps(raw))
-    assert command(["--config", str(path), "--check"]) == 0
+    args = [] if role == "gpu" else ["--role", role]
+    assert main([*args, "--config", str(path), "--check"]) == 0
     c = json.loads(capsys.readouterr().out)
     assert c["tiers"][0]["store"] == raw["tiers"][0]["store"]
     assert c["page_size"] == 32 * M

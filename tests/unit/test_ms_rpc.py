@@ -256,7 +256,9 @@ def test_storage_backend_requests_are_refused(served):
     wire.socket.send(wire.serializer.encode(0x30, {"action": "usage"}))
     header, reply = wire.serializer.decode(wire.socket.recv())
     assert header.msg_type == 0x30 | 0x80
-    assert "maru-server" in reply["error"]
+    assert reply["error"] == (
+        "This server uses --backend node. CXL clients use maru-server --backend cxl."
+    )
     # the server keeps serving
     assert FakeNode(wire, "n1").open().status == Status.OK
 
