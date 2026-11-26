@@ -1231,6 +1231,18 @@ def _speculative_method(vllm_config: VllmConfig) -> str | None:
     return str(getattr(spec, "method", None) or "unknown")
 
 
+def _dspark_layout_suffix(groups: Sequence[KVGroup]) -> str:
+    """Name the ordered KV layout shared by the scheduler and workers.
+
+    Include group boundaries: vLLM can redistribute the same layers among
+    sliding-window groups. Callers without KVCacheConfig still get a
+    DSpark-specific key distinct from ordinary chunk keys.
+    """
+    layout = json.dumps([group.layer_names for group in groups], separators=(",", ":"))
+    digest = hashlib.blake2b(layout.encode(), digest_size=16).hexdigest()
+    return f"_dspark_{digest}"
+
+
 def _scheduler_lookahead_tokens(vllm_config: VllmConfig) -> int:
     """Read vLLM's slot margin, with the pre-property scheduler rules as fallback."""
     lookahead = getattr(vllm_config, "num_lookahead_tokens", None)
@@ -1967,6 +1979,8 @@ class MaruKVConnector(KVConnectorBase_V1, *_HYBRID_SUPPORT):
                 )
                 self._kv_chunk_tokens = chunk_tokens
 
+        dspark = _speculative_method(vllm_config) == DSPARK_METHOD
+        layout_suffix = _dspark_layout_suffix(self._kv_groups) if dspark else ""
         self._scheduler: MaruSchedulerConnector | None
         self._worker: MaruWorkerConnector | None
         if role == KVConnectorRole.SCHEDULER:
@@ -1989,14 +2003,16 @@ class MaruKVConnector(KVConnectorBase_V1, *_HYBRID_SUPPORT):
                     else ()
                 ),
                 shard_suffixes=[
-                    shard.suffix
+                    layout_suffix + shard.suffix
                     for shard in (
                         tp_part_shards(tp_size)
                         if attention_by_rank
                         else tp_kv_shards(tp_size, total_kv_heads)
                     )
                 ],
-                state_suffixes=[shard.suffix for shard in tp_part_shards(tp_size)],
+                state_suffixes=[
+                    layout_suffix + shard.suffix for shard in tp_part_shards(tp_size)
+                ],
                 dp_rank=_dp_index(vllm_config),
                 layer_indices=_scheduler_layer_indices(self._kv_groups, vllm_config),
             )
@@ -2087,7 +2103,8 @@ class MaruKVConnector(KVConnectorBase_V1, *_HYBRID_SUPPORT):
                     kv_cache_config.num_blocks if kv_cache_config is not None else None
                 ),
                 dp_rank=_dp_index(vllm_config),
-                store_after_forward=_speculative_method(vllm_config) == DSPARK_METHOD,
+                store_after_forward=dspark,
+                layout_suffix=layout_suffix,
             )
 
     @property
@@ -3763,6 +3780,7 @@ class MaruWorkerConnector:
     # without MLA.
     _kv_shard: KVShard = WHOLE_MODEL
     _state_shard: KVShard = WHOLE_MODEL
+    _layout_suffix = ""
     _use_mla = False
     _kv_planes = 2
     # With DSpark a single-group model also stores from wait_for_save: the
@@ -3784,6 +3802,7 @@ class MaruWorkerConnector:
         num_blocks: int | None = None,
         dp_rank: int = 0,
         store_after_forward: bool = False,
+        layout_suffix: str = "",
     ):
         _validate_deferred_loading(bool(_get_knob(extra_config, "maru_async_load")))
         self._block_size = block_size
@@ -3818,6 +3837,7 @@ class MaruWorkerConnector:
         # keys of every attention group, and its part of each Mamba-type
         # state. _slice() picks one per group. A rank that is not a slice's
         # writer only loads it.
+        self._layout_suffix = layout_suffix
         self._kv_shard = kv_shard
         self._state_shard = state_shard
         # This worker's tensor-parallel rank (0 at TP=1). The worker-side
@@ -8352,7 +8372,9 @@ class MaruWorkerConnector:
     ) -> list[str]:
         """The request's chunk keys, named for the slice this rank holds."""
         return _req_chunk_keys(
-            req_meta, self._kv_chunk_tokens, self._slice(group).suffix
+            req_meta,
+            self._kv_chunk_tokens,
+            self._layout_suffix + self._slice(group).suffix,
         )
 
     def _route(self, req_meta: MaruReqMeta) -> dict[str, str]:

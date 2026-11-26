@@ -546,11 +546,12 @@ the chunkwise format, whose chunk is one object of every layer, stores the
 chunk. A load that overlaps compute (`maru_overlap_load_with_compute`) is
 also awaited for every layer before the drafter runs, so the draft layers do
 not depend on their per-layer hooks to wait for it.
-Engines that share a Maru pool must all run with DSpark or all without it,
-also across restarts. Object keys do not record the draft layers, so a chunk
-stored with one setting is found with the other even though it holds another
-set of layers, and its load can fail. Use a fresh or separate pool when
-switching.
+DSpark object keys include a digest of the ordered KV layer groups. Engines
+with and without DSpark can share a pool, including across restarts. The
+first request after switching computes any KV missing for its layout.
+Non-DSpark keys are unchanged. When upgrading a pool previously written by
+a DSpark engine, start a fresh pool once: old DSpark objects used the same
+keys as non-DSpark objects. Upgrade all writers before sharing that pool.
 Other speculative decoding methods store only from the per-layer hooks, as
 without speculative decoding. A method whose draft layers call none, as DFlash's
 likely do since vLLM runs its draft step the way it runs DSpark's, is not
@@ -874,7 +875,7 @@ vLLM splits the model's KV cache into several groups, how many depending on the 
 - **The sliding-window groups.** With SWA bounded replay (`--swa-bounded-replay`, the default on CUDA with vLLM's V2 model runner), vLLM keeps them out of its prefix cache and, after a hit, recomputes the hit's last 128 tokens to rebuild them; Maru does not store them. With bounded replay off (`--no-swa-bounded-replay`, the V1 model runner, or ROCm), vLLM prefix-caches them, and Maru stores for each chunk the window blocks that a hit at the chunk's end needs.
 - **The KV compressor's circular buffer** is not stored, since vLLM does not prefix-cache it.
 
-Both formats work. The model calls no per-layer connector method, so the layerwise format also stores after the forward and loads before it, without overlapping transfers with compute. With bounded replay on, a 256-token chunk takes one 467,712-byte page on SM120 in the chunkwise format, and about 2.9 times that in the layerwise format, which gives each KV cache and the `_DONE` marker a page of their own. With bounded replay off, each chunk also keeps the sliding windows' last blocks, several times the bytes of the MLA group's. Speculative decoding works with the DSpark draft layers in the model's checkpoint (`--speculative-config '{"method": "dspark", "num_speculative_tokens": 5}'`; vLLM 0.33.0 does not start without `num_speculative_tokens`); the connector refuses every other speculative decoding method. Each draft layer keeps a sliding window like the target's, and vLLM deals the draft windows into the target's sliding-window groups, splitting the windows into one more group, so Maru skips or stores them with the target's windows. The groups then hold other layers under the same group ids, and object keys do not tell the two layouts apart: run every engine that shares a Maru pool with the same speculative decoding setting.
+Both formats work. The model calls no per-layer connector method, so the layerwise format also stores after the forward and loads before it, without overlapping transfers with compute. With bounded replay on, a 256-token chunk takes one 467,712-byte page on SM120 in the chunkwise format, and about 2.9 times that in the layerwise format, which gives each KV cache and the `_DONE` marker a page of their own. With bounded replay off, each chunk also keeps the sliding windows' last blocks, several times the bytes of the MLA group's. Speculative decoding works with the DSpark draft layers in the model's checkpoint (`--speculative-config '{"method": "dspark", "num_speculative_tokens": 5}'`; vLLM 0.33.0 does not start without `num_speculative_tokens`); the connector refuses every other speculative decoding method. Each draft layer keeps a sliding window like the target's, and vLLM deals the draft windows into the target's sliding-window groups, splitting the windows into one more group, so Maru skips or stores them with the target's windows. The DSpark key digest includes this grouping, even for groups with equal-sized objects.
 
 ```bash
 vllm serve deepseek-ai/DeepSeek-V4.1-Flash-1017 \

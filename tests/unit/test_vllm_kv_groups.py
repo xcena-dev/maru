@@ -442,6 +442,57 @@ def test_connector_starts_with_dsv41_and_dspark():
     assert connector._scheduler._num_lookahead_tokens == 5
 
 
+@pytest.mark.parametrize("multi_group", [False, True], ids=["qwen", "deepseek"])
+@pytest.mark.parametrize("layerwise", [False, True], ids=["packed", "layerwise"])
+@pytest.mark.parametrize("writer_dspark", [False, True], ids=["off-on", "on-off"])
+def test_first_lookup_after_dspark_switch(multi_group, layerwise, writer_dspark):
+    def engine(role, dspark):
+        config = _connector_config(16, maru_use_layerwise=layerwise)
+        config.num_lookahead_tokens = 5 if dspark else 0
+        if dspark:
+            config.speculative_config = SimpleNamespace(method="dspark")
+        if multi_group:
+            side = "scheduler" if role == KVConnectorRole.SCHEDULER else "worker"
+            cache = dsv41_config(
+                side=side, drafts=dspark, window=_window_mla(4, bounded_replay=False)
+            )
+        else:
+            cache = _one_group_config()
+            if dspark:
+                cache.kv_cache_groups[0].layer_names.append("draft.layers.24.attn")
+        return MaruKVConnector(config, role, cache)
+
+    worker = engine(KVConnectorRole.WORKER, writer_dspark)._worker
+    chunk = worker._kv_chunk_tokens
+    tokens = list(range(2 * chunk + 1))
+    meta = _store_meta(tokens, ([0],), 0, 2 * chunk).requests[0]
+    # Populate the shared index with the worker's packed keys or completion
+    # markers. Every group's objects are present, including window objects.
+    stored = set()
+    for group in worker._kv_groups:
+        if group.kind == GROUP_SKIP:
+            continue
+        for key in worker._slice_chunk_keys(meta, group):
+            if multi_group:
+                key = group.object_key(key, chunk)
+            stored.add(connector_module._chunk_done_key(key) if layerwise else key)
+
+    for reader_dspark, expected in [(writer_dspark, 2), (not writer_dspark, 0)]:
+        scheduler = engine(KVConnectorRole.SCHEDULER, reader_dspark)._scheduler
+        scheduler._handler = MagicMock()
+        scheduler._handler.batch_exists.side_effect = lambda keys: [
+            key in stored for key in keys
+        ]
+        if multi_group:
+            hits = scheduler._count_matched_group_chunks("new", tokens)
+        else:
+            hits = scheduler._count_matched_chunks(tokens)
+        assert hits == expected
+        if reader_dspark != writer_dspark:
+            probed = scheduler._handler.batch_exists.call_args.args[0]
+            assert stored.isdisjoint(probed)
+
+
 def _dspark_scheduler(in_flight=2048):
     """DeepSeek-V4.1 with DSpark as on the GPU: eight 32-token window groups,
     the 64-token MLA group and the 8-token ring, 5 lookahead tokens, and a
