@@ -5,6 +5,7 @@ same process when MaruServer restarted or ended the run, when a result stays
 unknown, or when the RM lease is lost; workers re-attach without a restart.
 Also the worker's side of a MaruServer restart."""
 
+import contextlib
 import dataclasses
 import logging
 import os
@@ -25,6 +26,7 @@ from maru_common.storage_types import (
     PoolKind,
     SessionRole,
     Status,
+    StorageUnavailableError,
 )
 from maru_handler import MaruHandler
 from maru_handler.client import CreditUnavailableError
@@ -174,7 +176,9 @@ def test_an_unknown_commit_result_starts_a_new_run(fake, runs):
 
         fake.rewrite_responses(MessageType.COMMIT, stale)
         (credit,) = raw.credit(PAGE).credits
-        raw.write_done([credit], ["k2"])
+        # The run ends on this result: the reply or the close can come first
+        with contextlib.suppress(StorageUnavailableError):
+            raw.write_done([credit], ["k2"])
     finally:
         raw.close()
     new_run(node, first)
