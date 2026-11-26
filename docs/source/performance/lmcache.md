@@ -70,7 +70,7 @@ In these measurements, Maru `cxl` rises from 59.8 to 173.7 tokens/J and the P2P 
 - **Transfer Methods**:
   - **Maru (`cxl` backend)**:
     - CXL shared memory pool (200 GB, /dev/dax)
-    - Each instance maps the shared pool; GPU transfers copy bytes to/from that mapping, while the metadata server records keys and locations
+    - Each instance maps the shared pool; GPU transfers copy bytes to/from that mapping, while MaruServer (`maru-server --backend cxl`) records keys and locations
   - **LMCache P2P backend (NIXL)**:
     - UCX transport (cuda_ipc,cuda_copy,tcp) over TCP loopback
     - CPU DRAM storage (200 GB)

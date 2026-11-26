@@ -9,22 +9,22 @@
   <a href="https://opensource.org/licenses/Apache-2.0"><img src="https://img.shields.io/badge/License-Apache_2.0-green.svg" alt="License"></a>
 </p>
 
-**Maru** stores reusable KV cache in shared memory for LLM inference. The native vLLM connector supports node-owned DRAM, local CXL and remote memory through `maru_node`. Each node serves one store. The directly mapped `cxl` backend also supports LMCache and SGLang.
+**Maru** stores reusable KV cache in shared memory for LLM inference. The native vLLM connector supports the node backend (selected by `maru_node`). Each GPU node serves one store in DRAM, local CXL or remote memory. The directly mapped `cxl` backend also supports LMCache and SGLang.
 
-| Path | Storage and GPU access | Services |
+| Backend | Storage and GPU access | Services |
 |---|---|---|
-| `maru_node`, `dram` | Node-owned DRAM, mapped by local workers | `maru-node-server` and GPU-host `maru-storage` |
-| `maru_node`, `local_cxl` | Node-owned CXL, mapped by local workers | Catalog, `maru-storage` and Resource Manager |
-| `maru_node`, `remote` | GPU ↔ worker staging ↔ RDMA ↔ memory-node DRAM or CXL | Catalog, GPU-host `maru-storage` and `maru-memory-node`; CXL needs Resource Manager |
-| `cxl` | GPU ↔ directly mapped shared CXL | `maru-server` and Resource Manager |
+| node, `dram` | Node-owned DRAM, mapped by local workers | MaruServer (`maru-server --backend node`) and GPU StorageService (`maru-storage --role gpu`) |
+| node, `local_cxl` | Node-owned CXL, mapped by local workers | MaruServer, GPU StorageService and Resource Manager |
+| node, `remote` | GPU ↔ worker staging ↔ RDMA ↔ memory-node DRAM or CXL | MaruServer, GPU StorageService and memory StorageService (`maru-storage --role memory`). Local CXL needs a Resource Manager on the memory host. |
+| `cxl` | GPU ↔ directly mapped shared CXL | MaruServer (`maru-server --backend cxl`) and Resource Manager |
 
 KV payloads bypass metadata services. Remote workers issue RDMA READ and WRITE directly through their own registered staging. Memory nodes own the remote pages and publish keys only after COMMIT. Reads do not create cached copies on GPU nodes.
 
 ```mermaid
 flowchart LR
-    W["vLLM worker"] <-.-> C["maru-node-server<br/>Catalog"]
-    W <-.-> G["maru-storage<br/>GPU host"]
-    G <-.-> M["maru-memory-node"]
+    W["vLLM worker"] <-.-> C["MaruServer"]
+    W <-.-> G["GPU StorageService"]
+    G <-.-> M["maru-storage --role memory"]
     M <-.-> C
     W <==>|"GPU copy"| S["worker staging"]
     S <==>|"RDMA READ / WRITE"| P[("memory-node store")]
@@ -33,13 +33,13 @@ flowchart LR
 
 Compatible engines reuse keys within the selected store and namespace. GPU-local stores skip new writes when full; memory nodes use a shared LRU. GPU copies and RDMA staging still move bytes. Node components use the same release, and their Catalog is separate from the `cxl` registry.
 
-See [Node StorageService](docs/source/design_doc/node_storage_service.md) for configuration, and [Moving to maru_node](docs/source/getting_started/migrating_to_maru_node.md) for process and setting replacements.
+See [Node StorageService](docs/source/design_doc/node_storage_service.md) for store configuration, capacity and recovery.
 
 ## Quick Start
 
 ### System Components
 
-Node deployments use the processes in the table above. The quick start below describes `cxl`; it needs a Resource Manager, `maru-server` and a CXL-attached client. For node-owned DRAM or remote storage, use the [node setup](docs/source/integration/vllm.md#node-storageservice-maru_node).
+Node deployments use the processes in the table above. The quick start below describes `cxl`; it needs a Resource Manager, MaruServer and a CXL-attached client. For node-owned DRAM or remote storage, use the [node setup](docs/source/integration/vllm.md#node-backend).
 
 ### Prerequisites
 
@@ -100,9 +100,11 @@ sudo maru-resource-manager --log-level debug
 sudo maru-resource-manager --host <ip> --port <port> --log-level debug
 ```
 
-> If you change the RM port, pass the same address to `maru-server`: `maru-server --rm-address 127.0.0.1:9851`
+> If you change the RM port, pass the same address to MaruServer: `maru-server --rm-address 127.0.0.1:9851`
 
-### 2. Start the Metadata Server
+<a id="2-start-the-metadata-server"></a>
+
+### 2. Start MaruServer
 
 ```bash
 # Default (127.0.0.1:5555, connects to resource manager at 127.0.0.1:9850)
@@ -170,7 +172,7 @@ vllm serve <model> --kv-transfer-config '{
 }'
 ```
 
-For node-owned stores, configure `maru_node`, `maru_engine_id`, `maru_cache_namespace` and `kv_load_failure_policy="recompute"` as shown in the [vLLM guide](docs/source/integration/vllm.md#node-storageservice-maru_node).
+For node-owned stores, configure `maru_node`, `maru_engine_id`, `maru_cache_namespace` and `kv_load_failure_policy="recompute"` as shown in the [vLLM guide](docs/source/integration/vllm.md#node-backend).
 
 ## Plugins
 

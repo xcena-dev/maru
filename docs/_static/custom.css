@@ -135,12 +135,16 @@ dt.sig > a.internal {
     float: right;                      /* move [source] to right side */
 }
 
-/* Sidebar: always expand Architecture Overview children */
+/* Sidebar: always expand Quick Start and Architecture Overview children */
+.globaltoc li.toctree-l1:has(> a[href*="quick_start"]) > ul,
+.globaltoc li.toctree-l1:has(ul > .toctree-l2 > a[href*="quick_start_cxl"]) > ul,
 .globaltoc li.toctree-l1:has(> a[href*="architecture_overview"]) > ul,
 .globaltoc li.toctree-l1:has(ul > .toctree-l2 > a[href*="maru_handler"]) > ul {
     display: block !important;
 }
 
+.globaltoc li.toctree-l1:has(> a[href*="quick_start"]) > button,
+.globaltoc li.toctree-l1:has(ul > .toctree-l2 > a[href*="quick_start_cxl"]) > button,
 .globaltoc li.toctree-l1:has(> a[href*="architecture_overview"]) > button,
 .globaltoc li.toctree-l1:has(ul > .toctree-l2 > a[href*="maru_handler"]) > button {
     display: none !important;

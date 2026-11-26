@@ -1,8 +1,8 @@
 # Examples
 
-Start with {doc}`path selection in Quick Start <../quick_start>`. Its Python producer/consumer uses directly mapped CXL. For node DRAM, local CXL and remote stores, use {doc}`the native vLLM service setup <../../integration/vllm>`. The examples below cover vLLM, LMCache and Dynamo.
+Start with {doc}`backend selection in Quick Start <../quick_start>`. {doc}`../quick_start_cxl` uses a Python producer and consumer on directly mapped CXL; {doc}`../quick_start_node` runs vLLM engines on node DRAM, local CXL and remote stores. The examples below cover vLLM, LMCache and Dynamo.
 
-For a functional check, verify the worker's completed external restore and the generated output under equivalent decoding and cached-token boundaries. An HTTP success or scheduler cache-hit count alone can include fallback recomputation. Check failure/recompute logs as well. Record TTFT separately; there is no fixed speedup that proves correctness on every model or prompt.
+On an idle receiving engine, compare the counters before and after its request. An increase in `vllm:external_prefix_cache_hits_total` shows a lookup hit. Check `vllm:prompt_tokens_by_source_total{source="external_kv_transfer"}` and the worker load outcome to confirm reuse. Compare the generated output under equivalent decoding and cached-token boundaries. Measure TTFT separately.
 
 ```{toctree}
 :maxdepth: 2

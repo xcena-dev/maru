@@ -4,13 +4,13 @@ Maru stores KV cache data as fixed-size units called **KV cache chunks**. Each c
 
 ## Backend, identity and sharing
 
-The numbered sections below describe the `cxl` key registry. Node stores use the separate Catalog.
+The numbered sections below describe the `cxl` key registry on MaruServer (`maru-server --backend cxl`). On the node backend (selected by `maru_node`), MaruServer (`maru-server --backend node`) keeps keys in the Catalog.
 
-| Path | Reusable object | Read lifetime |
+| Backend | Reusable object | Read lifetime |
 |---|---|---|
 | `cxl` | A registered key whose CXL region the reader can map | Lookup returns a region handle and byte range; the caller keeps the key and region valid while reading |
-| `maru_node`: `dram`, `local_cxl` | A published object on the same GPU node with matching namespace and geometry | A Catalog source pin and worker mapping protect the read through GPU copy completion |
-| `maru_node`: `remote` | A memory-node object with matching namespace and geometry | A source pin protects the RDMA READ; worker staging stays owned through GPU copy completion |
+| node: `dram`, `local_cxl` | A published object on the same GPU node with matching namespace and geometry | A Catalog source pin and worker mapping protect the read through GPU copy completion |
+| node: `remote` | A memory-node object with matching namespace and geometry | A source pin protects the RDMA READ; worker staging stays owned through GPU copy completion |
 
 ## 1. Key Semantics
 

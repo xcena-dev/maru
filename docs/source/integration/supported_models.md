@@ -21,15 +21,15 @@ The structure table describes the native connector; node store restrictions are 
 | Chunked local + full attention | Llama 4 | ❌ | ❌ |
 ```
 
-🟢 means that Maru stores and loads the KV cache of such models, and ❌ that the connector refuses them at startup. Each model family in a 🟢 row has been run with its own weights while Maru stored and loaded its KV cache. Models with several KV cache groups also need the settings in {ref}`vllm-hybrid-models`; DeepSeek-V4.1-Flash has notes of its own in {ref}`vllm-deepseek-v41`.
+🟢 means that Maru stores and loads the KV cache of such models, and ❌ that the connector refuses them at startup. Models with several KV cache groups also need the settings in {ref}`vllm-hybrid-models`; DeepSeek-V4.1-Flash has notes of its own in {ref}`vllm-deepseek-v41`.
 
 Pipeline parallelism and decode or prefill context parallelism are refused at startup. See {ref}`vllm-tensor-parallelism` for how each rank stores its part of the KV cache.
 
 ## Storage backends
 
-`cxl` and node-local `dram` and `local_cxl` use the connector's mapped-pool transfer modes. Remote nodes use worker-owned registered staging and direct RDMA, and accept chunkwise storage only: layerwise format and overlapped loads are rejected. The node namespace includes model and KV geometry; different TP sizes do not share node keys.
+The directly mapped `cxl` backend and local `dram` or `local_cxl` on the node backend (selected by `maru_node`) use the connector's mapped-pool transfer modes. Remote nodes use worker-owned registered staging and direct RDMA, and accept chunkwise storage only: layerwise format and overlapped loads are rejected. The node namespace includes model and KV geometry; different TP sizes do not share node keys.
 
-TP and multiple KV groups require deferred loading. Requests containing multimodal inputs, LoRA adapters, cache salts or prompt embeddings are computed without Maru caching. These requests can still run in the engine. See {ref}`vllm-hybrid-models` for group and MLA format restrictions and {doc}`../getting_started/migrating_to_maru_node` for the store support matrix.
+TP > 1 or multiple KV groups require deferred loading. Requests containing multimodal inputs, LoRA adapters, cache salts or prompt embeddings are computed without Maru caching. These requests can still run in the engine. See {ref}`vllm-hybrid-models` for group and MLA format restrictions and {ref}`vllm-node-support` for store restrictions.
 
 ## Reporting results
 

@@ -1,8 +1,8 @@
 # MaruServer Architecture
 
-`maru-server` manages the directly mapped `cxl` registry through `KVManager` and `AllocationManager`. It coordinates CXL region ownership and key metadata; payloads pass between workers and mapped CXL.
+MaruServer (`maru-server --backend cxl`) manages the directly mapped `cxl` registry through `KVManager` and `AllocationManager`. It coordinates CXL region ownership and key metadata; payloads pass between workers and mapped CXL.
 
-Node-owned stores use the separate Catalog in `maru-node-server`. See {doc}`node_storage_service` for node registration, COMMIT, source pins and retirement. The registries do not exchange keys.
+The node backend (selected by `maru_node`) uses MaruServer (`maru-server --backend node`) to maintain the Catalog. See {doc}`node_storage_service` for node registration, COMMIT, source pins and retirement. The registries do not exchange keys.
 
 ## 1. Component Structure
 

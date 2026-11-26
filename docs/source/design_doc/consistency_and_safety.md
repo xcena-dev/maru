@@ -2,9 +2,9 @@
 
 ## 1. Data Visibility
 
-The sequence and cache-flush steps below describe directly mapped `cxl`. Node remote workers fill their own staging and issue RDMA WRITE; the memory node publishes keys only after Catalog COMMIT. Staging writes alone do not publish data. See {doc}`node_storage_service` for node protections.
+The sequence and cache-flush steps below describe directly mapped `cxl`. With a remote store on the node backend (selected by `maru_node`), workers fill their own staging and issue RDMA WRITE. The memory StorageService (`maru-storage --role memory`) publishes keys through Catalog COMMIT on MaruServer (`maru-server --backend node`). Staging writes alone do not publish data. See {doc}`node_storage_service` for node protections.
 
-Maru publishes an object's location after the writer finishes writing its payload. Once `store()` returns successfully, other instances can look up that location through the metadata server.
+Maru publishes an object's location after the writer finishes writing its payload. Once `store()` returns successfully, other instances can look up that location through MaruServer (`maru-server --backend cxl`).
 
 This relies on **write-then-register** ordering. Every store completes these steps in sequence:
 
@@ -31,7 +31,7 @@ sequenceDiagram
     Note over R: Complete data
 ```
 
-The visibility point is when `register_kv` RPC completes. The server holds the key in an in-memory registry protected by a lock, ensuring that concurrent lookups always see a fully committed entry or no entry at all.
+The visibility point is when `register_kv` RPC completes. MaruServer holds the key in an in-memory registry protected by a lock, ensuring that concurrent lookups always see a fully committed entry or no entry at all.
 
 (cross-host-visibility)=
 
@@ -46,7 +46,7 @@ CPU access to a shared payload can leave cached copies that other hosts do not i
 1. **Writer:** write the payload to `handle.buf`, call `flush_range(handle.buf)`, then `store()`.
 2. **Reader:** `retrieve()`, call `flush_range(result.view)` to drop local cached copies, then read `result.view`.
 
-The {doc}`../getting_started/quick_start` producer and consumer follow this pattern. The CPU-based `examples/basic/producer.py` and `consumer.py` are single-host examples and do not flush.
+The {doc}`../getting_started/quick_start_cxl` producer and consumer follow this pattern. The CPU-based `examples/basic/producer.py` and `consumer.py` are single-host examples and do not flush.
 
 For multi-node use, validate the deployed transfer path across repeated updates and memory reuse, including any CPU access performed by the runtime or driver.
 
@@ -58,7 +58,7 @@ Remote node processes default to `UCX_TLS=rc,dc,cuda_copy` and `UCX_RCACHE_ENABL
 
 ## 2. Concurrency
 
-The following lock diagram describes the legacy `cxl` Handler and registry. Node clients use Catalog pins and explicit staging ownership. Remote transfers can run outside the client lock while their resources remain owned until completion.
+The following lock diagram describes the directly mapped `cxl` Handler and registry. Node clients use Catalog pins and explicit staging ownership. Remote transfers can run outside the client lock while their resources remain owned until completion.
 
 ```mermaid
 flowchart LR
@@ -122,13 +122,13 @@ sequenceDiagram
 
 ### 3.2 Client Crash Recovery
 
-Process exit, session expiry and network loss are different events. The legacy `cxl` region owner tracked by the RM is usually MaruServer. The RM checks local owners by PID and start time and tracks remote owners through their connections and a grace period. A worker can still use its mapping after the owner loses the allocation. The RM keeps the range out of use while any mapping or NIC registration holds it (see {doc}`maru_resource_manager`, §5).
+Process exit, session expiry and network loss are different events. The RM usually tracks the `cxl` MaruServer as the region owner. The RM checks local owners by PID and start time and tracks remote owners through their connections and a grace period. A worker can still use its mapping after the owner loses the allocation. The RM keeps the range out of use while any mapping or NIC registration holds it (see {doc}`maru_resource_manager`, §5).
 
 | Component | Detection | Reclamation |
 |-----------|-----------|-------------|
 | Resource Manager | Local liveness or remote disconnect/grace period | Ends allocation ownership; a held range remains draining until every NIC registration is confirmed gone and every process that maps it has unmapped it or ended |
-| Legacy `cxl` registry | Owner disconnect and KV ref counts | Defers return while registered keys still reference the region |
-| Node Catalog | Worker/run identity and source pins | Keeps orphan pins while old workers can still read |
+| Directly mapped `cxl` registry | Owner disconnect and KV ref counts | Defers return while registered keys still reference the region |
+| Node MaruServer | Worker/run identity and source pins | Keeps orphan pins while old workers can still read |
 | Memory node | Worker loss, uncertain write, lost connection or a silent GPU-node run | Revokes the instance's write registration within its GPU-node run before reclaiming that domain's pages; failed revocation quarantines them |
 
 The reaper defends against PID reuse by caching each client's process start time at allocation time. If the PID is recycled by the OS, the start-time mismatch triggers reclamation.
@@ -142,7 +142,7 @@ The reaper defends against PID reuse by caching each client's process start time
 | Failure | Impact | Recovery boundary |
 |---|---|---|
 | Worker exit | Node-owned committed keys can remain; in-flight writes need fencing | Recompute unavailable keys; restart affected vLLM instances after confirming old worker exit |
-| Metadata server restart | Volatile key metadata is lost | Node services and workers open new sessions; recompute and repopulate the cache |
+| MaruServer restart | Volatile key metadata is lost | Node services and workers open new sessions; recompute and repopulate the cache |
 | Resource Manager restart | Allocation operations pause while the ledger and holds are recovered | Restore allocation metadata and revalidate devices; this does not establish payload durability |
 | Network partition or uncertain native transfer | Reads can miss and unknown NIC accesses can retain staging | Use recompute; recover a persistently affected worker by stopping its whole engine and confirming process exit |
 | Memory-node reboot or device failure | Cached bytes can be lost or invalid | Invalidate affected regions and recompute; this implementation does not promise automatic cross-device replication |

@@ -1,16 +1,16 @@
 # Configuration
 
-The native vLLM connector selects a node store with `maru_node`, or directly mapped `cxl` with its default configuration. Node capacity, page size, Catalog address and RDMA settings belong to service JSON. See {doc}`../getting_started/migrating_to_maru_node` for setting replacements.
+The native vLLM connector uses the node backend (selected by `maru_node`) or the directly mapped `cxl` backend. Set node capacity, page size, the `server` address and RDMA settings in service JSON.
 
 ## Node services
 
-| Command | Purpose | Defaults and options |
+| Process and command | Purpose | Defaults and options |
 |---|---|---|
-| `maru-node-server` | Catalog | `--host 127.0.0.1`, `--port 5556`, `--log-level INFO` |
-| `maru-storage --config gpu.json` | GPU service | Required JSON; `--check` prints resolved defaults; `--log-level INFO` |
-| `maru-memory-node --config memory.json` | Memory service | Required JSON; same check and logging options |
+| MaruServer (`maru-server --backend node`) | Tracks node metadata | `--host 127.0.0.1`, `--port 5556`, `--log-level INFO` |
+| GPU StorageService (`maru-storage --role gpu`) | Serves local workers (default role) | Requires `--config FILE`. `--check` prints resolved defaults. Log level defaults to `INFO`. |
+| memory StorageService (`maru-storage --role memory`) | Serves a remote pool | Requires `--config FILE`. Same check and logging options. |
 
-Catalog options:
+Options for the node MaruServer:
 
 | Option | Default | Meaning |
 |---|---|---|
@@ -23,7 +23,7 @@ Catalog options:
 | `--op-bytes-max` | `67108864` | Byte limit for those results |
 | `--policy-file` | None | JSON preserve policy, reloaded on changes |
 
-The command selects the role. JSON rejects `role`, unknown keys and duplicate keys. `--check` validates configuration and store support without allocating pools, loading the extension or starting RDMA. It does not check that a key file, device or endpoint can be used at runtime.
+The command selects the role. JSON rejects `role`, unknown keys and duplicate keys. `--check` validates configuration and store support without allocating pools, loading the extension or starting RDMA. For the MaruServer address, `--check` only verifies a nonempty string. It does not check that a key file, device or endpoint can be used at runtime.
 
 | Configuration | Required | Main optional settings |
 |---|---|---|
@@ -39,6 +39,8 @@ The command selects the role. JSON rejects `role`, unknown keys and duplicate ke
 `high_watermark` (`0.9`) and `low_watermark` (`0.8`) are memory-store options only. Remote `staging_size` defaults to `max(1GiB, 64 * page_size)` per worker; `staging_max_bytes` defaults to that same amount for the whole GPU node. Increase the total for simultaneous workers.
 
 See {doc}`../design_doc/node_storage_service` for every store and budget validation rule, derived defaults and complete JSON examples. See {doc}`../design_doc/read_hints` for extension hooks and memory generations.
+
+(node-connector-settings)=
 
 ## vLLM node configuration
 
@@ -63,7 +65,7 @@ See {doc}`../design_doc/node_storage_service` for every store and budget validat
 | `maru_engine_id` | Required | Engine identity; ranks share it |
 | `maru_cache_namespace` | Required | Immutable weights revision; connector binds it to KV geometry |
 | `maru_kv_chunk_tokens` | `256` | Tokens per stored chunk, aligned to vLLM blocks |
-| `maru_async_load` | Node advice (`false`) | Deferred load; forced on for async scheduling, TP>1 and multiple KV groups |
+| `maru_async_load` | Node advice (`false`) | Deferred load; required for async scheduling, TP > 1 or multiple KV groups |
 | `maru_async_store` | Node advice (`false`) | Asynchronous store completion |
 | `maru_lookup_timeout_ms` | `100` | Foreground Catalog lookup timeout |
 | `maru_credit_wait_ms` | `0` | Engine-thread store credit wait budget per step |
@@ -73,7 +75,14 @@ See {doc}`../design_doc/node_storage_service` for every store and budget validat
 
 `kv_load_failure_policy` must be `recompute`. Remote stores reject `maru_use_layerwise` and `maru_overlap_load_with_compute`. Synchronous loads require TP=1, one KV group and async scheduling off. See {doc}`../integration/vllm` for transfer modes and model restrictions.
 
-Do not combine `maru_node` with connector-side capacity, page-size, server-address, instance-id, backend, pinning, eager-mapping or write-hint settings. The service owns those settings; the connector rejects them by name.
+| Configuration | Keys the connector rejects with `maru_node` |
+|---|---|
+| Store capacity and order | `maru_pool_size`, `maru_cpu_pool_size`, `maru_cxl_pool_size`, `maru_auto_expand`, `maru_write_order`, `maru_read_order` |
+| Page size and mapping | `maru_chunk_size`, `maru_pin_pools`, `maru_eager_map` |
+| Server, identity and backend | `maru_server_url`, `maru_node_id`, `maru_instance_id`, `maru_storage_backend` |
+| Remote credentials and write hints | `maru_remote_cxl_agent_key_file`, `maru_write_hints`, `maru_write_wait_ms` |
+
+Configure remote staging size, RDMA device and timeout on the GPU StorageService. ATTACH supplies the effective values to the worker.
 
 ## MaruConfig
 
@@ -93,7 +102,7 @@ config = MaruConfig(
 |---|---|---|
 | `maru_node` | `None` | Set to use a node service |
 | `engine_id`, `cache_namespace` | `None` | Required when using a node service |
-| `server_url` | `tcp://localhost:5555` | `cxl` metadata server; node services supply the Catalog address |
+| `server_url` | `tcp://localhost:5555` | Address of MaruServer (`maru-server --backend cxl`) for directly mapped CXL. Node services supply their MaruServer address through `server`. |
 | `instance_id` | Generated UUID | `cxl` client identity |
 | `pool_size` | `100MiB` | Initial `cxl` region allocation |
 | `chunk_size_bytes` | `1MiB` | Required object/page size on the Python interface |
@@ -114,7 +123,7 @@ config = MaruConfig(
 
 ## Direct CXL configuration
 
-`maru-server` serves the `cxl` backend:
+Running `maru-server` without `--backend` selects `cxl`. MaruServer accepts these options for `cxl`:
 
 | Option | Default | Meaning |
 |---|---|---|

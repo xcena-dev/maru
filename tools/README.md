@@ -14,7 +14,7 @@ The subcommands sit at three layers and complement rather than overlap (the only
 
 | Command | Layer | Source | Answers |
 |---|---|---|---|
-| `marutop` | both (fused) | RM + MaruServer | "one screen: how full, and who holds what?" |
+| `marutop` | both (fused) | RM + MaruServer (`maru-server --backend cxl`) | "one screen: how full, and who holds what?" |
 | `marutop pool` | physical device/pool | resource manager (`:9850`) | "how full is each DAX device?" |
 | `marutop usage` | logical per-instance | MaruServer (`:5555`) | "who is holding what, and how much is left?" |
 | `marutop stats` | operations/performance | MaruServer (`:5555`) | "who is doing how many ops, how fast?" |
@@ -27,16 +27,16 @@ The default screen is an `htop`-style curses TUI — the analog of `pxltop`'s DE
 **Overview** (default):
 
 - **DEVICES** — physical DAX pools from the Resource Manager (`:9850`).
-- **INSTANCES** — per-instance allocated/used/slack, with a per-DAX-device gauge under each instance (which device its regions landed on, and how much of that device it holds). With no `-p`/`--host`, the local `maru-server` processes are **auto-discovered** (by scanning `/proc` for their `--port`) and all polled, each under a `── server :PORT (pid N) ──` block — so multiple servers are covered without knowing their ports. Pass `-p`/`--host` to pin a single (possibly remote) server instead. This view reports the `cxl` registry. For node stores, inspect service errors and the worker's read and store outcome logs. `maru-node-server` is a separate Catalog endpoint.
+- **INSTANCES** — per-instance allocated/used/slack, with a per-DAX-device gauge under each instance (which device its regions landed on, and how much of that device it holds). With no `-p`/`--host`, local `cxl` MaruServer processes are **auto-discovered** (by scanning `/proc` for their `--port`) and all polled, each under a `── server :PORT (pid N) ──` block — so you can see each MaruServer instance without knowing its port. Pass `-p`/`--host` to select one MaruServer instance by address. This view reports the `cxl` registry. For node stores, inspect service errors and the worker's read and store outcome logs. MaruServer (`maru-server --backend node`) maintains the Catalog for node stores.
 
 **STATS view** (select an instance + `enter`): a full per-instance dashboard — an op table (count / delta / avg / min / max latency + an activity sparkline), a detail box for the `↑↓`-selected op (hit-rate bar, throughput), and a min/avg/max latency graph over time. Populated only when clients run with `MARU_STAT=1` (else a hint). `esc`/`←` returns to the overview. `marutop stats` remains for a directly port-pinned dashboard.
 
 Backends are polled on a background thread, so the UI stays smooth and keys stay responsive even when a server is slow or unreachable (its block just shows `(unavailable: ...)`).
 
 ```bash
-marutop                    # auto-discover local servers + RM; refresh every 1s
+marutop                    # auto-discover local MaruServer instances + RM; refresh every 1s
 marutop -w 2               # refresh every 2s
-marutop -p 11011           # pin one server (e.g. a naru run) — disables discovery
+marutop -p 11011           # select one MaruServer instance (e.g. a naru run) — disables discovery
 marutop --once             # single plain-text snapshot then exit (scriptable)
 marutop --host 10.0.0.1 -p 5556 --address 10.0.0.1:9850
 ```
@@ -115,7 +115,7 @@ Options:
   Pool (shared): 229.0G free / 242.8G total  [##----------------------------] 5.7%
 ```
 
-> **Note:** `instance_id` identifies one `MaruBackend` = one process/worker (TP/DP runs one per worker), and the default is a random UUID per process. Set `maru_instance_id` in the integration's `extra_config` for stable, readable rows. Requires a MaruServer that supports the `GET_USAGE` RPC; against an older server the tool reports a connection error rather than an empty table.
+> **Note:** `instance_id` identifies one `MaruBackend` = one process/worker (TP/DP runs one per worker), and the default is a random UUID per process. Set `maru_instance_id` in the integration's `extra_config` for stable, readable rows. Requires a MaruServer that supports the `GET_USAGE` RPC; against an older MaruServer version the tool reports a connection error rather than an empty table.
 
 ## `marutop stats`
 
@@ -153,7 +153,7 @@ Options: `--host` (default `127.0.0.1`), `-p/--port` (default `5555`), `-i/--int
 
 ### Metrics shown
 
-Per `(client_id, op_type)` the server tracks cumulative (count, total bytes, avg/min/max latency since connect) and interval (reset each poll — live view) figures, plus `hit`/`partial`/`miss` classification for retrieve/exists ops. Operations covered: `alloc`, `free`, `store`, `retrieve`, `exists`, `pin`, `unpin`, `delete`, and their `batch_*` variants.
+Per `(client_id, op_type)` MaruServer tracks cumulative (count, total bytes, avg/min/max latency since connect) and interval (reset each poll — live view) figures, plus `hit`/`partial`/`miss` classification for retrieve/exists ops. Operations covered: `alloc`, `free`, `store`, `retrieve`, `exists`, `pin`, `unpin`, `delete`, and their `batch_*` variants.
 
 ## `marutop device`
 

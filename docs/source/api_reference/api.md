@@ -2,7 +2,7 @@
 
 ## MaruHandler
 
-The main client interface for Maru. It stores and retrieves shared KV objects, with metadata managed by MaruServer. The selected storage backend determines where allocation and read buffers live.
+MaruHandler stores and retrieves shared KV objects. MaruServer manages metadata for the selected backend (`maru-server --backend cxl` or `maru-server --backend node`). The backend determines where allocation and read buffers live.
 
 ```python
 from maru import MaruConfig, MaruHandler
@@ -10,7 +10,7 @@ from maru import MaruConfig, MaruHandler
 
 ### Usage
 
-This example and the `AllocHandle`/`MemoryInfo` descriptions below use the default **`cxl` backend**. A returned memoryview points into a directly mapped CXL region. With `maru_node`, the service owns the pool. A remote worker reads directly into its registered staging and returns a result that must stay owned through the final GPU copy. See {doc}`../design_doc/node_storage_service`.
+This example and the `AllocHandle`/`MemoryInfo` descriptions below use the default **`cxl` backend**. A returned memoryview points into a directly mapped CXL region. On the node backend (selected by `maru_node`), the StorageService owns the pool. A remote worker reads directly into its registered staging and returns a result that must stay owned through the final GPU copy. See {doc}`../design_doc/node_storage_service`.
 
 ```python
 config = MaruConfig(server_url="tcp://localhost:5555", pool_size=1024 * 1024 * 100)
@@ -35,7 +35,7 @@ with MaruHandler(config) as handler:
 
 ### Key Behaviors
 
-The following behaviors describe the default `cxl` path:
+The following behaviors describe the default `cxl` backend:
 
 - **Context-manager connection**: Entering `with MaruHandler(config)` connects when `auto_connect=True` (default). Construction alone does not connect; outside a context manager call `connect()` explicitly.
 - **Auto-expand**: Automatically allocates new memory regions when current ones are full
@@ -45,11 +45,11 @@ The following behaviors describe the default `cxl` path:
 
 For node reads, retain each result until its final CPU read or GPU copy completes, then call `handler.release_retrieved([result])`.
 
-### Path-specific operations
+### Backend-specific operations
 
-| Operation | `cxl` | `maru_node` |
+| Operation | `cxl` | node |
 |---|---|---|
-| `alloc`, `store`, `retrieve`, `exists` and batch forms | Directly mapped CXL | Service credit, Catalog and mapped pool or worker RDMA |
+| `alloc`, `store`, `retrieve`, `exists` and batch forms | Directly mapped CXL | Service credit, Catalog operations on keys, and a mapped pool or worker RDMA |
 | `delete`, `pin`, `unpin` and batch pin/unpin | Key-registry operations | Handler raises `NotImplementedError`; Catalog source pins are managed by the read path |
 | DAX mapping accessors | Handler's CXL mappings | Do not expose a remote DAX mapping |
 | `release_retrieved` | No result ownership to release | Release results after the final read or GPU copy |

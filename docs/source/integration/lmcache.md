@@ -2,7 +2,7 @@
 
 ## Integration Architecture
 
-This guide describes LMCache's directly mapped `cxl` integration. Its memoryview and allocator diagrams refer to that path. Node-owned stores and worker direct RDMA are documented for the native {doc}`vLLM connector <vllm>`. The configuration below selects directly mapped `cxl`.
+This guide describes LMCache's directly mapped `cxl` integration. Its allocator and memoryview diagrams show mapped CXL pages. The native {doc}`vLLM connector <vllm>` also supports the node backend (selected by `maru_node`) for node-owned pools and worker RDMA.
 
 The full stack from inference engine to shared memory:
 
@@ -24,7 +24,7 @@ The full stack from inference engine to shared memory:
 | **MaruBackend** | LMCache `AllocatorBackendInterface` — allocates directly on CXL, async store, sync get | Integration boundary |
 | **CxlMemoryAdapter** | LMCache `MemoryAllocatorInterface` — translates Maru pages to `TensorMemoryObj` pool | Integration boundary |
 | **MaruHandler** | Client-side KV operations, memory mapping, connection management | Maru client |
-| **MaruServer** | Central metadata store, memory allocation coordinator | Maru server |
+| **MaruServer** (`maru-server --backend cxl`) | Central metadata store, memory allocation coordinator | MaruServer |
 
 The **integration boundary** sits at MaruBackend + CxlMemoryAdapter. Everything above is LMCache; everything below is Maru. These two classes are the only components that import from both projects.
 

@@ -1,6 +1,6 @@
 # Handler Plugins
 
-Maru core is **vendor-neutral**. Hardware- or vendor-specific behaviour — for example a CXL device's prefetch/pin hints — does not live in the Maru tree. Instead it ships as a **separate package** that registers a `maru.handler_plugins` [entry point](https://packaging.python.org/en/latest/specifications/entry-points/). `MaruHandler` discovers those packages when it is constructed and calls them at a few lifecycle seams. DAX mapping hooks describe the `cxl` path; node stores do not provide the same mapping callbacks.
+Maru core is **vendor-neutral**. Hardware- or vendor-specific behaviour — for example a CXL device's prefetch/pin hints — does not live in the Maru tree. Instead it ships as a **separate package** that registers a `maru.handler_plugins` [entry point](https://packaging.python.org/en/latest/specifications/entry-points/). `MaruHandler` discovers those packages when it is constructed and calls them at a few lifecycle seams. DAX mapping hooks describe the `cxl` backend; node stores do not provide the same mapping callbacks.
 
 The model deliberately follows [vLLM's plugin system](https://blog.vllm.ai/2025/05/12/hardware-plugin.html) (soft-fail) rather than PyTorch's device-backend autoload (hard-fail): a Maru plugin is an *optional optimization*. A plugin that fails to load — or whose hook raises an ordinary exception — is logged and skipped. Plugins still run inside the Handler process and must respect buffer lifetimes and execution costs; exception handling does not make arbitrary plugin behavior harmless.
 
@@ -36,11 +36,11 @@ Every hook is **optional** — a plugin implements only the ones it needs, and `
 
 In `on_batch_retrieve`, `keys[i]` corresponds to `batch_resp.entries[i]`. A found entry exposes a `handle` (region/offset) whose region is already mapped, so a plugin can act on real memory addresses.
 
-The node path delegates retrieval and close to `MaruClient` before the DAX hooks. `on_init` and statistics contributions still apply, but a plugin must not assume that DAX mapping or close callbacks follow for every path. Remote device hooks run on the memory node through `region_extension`; see {doc}`../design_doc/read_hints`.
+The node backend (selected by `maru_node`) delegates retrieval and close to `MaruClient` before the DAX hooks. `on_init` and statistics contributions still apply, but a plugin must not assume that DAX mapping or close callbacks follow for every backend. Remote device hooks run on the memory node through `region_extension`; see {doc}`../design_doc/read_hints`.
 
 ### Memory hints of the `cxl` backend
 
-With `read_hints` (a vLLM scheduler's handler; `maru_read_hints` in the vLLM connector) or `read_promotes` (a vLLM worker's handler with `maru_async_load`), a handler of the `cxl` backend gives the plugins the hint messages that remote node stores send through GPU StorageService to a memory-node region extension ({doc}`../design_doc/read_hints`), in the same form:
+With `read_hints` (a vLLM scheduler's handler; `maru_read_hints` in the vLLM connector) or `read_promotes` (a vLLM worker's handler with `maru_async_load`), a handler of the `cxl` backend gives the plugins the hint messages that remote node stores send through the GPU StorageService (`maru-storage --role gpu`) to a memory-node region extension ({doc}`../design_doc/read_hints`), in the same form:
 
 | `message["action"]` | Sent when | `message["ranges"]` |
 |------|------|------|

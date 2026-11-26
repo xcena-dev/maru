@@ -1,87 +1,131 @@
 # Node StorageService
 
-`maru_node` connects vLLM to a node-owned store. Each GPU node serves exactly one of `dram`, `local_cxl` or `remote`; a memory node owns one `dram` or `local_cxl` store. The Catalog in `maru-node-server` is the authority for published keys and their locations. The directly mapped `cxl` backend uses `maru-server` and a separate registry.
+The node backend (selected by `maru_node`) runs MaruServer (`maru-server --backend node`). MaruServer keeps the Catalog of the node backend: published keys, their locations and pins. The GPU StorageService (`maru-storage --role gpu`) serves one `dram`, `local_cxl` or `remote` store. The memory StorageService (`maru-storage --role memory`) owns one `dram` or `local_cxl` pool. The directly mapped `cxl` backend runs MaruServer (`maru-server --backend cxl`) with a separate key registry.
 
 ## Processes and data paths
 
 | Process | Responsibility |
 |---|---|
-| `maru-node-server` | Catalog, node and worker sessions, publication, pins and retirement |
-| `maru-storage` | GPU-node pools, worker attachment, credit and memory-node control |
-| `maru-memory-node` | Memory-node pools, RDMA registrations, publication and shared LRU eviction |
+| MaruServer | Catalog, node and worker sessions, publication, pins and retirement |
+| `maru-storage --role gpu` | GPU-node pools, worker attachment, credit and memory-node control |
+| `maru-storage --role memory` | Memory-node pools, RDMA registrations, publication and shared LRU eviction |
 | vLLM worker | GPU copies and, with `remote`, direct RDMA READ and WRITE |
 | Resource Manager | CXL region ownership and holds; needed for `local_cxl` |
 
-```mermaid
-flowchart LR
-    W["vLLM worker"] <-.->|"lookup and pin"| C["maru-node-server<br/>Catalog"]
-    W <-.->|"attach, credit, write completion"| G["maru-storage"]
-    G <-.-> C
-    G <-.->|"reserve, commit, fence"| M["maru-memory-node"]
-    M <-.-> C
-    W <==>|"GPU copy"| S["worker-owned registered staging"]
-    S <==>|"RDMA READ / WRITE"| P[("memory-node DRAM or local CXL")]
-    M -.->|"map and register"| P
-```
+![Remote workers look up and pin keys in the Catalog, then transfer KV between their staging and the registered memory-node pool over RDMA. The GPU StorageService manages credit. The memory StorageService commits keys and evicts eligible unpinned keys under capacity pressure.](../image/node_remote.png)
 
-The diagram shows `remote`. For `dram` and `local_cxl`, workers map the node-owned pool and copy directly between that mapping and GPU memory. With `remote`, the GPU service carries control messages; KV bytes move through each worker's own staging. Workers and their GPU service must share a PID namespace so the service can verify process identity and exit.
+The figure shows `remote`. For `dram` and `local_cxl`, workers map the node-owned pool and copy directly between that mapping and GPU memory. With `remote`, the GPU service carries control messages; KV bytes move through each worker's own staging. Workers and their GPU service must share a PID namespace so the service can verify process identity and exit.
 
 ## Stores and reads
 
-For a local store, the worker obtains credit, fills its page, and reports write completion. The service publishes the key through Catalog COMMIT after the payload write completes. A local read pins the Catalog location and uses the mapped page until its GPU copy completes.
+Engines on the same GPU node can share local keys when their namespace and KV geometry match. To store a key, the worker obtains credit, fills its page and reports write completion. The service publishes the key through Catalog COMMIT after the payload write completes. A local read pins the Catalog location and uses the mapped page until its GPU copy completes.
 
-For a remote store, the GPU service reserves memory-node pages and obtains the instance's write registration for that GPU-node run. The worker copies GPU bytes into its registered staging, issues RDMA WRITE to those pages, and reports completion. The memory node publishes the key with Catalog COMMIT. A staging write or an RDMA completion alone does not publish a key.
+```mermaid
+sequenceDiagram
+    participant W as worker
+    participant S as maru-storage
+    participant C as MaruServer
+    Note over W,C: local store (dram or local_cxl)
+    W->>S: CREDIT
+    S-->>W: pages in the node pool
+    W->>W: GPU copy into the mapped page
+    W->>S: WRITE_DONE
+    S->>C: COMMIT (key becomes visible)
+    Note over W,C: local read
+    W->>C: LOOKUP_AND_PIN
+    C-->>W: location, pin
+    W->>W: GPU copy from the mapped page
+    W->>C: UNPIN after the GPU copy
+```
 
-The GPU service reports its connected memory node’s ID and epoch to the Catalog on each heartbeat, starting before workers attach. For both PROBE and LOOKUP_AND_PIN, a remote HIT requires a committed copy in an active pool of that memory-node run and live sessions on both nodes. If a key has several copies, the Catalog chooses among the readable ones.
+For a remote store, the GPU service reserves memory-node pages and obtains the instance's write registration for that GPU-node run. The worker copies GPU bytes into its registered staging, issues RDMA WRITE to those pages, and reports completion. The memory node publishes the key with Catalog COMMIT. The committed key belongs to the memory node and can outlive the storing GPU worker or its GPU StorageService.
 
-For a remote read, the worker performs LOOKUP_AND_PIN and validates the pool registration and generation. It issues RDMA READ directly into its staging, then copies the bytes to the GPU. The source pin protects the memory-node page during the READ; staging stays owned until the GPU copy finishes. Reads already in progress for the same location can be joined within one worker. Different workers use separate staging and READs. Read bytes are never published or retained as cached copies.
+```mermaid
+sequenceDiagram
+    participant W as worker
+    participant S as maru-storage
+    participant M as maru-storage --role memory
+    participant C as MaruServer
+    W->>S: CREDIT
+    S->>M: RESERVE (instance write domain)
+    W->>W: GPU copy into own staging
+    W->>M: RDMA WRITE
+    W->>S: WRITE_DONE
+    S->>M: WRITE_DONE
+    M->>C: COMMIT (key becomes visible)
+    Note over M: worker exit, unknown write or lost link:<br/>revoke the domain registration, then reclaim
+```
+
+The GPU service reports its connected memory node’s ID and epoch to MaruServer on each heartbeat, starting before workers attach. For both PROBE and LOOKUP_AND_PIN, a remote HIT requires a committed copy in an active pool of that memory-node run and live sessions on both nodes. If a key has several copies, MaruServer selects a readable location from the Catalog.
+
+For a remote read, the worker performs LOOKUP_AND_PIN and validates the pool registration and generation. It issues RDMA READ directly into its staging, then copies the bytes to the GPU. Reads already in progress for the same location can be joined within one worker. Different workers use separate staging and READs. Read bytes are never published or retained as cached copies.
+
+```mermaid
+sequenceDiagram
+    participant W as worker
+    participant C as MaruServer
+    participant M as maru-storage --role memory
+    W->>C: LOOKUP_AND_PIN
+    C-->>W: location, pin
+    W->>M: RDMA READ into own staging
+    W->>C: UNPIN (the bytes are in staging)
+    W->>W: GPU copy, then return the staging slot
+```
 
 Unavailable keys, stale locations and lack of a staging slot produce a MISS and recomputation. The read path does not wait for capacity or retry a failed read. Synchronous loads use the same direct reader on the engine thread. Deferred loads use the loader thread.
 
+(node-capacity-lifetimes)=
+
 ## Capacity and lifetimes
 
-| Store | Owner | When full |
+| Store | Owner | Under capacity pressure |
 |---|---|---|
 | GPU `dram` | GPU node | Skip new stores; keep existing keys |
 | GPU `local_cxl` | GPU node | Skip new stores; keep existing keys |
-| GPU `remote` | Memory node | Memory node evicts its least recently used unpinned keys |
-| Memory-node `dram` or `local_cxl` | Memory node | Shared LRU, using the high and low watermarks |
+| GPU `remote` | Memory node | Shared memory-node LRU |
+| Memory-node `dram` or `local_cxl` | Memory node | Shared memory-node LRU |
 
-Memory-node eviction covers all writers using that memory node, rather than a per-engine partition. It also frees space below the high watermark when FREE bytes cannot cover the transfer reserve plus one credit page. Pinned keys remain protected. Each GPU service connects to one memory-node endpoint. There is one Catalog per deployment; a list of Catalogs or memory endpoints is not accepted.
+The memory node evicts eligible keys in LRU order across all writers. Pins and MaruServer's preserve policy protect keys. The high and low watermarks govern eviction. The memory node can also evict below the high watermark to make space for the transfer reserve and one credit page.
 
-| Protection | Ends only when |
+A timed-out remote read immediately misses. A running worker continues tracking its transfer. A worker stopped by a CUDA error returns no resources.
+
+| Resource | Release or reuse condition |
 |---|---|
-| Write credit | Its write is committed, safely cancelled or fenced |
-| Catalog source pin | The READ completes or the unused result is discarded safely |
-| Worker READ destination slot | READ is confirmed and all GPU consumers release it; an unconfirmed READ keeps it until process exit |
-| Worker WRITE source slot | D2H finishes before WRITE; the WRITE result releases the slot, including UNKNOWN, unless the worker stopped |
-| Orphan source pin after a GPU-service run change | The old worker releases it or its exit is verified |
-| CXL region hold | Its mapping or NIC registration is safely removed |
+| Worker WRITE source slot | After D2H finishes, the worker releases the slot once it knows the WRITE was never posted or the transfer handle has finished, including a finished failure. An unfinished handle keeps its slot even after `UNKNOWN`. |
+| Memory-node write credit | A completed write passes to its COMMIT ticket. Unused credit can be safely cancelled. `UNKNOWN` retires the write domain. Its unconfirmed pages stay quarantined until registration revocation succeeds or a memory-node restart is verified. |
+| Catalog pin on the remote READ source | The worker unpins if no READ was posted or once it confirms a successful READ, including a late success after a MISS. A posted READ whose success remains unconfirmed keeps the pin. |
+| Worker READ destination slot | A posted READ must succeed, all waiters must have taken or discarded their results, and all GPU consumers must finish. A late success permits release. If success remains unconfirmed, the slot stays held until process exit. |
+| Orphan source pin after a GPU-service run change | The old worker releases it or its exit is verified. |
+| CXL region hold | Its mapping or NIC registration is safely removed. |
 
-The memory node maintains a separate write domain for each vLLM instance within a GPU-node run. Only ranks of that instance attached to the same GPU-node run share the domain; another GPU node or run has a separate domain. A worker exit, stopped worker, uncertain write, lost control connection or a GPU-node run that sends no control request for `reserve_ttl_s` triggers revocation of that domain's write registration before unconfirmed pages are reclaimed. Fencing affects only the specified domain. Workers share the memory node's read registration, which is independent of write-domain revocation.
+Each vLLM instance has a separate write domain within a GPU-node run. Ranks of that instance share the domain on that node. Each domain has its own write agent and registration. All workers share a separate read registration.
 
-Time alone is not a fence. If revocation fails, unconfirmed pages remain quarantined; at the configured limit that GPU node receives no new credit. A confirmed revocation or a verified memory-node restart can recover those pages. An uncertain or failed READ keeps its destination slot out of reuse until the worker process exits. A WRITE starts after D2H completes and releases its source slot when it returns DONE, UNKNOWN or NOT_POSTED. An unfinished WRITE retains its pending transfer object; UNKNOWN retires the write domain. The memory-node destination credit remains protected by domain fencing. A stopped worker returns no slots. Failed service teardown retains mappings and prevents another run in that process.
+A worker exit, stopped worker, uncertain write, lost control connection or `reserve_ttl_s` without a control request triggers revocation. FENCE_DOMAIN revokes only the affected domain. Pages awaiting COMMIT stay with their tickets. A successful WRITE_DONE response follows the Catalog COMMIT result.
 
-A GPU-service run change closes the worker's read admission gate before new READs can use old locations. Source pins held by live old workers survive that run change. A CUDA error that leaves a copy unconfirmed stops the worker, which returns no resources; restart the complete vLLM instance and verify that its old worker processes have exited.
+Time alone is not a fence. At `peer_quarantine_max` the memory node stops granting credit to that GPU node. The limit counts quarantined pages across all its runs. Failed service teardown retains mappings and prevents another run in that process.
 
-A remote worker's connection to its GPU service lasts one incarnation. If the connection ends while the service run continues, the service fences the write domains issued to that incarnation and refuses it afterwards; the worker stops remote loads and stores until its process restarts, keeping in-flight READs, slots and source pins until they finish. After a GPU-service restart the worker attaches to the new run and recovers. A clean close deregisters, unregisters and unmaps the staging buffer before DETACH, and the service then frees that buffer's staging admission; an uncertain teardown keeps the admission until the process exits. DRAM and `local_cxl` workers attach again to the same run and keep their credit.
+A memory node accepts up to 64 worker NIXL agents per GPU node, with at most 1 MiB of metadata each, and up to 64 outstanding write registrations per GPU node, including registrations whose revocation failed.
+
+When the GPU StorageService starts a new run, each worker closes admission to old READ locations before issuing new READs. After a persistent transfer failure or a CUDA error that stops a worker, restart the affected vLLM instance and verify that its old workers have exited.
+
+A remote worker attaches once per GPU service run. If its connection ends during that run, the service fences its write domains and refuses further attachment by that worker. Remote loads and stores stop until the worker process restarts or the service starts a new run. A clean close unregisters and unmaps staging before DETACH, which releases its staging admission. An uncertain teardown keeps that admission until process exit. DRAM and `local_cxl` workers can reattach to the same run and keep their credit.
 
 ## Restarts and memory generations
 
-Catalog metadata is volatile. A `maru-node-server` restart invalidates all keys; services and workers establish new sessions and recompute misses. A DRAM pool ends with its service run. A `local_cxl` store can adopt regions and registered keys from an earlier run when the Catalog, boot and memory generation still match and earlier holds permit access. This is cache reuse, not persistent storage.
+A MaruServer restart loses the Catalog. Services and workers need new sessions, and engines recompute misses. A DRAM pool ends with its service run. A `local_cxl` store can adopt regions and registered keys from an earlier run when the MaruServer epoch, boot ID and memory generation still match and earlier holds permit access. This is cache reuse, not persistent storage.
 
-A memory-node extension can report `memory_generation()`. A changed generation, or an unknown generation beyond the grace period, revokes registrations and ends the run, invalidating old locations. An unknown generation at startup prevents service. See {doc}`read_hints` for the extension contract and {doc}`memory_node` for recovery.
+A memory-node extension can report `memory_generation()`. A changed generation, or an unknown generation beyond the grace period, revokes registrations and ends the run, invalidating old locations. An unknown generation at startup prevents service. HELLO advertises the extension's supported actions, and unsupported actions are rejected. See {doc}`read_hints` for the extension contract.
 
 ## Configuration
 
-`maru-storage --config gpu.json --check` and `maru-memory-node --config memory.json --check` validate JSON and print resolved defaults without starting pools or RDMA. Start each service with the same command without `--check`. The command selects its role; JSON has no `role` field. Unknown and duplicate keys are rejected.
+`maru-storage --role gpu --config gpu.json --check` and `maru-storage --role memory --config memory.json --check` validate JSON and print resolved defaults without starting pools, RDMA or a NIXL agent. Start each service with the same command without `--check`. Select the service role with `--role` (default `gpu`). JSON has no `role` field. Unknown and duplicate keys are rejected.
 
 Common keys:
 
 | Key | Default | Rule |
 |---|---|---|
 | `node_id` | Required | Unique stable node name; starts with a letter or digit, followed by letters, digits, `.`, `_` or `-` |
-| `server` | Required | One `maru-node-server` URL |
+| `server` | Required | One MaruServer URL per deployment. `--check` verifies only that the string is nonempty. |
 | `page_size` | Required | Positive byte size; must hold the largest stored object |
 | `state_dir` | `/run/maru` | Writable service state and ownership-lock directory |
 | `tiers` | Required | Exactly one store |
@@ -93,7 +137,7 @@ GPU-only keys are `socket` (default `/run/maru/node.sock`), `socket_group` (defa
 |---|---|---|
 | `dram.size` | Required | At least one page; capacity uses whole pages |
 | `dram.hugepage` | `true` | Huge pages must be available; `false` uses ordinary pages |
-| `local_cxl.size` | Required to serve | At least `region_size` |
+| `local_cxl.size` | Required to serve | Target capacity, at least `region_size`. Usable capacity depends on the whole regions the Resource Manager grants. |
 | `local_cxl.region_size` | `1GiB` | A multiple of `page_size`, at least one page |
 | `local_cxl.rm` | `127.0.0.1:9850` | Resource Manager address |
 | `local_cxl.visibility` | `coherent` | `coherent` or `flush` |
@@ -103,7 +147,7 @@ GPU-only keys are `socket` (default `/run/maru/node.sock`), `socket_group` (defa
 
 | Key | Default | Rule |
 |---|---|---|
-| `url` | Required | One `host:port`, optionally prefixed with `tcp://`; port 1–65535 |
+| `url` | Required | One memory endpoint per GPU StorageService, `host:port`, optionally prefixed with `tcp://`; port 1–65535 |
 | `key_file` | Required | Shared deployment key readable by the service |
 | `rdma_device` | Empty | UCX chooses the NIC unless a device is specified |
 | `timeout_s` | `30` | Positive transfer/control timeout in seconds |
@@ -159,7 +203,7 @@ Validation requires `credit_refill_low <= credit_refill_high <= credit_max_bytes
 }
 ```
 
-### GPU remote and memory-node local CXL
+### GPU remote and memory node
 
 GPU configuration for four writers, each with 2 GiB of staging and up to 512 MiB of credit:
 
@@ -185,4 +229,22 @@ Memory-node configuration:
 }
 ```
 
-Use matching page sizes and the same software release for the Catalog, services and workers. Use a shared key on GPU services and memory nodes; the Catalog does not need that key. Remote processes default to `UCX_TLS=rc,dc,cuda_copy` and `UCX_RCACHE_ENABLE=n`; explicit settings must preserve checked RC/DC transports and disable registration caching. See {doc}`../getting_started/installation` and {doc}`../getting_started/migrating_to_maru_node`.
+Memory-node DRAM configuration:
+
+```json
+{
+  "node_id": "memory-1",
+  "state_dir": "/run/maru-memory-1",
+  "server": "tcp://192.0.2.1:5556",
+  "page_size": "32MiB",
+  "tiers": [{"store": "dram", "size": "16GiB", "hugepage": true}],
+  "remote_server": {
+    "listen": "192.0.2.10:9871",
+    "key_file": "/etc/maru/maru.key",
+    "reserve_ttl_s": 60,
+    "peer_quarantine_max": "1GiB"
+  }
+}
+```
+
+Use matching page sizes for the stores and workers. Run the same software release on MaruServer, services and workers. The memory-node endpoint checks the wire version and required capabilities. Use a shared key on GPU services and memory nodes; MaruServer does not need that key. Remote processes default to `UCX_TLS=rc,dc,cuda_copy` and `UCX_RCACHE_ENABLE=n`; explicit settings must preserve checked RC/DC transports and disable registration caching. See {doc}`../getting_started/installation` and {ref}`deployment key setup <quickstart-deployment-key>`.

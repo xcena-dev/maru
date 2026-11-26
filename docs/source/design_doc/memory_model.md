@@ -2,14 +2,14 @@
 
 ## Backend and buffer ownership
 
-The storage backend determines which process maps or owns the bytes. The GPU's execution KV cache is separate from all storage pools below.
+The directly mapped `cxl` backend and the node backend (selected by `maru_node`) differ in which process owns the pool and which workers can map it. The GPU's execution KV cache is separate from all storage pools below.
 
 | Backend | Storage bytes | Worker-facing read result | Sharing scope |
 |---|---|---|---|
-| `cxl` | CXL mapped on the worker | `MemoryInfo` over the mapping | Legacy CXL registry; workers can map the same pool |
-| `maru_node`, `dram` | Node-owned DRAM | A pinned read result over the local mapping | Compatible workers on that node |
-| `maru_node`, `local_cxl` | Node-owned CXL regions | A pinned read result over the local mapping | Compatible workers that can map the pool |
-| `maru_node`, `remote` | Memory-node DRAM or CXL | Worker-owned staging filled by direct RDMA READ | Compatible workers using the same memory node and Catalog |
+| `cxl` | CXL mapped on the worker | `MemoryInfo` over the mapping | Workers that map the same pool and use the registry on MaruServer (`maru-server --backend cxl`) |
+| node, `dram` | Node-owned DRAM | A pinned read result over the local mapping | Compatible workers on that node |
+| node, `local_cxl` | Node-owned CXL regions | A pinned read result over the local mapping | Compatible workers that can map the pool |
+| node, `remote` | Memory-node DRAM or CXL | Worker-owned staging filled by direct RDMA READ | Compatible workers using the same memory node and MaruServer (`maru-server --backend node`) |
 
 Remote staging must outlive NIC access and every GPU copy. It is not a cache. See {doc}`node_storage_service` for source pins, write domains and orphan-worker protection. The numbered sections below describe `cxl`.
 
@@ -56,7 +56,7 @@ graph TB
 
 ## 2. Region Lifecycle
 
-The diagram illustrates legacy `cxl` mapping and ownership states. MaruServer tracks owner connection and registered-key references, not every live mapped view or GPU copy. `SharedRead` below describes a client mapping, not a server read lease.
+The diagram illustrates directly mapped `cxl` mapping and ownership states. MaruServer tracks owner connection and registered-key references, not every live mapped view or GPU copy. `SharedRead` below describes a client mapping, not a server read lease.
 
 ```mermaid
 stateDiagram-v2
@@ -88,7 +88,7 @@ stateDiagram-v2
 
 **Deferred** — The owner has disconnected but registered keys still reference the region. This preserves those registered objects; a `MemoryInfo` view does not itself increment that count or pin a key. Callers must keep the key/region valid through outstanding reads and GPU copies.
 
-**Freed** — In legacy `cxl`, the owner has disconnected and the KV reference count is zero, so the region can be returned to the Resource Manager.
+**Freed** — On the `cxl` backend, the owner has disconnected and the KV reference count is zero, so the region can be returned to the Resource Manager.
 
 ### Node-store protections
 

@@ -4,7 +4,7 @@ This example demonstrates how to share KV cache across multiple vLLM instances u
 
 ## Overview
 
-When multiple vLLM instances serve the same or similar prompts, they can reuse cached prefix KV. This example uses the directly mapped `cxl` backend: Instance 2 loads the KV that Instance 1 stored in shared CXL memory. GPU loads still copy bytes. For workers without CXL, the native vLLM node path provides DRAM or direct RDMA storage. This LMCache configuration uses `cxl`.
+When multiple vLLM instances serve the same or similar prompts, they can reuse cached prefix KV. This example uses the directly mapped `cxl` backend: Instance 2 loads the KV that Instance 1 stored in shared CXL memory. GPU loads still copy bytes. For workers without CXL, the native vLLM node backend (selected by `maru_node`) provides DRAM or direct RDMA storage. This LMCache configuration uses `cxl`.
 
 ## Prerequisites
 
@@ -47,7 +47,7 @@ source .venv/bin/activate
 
 ### 1. Launch two vLLM instances
 
-The launcher script starts MaruServer and both vLLM instances automatically:
+The launcher script starts MaruServer (`maru-server --backend cxl`) and both vLLM instances automatically:
 
 ```bash
 cd examples/lmcache/p2p_sharing

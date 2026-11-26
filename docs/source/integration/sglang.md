@@ -10,7 +10,7 @@ Maru integrates with SGLang's **Hierarchical Cache (HiCache)** as an L3 storage 
 | L2 | Host DRAM | SGLang |
 | **L3** | **CXL Shared Memory** | **Maru** |
 
-When GPU memory pressure triggers eviction, KV pages flow down: L1 → L2 → L3. On cache hit, pages flow back up. In this guide the Maru adapter uses the directly mapped `cxl` backend, so SGLang instances on the same node can reuse the shared L3 without a P2P network payload transfer. Cache hits still copy bytes from CXL to host DRAM and then to GPU memory. This configuration does not select `maru_node`; see the {doc}`vLLM guide <vllm>` for node stores and their remote path.
+When GPU memory pressure triggers eviction, KV pages flow down: L1 → L2 → L3. On cache hit, pages flow back up. In this guide the Maru adapter uses the directly mapped `cxl` backend, so SGLang instances on the same node can reuse the shared L3 without a P2P network payload transfer. Cache hits still copy bytes from CXL to host DRAM and then to GPU memory. See the {doc}`vLLM guide <vllm>` for the node backend (selected by `maru_node`) and its remote stores.
 
 ## Prerequisites
 
@@ -63,7 +63,7 @@ sglang serve \
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | `interface_v1` | `0` | Set to `1` to enable V1 API (required for `page_first_direct`) |
-| `maru_server_url` | `tcp://localhost:5555` | MaruServer address |
+| `maru_server_url` | `tcp://localhost:5555` | Address of MaruServer (`maru-server --backend cxl`) |
 | `maru_pool_size` | `4G` | CXL shared memory pool size (`"4G"`, `"500M"`, etc.) |
 | `maru_chunk_size_bytes` | `1M` | Chunk size for memory allocation |
 | `maru_instance_id` | auto UUID | Unique client instance identifier |

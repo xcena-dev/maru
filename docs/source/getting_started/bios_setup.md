@@ -13,7 +13,7 @@ Option names and menu locations vary by server vendor and BIOS version. If neith
 
 Apply the setting on every participating host, save the configuration, and reboot.
 
-Apply cross-host visibility settings wherever several hosts directly access the same physical CXL memory. Each memory node owns its regions; the remote node path does not map one region through multiple memory nodes.
+Apply cross-host visibility settings wherever several hosts directly access the same physical CXL memory. Each memory node owns its regions; the remote store does not map one region through multiple memory nodes.
 
 ## AMD (Turin)
 

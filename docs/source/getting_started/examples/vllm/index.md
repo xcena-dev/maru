@@ -16,7 +16,7 @@ These prerequisites describe the default `cxl` single-instance/P2P launchers. No
 - 1 GPU for the single-instance example, 2+ for P2P
 - Maru installed with its KV placement kernels: `./install.sh` from the Maru source tree, or `uv pip install -e /path/to/maru --no-build-isolation` in an environment that already has PyTorch and the CUDA toolkit. The connector carries its own CUDA kernels for the coalesced multi-layer transfers and falls back to a transfer per layer without them, which is materially slower. `python -c "import maru_kv_ops; print(maru_kv_ops.is_available())"` checks importability only. The engine's layout and transfer logs determine the actual path. Logical pages can use the stride-based placement bindings; unsupported layouts or unavailable bindings use per-layer copies.
 - vLLM v0.14+ installed
-- `maru-server` binary available
+- MaruServer (`maru-server --backend cxl`) available on the command line
 
 ## Single-instance verification
 
@@ -43,14 +43,14 @@ cd examples/vllm/single
 ./single_example.sh --model meta-llama/Llama-3-8B
 ```
 
-The script starts `maru-server` and one vLLM instance, then sends the same prompt twice. Check the hit and the worker's completed restore, and compare generated output with recompute. TTFT alone does not prove a correct restore. The script exits non-zero on a cache miss; check `single.log` for errors (a missing `Maru: loaded N layers` message means the worker load path failed).
+The script starts MaruServer and one vLLM instance, then sends the same prompt twice. Check the hit and the worker's completed restore, and compare generated output with recompute. TTFT alone does not prove a correct restore. The script exits non-zero on a cache miss; check `single.log` for errors (a missing `Maru: loaded N layers` message means the worker load path failed).
 
 ### Step-by-step
 
 ```bash
 cd examples/vllm/single
 
-# 1. Start maru-server
+# 1. Start MaruServer
 source env.sh
 maru-server --port $MARU_SERVER_PORT
 
@@ -99,14 +99,14 @@ cd examples/vllm/p2p_sharing
 ./p2p_example.sh meta-llama/Llama-3-8B
 ```
 
-The script starts `maru-server`, launches both instances, runs the sharing test, and cleans up every process it started.
+The script starts MaruServer, launches both instances, runs the sharing test, and cleans up every process it started.
 
 ### Step-by-step
 
 ```bash
 cd examples/vllm/p2p_sharing
 
-# 1. Start maru-server
+# 1. Start MaruServer
 source env.sh
 maru-server --port $MARU_SERVER_PORT
 
@@ -138,7 +138,7 @@ The two examples use different instance ports, so they do not collide when run o
 
 ### Troubleshooting
 
-**Instance 2 TTFT is not faster.** Check the Instance 2 log for `Maru: loaded N layers`. If it is absent, confirm `maru-server` is running and that both instances connect to it. For very small models with short prompts the CXL retrieve overhead can exceed the prefill it saves.
+**Instance 2 TTFT is not faster.** Check the Instance 2 log for `Maru: loaded N layers`. If it is absent, confirm MaruServer is running and that both instances connect to it. For very small models with short prompts the CXL retrieve overhead can exceed the prefill it saves.
 
 **Garbage output on Instance 2.** KV cache corruption — confirm the load is using per-chunk injection rather than a concatenated 1D load.
 

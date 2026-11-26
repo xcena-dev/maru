@@ -5,7 +5,7 @@ The `MaruHandler` is the client-side library that applications (e.g., LMCache/vL
 1. **KV cache client** — provides `store`/`retrieve`/`exists`/`delete` APIs.
 2. **Memory manager** — owns CXL memory regions, manages paged allocation within them, and auto-expands when space runs out.
 
-With `cxl`, the Handler owns and maps CXL regions. With `MaruConfig(maru_node=...)`, it delegates pool ownership to the node service and uses the Catalog for keys and source pins. Remote workers move bytes directly through registered staging. Sections below describe the `cxl` mapping path; see {doc}`node_storage_service` for node stores and buffer lifetimes.
+With `cxl`, the Handler owns and maps CXL regions allocated through MaruServer (`maru-server --backend cxl`). On the node backend (selected by `maru_node`), it attaches to the GPU StorageService (`maru-storage --role gpu`) and contacts MaruServer (`maru-server --backend node`) to look up and pin keys in the Catalog. Remote workers move bytes directly through registered staging. Sections below describe the `cxl` mapping path; see {doc}`node_storage_service` for node stores and buffer lifetimes.
 
 ## 1. Component Hierarchy
 

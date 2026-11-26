@@ -4,6 +4,8 @@ Hints tell an installed extension which ranges a request may read or write. They
 
 ## Delivery
 
+On the node backend (selected by `maru_node`), MaruServer (`maru-server --backend node`) looks up key locations in the Catalog. The GPU StorageService (`maru-storage --role gpu`) forwards remote hints to the memory StorageService (`maru-storage --role memory`).
+
 ```mermaid
 flowchart LR
     S["vLLM scheduler"] --> Q["hint queue"]
@@ -15,7 +17,7 @@ flowchart LR
     W ==>|"mapped copy or direct RDMA"| K[("KV storage")]
 ```
 
-On `cxl`, `MaruHandler` calls plugins implementing `on_memory_hint` and advertising the corresponding `hint_actions`. On remote `maru_node`, the scheduler locates keys through the Catalog and sends ranges to its GPU service. The GPU service forwards supported actions to the memory node, which checks pool identity, registration, generation and page bounds before calling the extension. Workers announce the start of hinted loads through the same service path.
+On `cxl`, `MaruHandler` calls plugins implementing `on_memory_hint` and advertising the corresponding `hint_actions`. The memory StorageService checks pool identity, registration, generation and page bounds before calling the extension. Workers announce the start of hinted loads through the same service path.
 
 | Action | Meaning | Payload |
 |---|---|---|

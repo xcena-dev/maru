@@ -5,7 +5,7 @@ The scripts live in `examples/dynamo/single_node/`.
 
 ## Prerequisites
 
-- A local CXL DEV_DAX pool and a running `maru-resource-manager` (see {ref}`single-host quick start <quickstart-single-host>`). The example starts its own MaruServer, so you do not need to start one.
+- A local CXL DEV_DAX pool and a running `maru-resource-manager` (see {ref}`single-host quick start <quickstart-single-host>`). The example starts its own MaruServer (`maru-server --backend cxl`), so you do not need to start one.
 - Two GPUs by default, or enough memory on one GPU for two small-model workers.
 - Maru installed with its KV placement kernels (see {doc}`../../installation`).
 - Dynamo's vLLM backend installed in the **same Python environment** as Maru

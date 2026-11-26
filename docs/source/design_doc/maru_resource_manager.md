@@ -54,7 +54,7 @@ flowchart TB
 
 ## 2. IPC Protocol
 
-> **Note:** This section describes the Resource Manager's binary IPC protocol (TCP, port 9850). The Metadata Server (`maru-server`) uses a separate RPC protocol over ZMQ (port 5555) — see the MaruServer documentation for details.
+> **Note:** This section describes the Resource Manager's binary IPC protocol (TCP, port 9850). MaruServer (`maru-server --backend cxl`) uses a separate RPC protocol over ZMQ (port 5555) — see the MaruServer documentation for details.
 
 All messages use a fixed-size binary header (12 bytes) containing protocol magic, version (v2), message type, and payload length, followed by a type-specific payload. Communication is over TCP.
 
