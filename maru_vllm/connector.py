@@ -728,6 +728,26 @@ def _remote_cxl_async(extra: dict[str, Any]) -> bool:
     )
 
 
+def _storage_schema(schema: dict[str, Any]) -> str:
+    """The schema a storage session names its objects' format by.
+
+    MaruServer only compares schemas: a session reads the regions of its
+    namespace when it names the same one. The schema goes as its format and
+    the SHA-256 hash of its JSON, as the cache namespace does: the JSON lists
+    every layer, which is longer than the 4096 characters MaruServer takes for
+    a model with several KV cache groups and many layers (Qwen3.8-27B's 64
+    layer names).
+
+    Args:
+        schema: The objects' format, with a ``"format"`` entry.
+
+    Returns:
+        ``"<format>:sha256:<hash>"``.
+    """
+    schema_hash = hashlib.sha256(json.dumps(schema, sort_keys=True).encode())
+    return f"{schema['format']}:sha256:{schema_hash.hexdigest()}"
+
+
 def _session_pool_key(extra: dict[str, Any]) -> str:
     """The extra_config key that sizes a storage-session backend's space.
 
@@ -4183,7 +4203,7 @@ class MaruWorkerConnector:
             }
             self._extra_config = {
                 **self._extra_config,
-                "_maru_storage_schema": json.dumps(schema, sort_keys=True),
+                "_maru_storage_schema": _storage_schema(schema),
             }
         # Derive the CXL page size from the model's KV geometry so each
         # (chunk x layer) object fills exactly one page (no page-rounding waste).
@@ -4274,7 +4294,7 @@ class MaruWorkerConnector:
             }
             self._extra_config = {
                 **self._extra_config,
-                "_maru_storage_schema": json.dumps(schema, sort_keys=True),
+                "_maru_storage_schema": _storage_schema(schema),
             }
         self._group_kernels = {}
         for cache in self._group_caches:

@@ -1,15 +1,19 @@
 # SPDX-License-Identifier: Apache-2.0
 """Remote CXL storage opt-in at the vLLM connector boundary."""
 
+import json
+
 import pytest
 
 pytest.importorskip("torch")
 pytest.importorskip("vllm")
 
 import maru
+from maru_server.replica_directory import ReplicaDirectory
 from maru_vllm.connector import (
     _create_maru_handler,
     _rdma_staging_size,
+    _storage_schema,
     _validate_storage_config,
 )
 
@@ -316,3 +320,49 @@ def test_read_hint_settings_need_the_remote_cxl_backend():
 
     with pytest.raises(ValueError, match="remote_cxl"):
         _validate_storage_config({**cpu_extra(), "maru_read_hints": True})
+
+
+def _groups_schema(layers, chunk_tokens=784):
+    """A KV_GROUPS-v1 schema as the connector builds it for a Qwen3.8-style
+    model: one attention group, and the Gated DeltaNet layers in groups of
+    the same size."""
+    attn = [i for i in range(layers) if i % 4 == 3]
+    gdn = [i for i in range(layers) if i % 4 != 3]
+    prefix = "language_model.model.layers"
+    groups = [
+        {"kind": "full", "layer_names": [f"{prefix}.{i}.self_attn.attn" for i in attn]}
+    ]
+    for start in range(0, len(gdn), len(attn)):
+        names = [f"{prefix}.{i}.linear_attn" for i in gdn[start : start + len(attn)]]
+        groups.append({"kind": "mamba", "layer_names": names})
+    for group_id, group in enumerate(groups):
+        group |= {
+            "group_id": group_id,
+            "spec_name": "FullAttentionSpec"
+            if group["kind"] == "full"
+            else "MambaSpec",
+            "block_size": chunk_tokens,
+            "slot_bytes": 102760448,
+            "group_page_bytes": 0,
+            "sliding_window": None,
+            "mamba_cache_mode": None if group["kind"] == "full" else "align",
+            "state_bytes": 0 if group["kind"] == "full" else 101449728,
+            "kv_shape": [4, 256, 256] if group["kind"] == "full" else None,
+            "replay_tokens": 0,
+            "member_specs": [],
+        }
+    return {"format": "KV_GROUPS-v1", "chunk_tokens": chunk_tokens, "groups": groups}
+
+
+def test_a_schema_goes_as_its_format_and_hash():
+    """Qwen3.8-27B's 64 layer names make its schema JSON longer than the 4096
+    characters MaruServer takes; its hash passes, and still tells apart
+    engines that store other objects."""
+    schema = _groups_schema(64)
+    assert len(json.dumps(schema, sort_keys=True)) > 4096
+    sent = _storage_schema(schema)
+    assert ReplicaDirectory._text(sent, "schema") == sent
+    assert sent.startswith("KV_GROUPS-v1:sha256:")
+    assert _storage_schema(_groups_schema(64)) == sent
+    assert _storage_schema(_groups_schema(64, chunk_tokens=800)) != sent
+    assert _storage_schema(_groups_schema(40)) != sent

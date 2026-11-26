@@ -10,7 +10,6 @@ same at the MaruHandler boundary.
 CPU tensors only: loads and stores take their per-layer paths.
 """
 
-import json
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -591,11 +590,19 @@ def test_group_objects_are_written_on_the_write_behind_thread():
 
 
 def test_group_registration_names_its_objects_and_sizes_staging(monkeypatch):
+    schemas = []
+    storage_schema = connector_module._storage_schema
+    monkeypatch.setattr(
+        connector_module,
+        "_storage_schema",
+        lambda schema: schemas.append(schema) or storage_schema(schema),
+    )
     worker, _ = _storing_worker(
         tiny_kv_caches("0.30", _shared()),
         extra=remote_cxl_extra(_maru_max_model_len=1000),
     )
-    schema = json.loads(worker._extra_config["_maru_storage_schema"])
+    (schema,) = schemas
+    assert worker._extra_config["_maru_storage_schema"] == storage_schema(schema)
     assert schema["format"] == "KV_GROUPS-v1"
     assert [g["kind"] for g in schema["groups"]] == ["mamba"] * 3 + ["full"]
 
