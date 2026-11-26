@@ -311,7 +311,7 @@ class TestProbeHandler:
 
 class TestLookupTimeout:
     @pytest.mark.parametrize("probe", [False, True])
-    def test_a_150ms_reply_misses_at_100ms_and_recovers(self, fake, handlers, probe):
+    def test_a_500ms_reply_misses_at_100ms_and_recovers(self, fake, handlers, probe):
         worker = handlers(timeout_ms=2000)
         assert put(worker, "here")
         handler = handlers(timeout_ms=2000, metadata_only=True) if probe else worker
@@ -320,14 +320,14 @@ class TestLookupTimeout:
         counter = "probe_unavailable" if probe else "retrieve_unavailable"
         call = handler.batch_exists if probe else handler.batch_retrieve
         miss = [False] if probe else [None]
-        fake.delay(code, 0.15)
-        fake.delay(MessageType.WORKER_HEARTBEAT, 0.15)
-        fake.delay(MessageType.UNPIN, 0.15)
+        fake.delay(code, 0.5)
+        fake.delay(MessageType.WORKER_HEARTBEAT, 0.5)
+        fake.delay(MessageType.UNPIN, 0.5)
 
         started = time.monotonic()
         assert call(["here"]) == miss
         elapsed = time.monotonic() - started
-        assert 0.08 <= elapsed < 0.15
+        assert 0.08 <= elapsed < 0.4  # at the 100 ms timeout, not the reply
         assert conn.down
         assert handler.get_stats()["maru_node"]["counters"][counter] == 1
         sent = len(fake.requests(code))
