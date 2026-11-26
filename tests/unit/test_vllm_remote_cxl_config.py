@@ -11,7 +11,6 @@ pytest.importorskip("vllm")
 import maru
 from maru_server.replica_directory import ReplicaDirectory
 from maru_vllm.connector import (
-    _MAX_STORAGE_SCHEMA_CHARS,
     _create_maru_handler,
     _rdma_staging_size,
     _storage_schema,
@@ -355,20 +354,15 @@ def _groups_schema(layers, chunk_tokens=784):
     return {"format": "KV_GROUPS-v1", "chunk_tokens": chunk_tokens, "groups": groups}
 
 
-def test_a_schema_that_fits_goes_as_its_json():
-    """Engines of an earlier version named it so: the regions MaruServer kept
-    for them stay readable."""
-    schema = _groups_schema(40)  # Qwen3.6-35B-A3B
-    assert json.loads(_storage_schema(schema)) == schema
-
-
-def test_a_schema_maru_server_would_refuse_goes_as_its_digest():
-    """Qwen3.8-27B's 64 layer names make its schema longer than MaruServer
-    takes; its digest still tells apart engines that store other objects."""
+def test_a_schema_goes_as_its_format_and_digest():
+    """Qwen3.8-27B's 64 layer names make its schema JSON longer than the 4096
+    characters MaruServer takes; its digest passes, and still tells apart
+    engines that store other objects."""
     schema = _groups_schema(64)
-    assert len(json.dumps(schema, sort_keys=True)) > _MAX_STORAGE_SCHEMA_CHARS
+    assert len(json.dumps(schema, sort_keys=True)) > 4096
     sent = _storage_schema(schema)
     assert ReplicaDirectory._text(sent, "schema") == sent
     assert sent.startswith("KV_GROUPS-v1:sha256:")
     assert _storage_schema(_groups_schema(64)) == sent
     assert _storage_schema(_groups_schema(64, chunk_tokens=800)) != sent
+    assert _storage_schema(_groups_schema(40)) != sent

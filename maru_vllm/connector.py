@@ -728,32 +728,23 @@ def _remote_cxl_async(extra: dict[str, Any]) -> bool:
     )
 
 
-# MaruServer refuses a storage session whose schema is longer
-# (maru_server.replica_directory.ReplicaDirectory._text).
-_MAX_STORAGE_SCHEMA_CHARS = 4096
-
-
 def _storage_schema(schema: dict[str, Any]) -> str:
     """The schema a storage session names its objects' format by.
 
     MaruServer only compares schemas: a session reads the regions of its
-    namespace when it names the same one. The JSON goes as it is unless it is
-    longer than MaruServer takes, as it is for a model with several KV cache
-    groups and many layers (Qwen3.8-27B's 64 layer names). It then goes as its
-    format and the SHA-256 digest of the JSON, which engines with the same
-    objects still share. A schema that fits keeps its JSON, so regions that
-    MaruServer kept for engines of an earlier version stay readable.
+    namespace when it names the same one. The schema goes as its format and
+    the SHA-256 digest of its JSON, as the cache namespace does: the JSON lists
+    every layer, which is longer than the 4096 characters MaruServer takes for
+    a model with several KV cache groups and many layers (Qwen3.8-27B's 64
+    layer names).
 
     Args:
         schema: The objects' format, with a ``"format"`` entry.
 
     Returns:
-        The schema to send, at most ``_MAX_STORAGE_SCHEMA_CHARS`` characters.
+        ``"<format>:sha256:<digest>"``.
     """
-    text = json.dumps(schema, sort_keys=True)
-    if len(text) <= _MAX_STORAGE_SCHEMA_CHARS:
-        return text
-    digest = hashlib.sha256(text.encode()).hexdigest()
+    digest = hashlib.sha256(json.dumps(schema, sort_keys=True).encode()).hexdigest()
     return f"{schema['format']}:sha256:{digest}"
 
 
