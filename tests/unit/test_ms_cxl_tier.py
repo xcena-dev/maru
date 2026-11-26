@@ -532,7 +532,7 @@ def test_leave_gives_back_every_region_and_holds_keep_mapped_ones(fake, sockdir)
     from tests.unit.ms_node_helpers import RawWorker
 
     rm = FakeRm()
-    node = cxl_node(fake, sockdir, rm, unmap_timeout_s=0.3)
+    node = cxl_node(fake, sockdir, rm, unmap_timeout_s=1.5)
     worker = RawWorker(f"{sockdir}/node.sock")
     worker.attach()
     first, second = node.tier("local_cxl").pools
@@ -555,9 +555,10 @@ def test_leave_gives_back_every_region_and_holds_keep_mapped_ones(fake, sockdir)
     assert worker.incarnation in rm.holds[second.region.handle.region_id]
 
 
-def test_an_ended_worker_counts_as_unmapped_only_after_the_gpu_grace():
-    import time
+def test_an_ended_worker_counts_as_unmapped_only_after_the_gpu_grace(monkeypatch):
+    from types import SimpleNamespace
 
+    from maru_storage_service.gpu import worker_registry
     from maru_storage_service.gpu.worker_registry import WorkerRegistry
     from maru_storage_service.op_ledger import OpLedger
 
@@ -569,10 +570,13 @@ def test_an_ended_worker_counts_as_unmapped_only_after_the_gpu_grace():
         on_exit=lambda ref: None,
         gpu_drain_grace_s=0.4,
     )
+    now = 10.0
+    monkeypatch.setattr(worker_registry, "time", SimpleNamespace(monotonic=lambda: now))
     with registry._lock:
-        registry._settles_at["w"] = time.monotonic() + 0.4  # ended just now
+        registry._settles_at["w"] = now + registry.gpu_drain_grace_s
     assert not registry.settled("w")
-    wait_until(lambda: registry.settled("w"), what="grace over")
+    now += registry.gpu_drain_grace_s
+    assert registry.settled("w")
     registry.stop()
 
 
@@ -907,11 +911,14 @@ class TestUnholds:
 
         unholds = Unholds(retry_s=0.05, max_retry_s=0.2)
         sent: list[str] = []
+        attempts = []
         fails = {"a": 100, "b": 1}
 
         def send(key):
             def go():
                 sent.append(key)
+                if key == "a":
+                    attempts.append(time.monotonic())
                 if fails[key]:
                     fails[key] -= 1
                     raise ConnectionRefusedError("RM down")
@@ -921,10 +928,11 @@ class TestUnholds:
         unholds.put("a", send("a"), "a")
         unholds.put("b", send("b"), "b")
         wait_until(lambda: sent.count("b") == 2, what="b retried once")
-        time.sleep(0.5)
-        assert sent.count("b") == 2  # confirmed: not sent again
-        assert 3 <= sent.count("a") <= 8  # backing off to 0.2 s, not every pass
+        wait_until(lambda: len(attempts) >= 5, what="retries at the backoff cap")
+        assert attempts[4] - attempts[3] >= 0.1  # capped retry interval is 0.2 s
+        assert sent.count("b") == 2
         assert unholds.pending() == 1
+        unholds.take_back("a")
 
     def test_a_refused_drop_is_not_sent_again(self, caplog):
         import logging

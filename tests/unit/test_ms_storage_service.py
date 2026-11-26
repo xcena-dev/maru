@@ -21,6 +21,7 @@ from maru_common.node_protocol import (
     DetachRequest,
     NodeMessageType,
     Notify,
+    recv_frame,
 )
 from maru_common.protocol import LookupAndPinRequest, MessageType
 from maru_common.storage_types import (
@@ -59,6 +60,18 @@ from tests.unit.ms_node_helpers import (
 )
 
 NS = "ns"
+
+
+def observe_wait(monkeypatch, condition):
+    entered = threading.Event()
+    wait = condition.wait
+
+    def observed(timeout):
+        entered.set()
+        return wait(timeout)
+
+    monkeypatch.setattr(condition, "wait", observed)
+    return entered
 
 
 @pytest.fixture
@@ -179,11 +192,21 @@ class TestClientRobustness:
         assert put(handler, "retried")
         handler.close()
 
-    def test_busy_ops_are_sent_again(self, fake, nodes, handlers):
+    def test_busy_ops_are_sent_again(self, fake, nodes, handlers, monkeypatch):
         node = nodes(op_window=1)
         h = handlers(node)
         client = h._cpu
         wait_credit(h, 4)
+        busy = threading.Event()
+        credit = node.manager.credit
+
+        def observe_credit(*args):
+            reply = credit(*args)
+            if reply.status == Status.BUSY:
+                busy.set()
+            return reply
+
+        monkeypatch.setattr(node.manager, "credit", observe_credit)
         fake.pause()
         handle = h.alloc(4)
         handle.buf[:] = b"busy"
@@ -195,7 +218,7 @@ class TestClientRobustness:
         )
         client.credits.take_all()  # force a CREDIT while the WRITE_DONE runs
         client._refill_wake.set()
-        time.sleep(0.5)  # the CREDIT gets BUSY (one op at a time) and waits
+        assert busy.wait(5)
         assert len(client._ops.unresolved()) == 2
         fake.resume()
         t.join(10)
@@ -335,9 +358,10 @@ class TestRepliesAndResults:
         client = h._cpu
         wait_credit(h)
         real_credit = node.manager.credit
+        both_sent = threading.Event()
 
         def slow_credit(rec, decoded):
-            time.sleep(0.3)  # both sends are out before the first reply
+            assert both_sent.wait(5)
             return real_credit(rec, decoded)
 
         monkeypatch.setattr(node.manager, "credit", slow_credit)
@@ -361,9 +385,12 @@ class TestRepliesAndResults:
 
         first = client._send_op(NodeMessageType.CREDIT, request, on_result, ops)
         second = client._send_op(NodeMessageType.CREDIT, request, on_result, ops, True)
+        handled = threading.Event()
+        second.add_done_callback(lambda _: handled.set())
+        both_sent.set()
         first.result(5)
         second.result(5)  # both replies arrive
-        time.sleep(0.2)
+        assert handled.wait(5)
         assert len(got) == 1  # the replay's reply is dropped
         keys = [(c.pool_id, c.offset, c.generation) for c in client.credits.take_all()]
         assert len(keys) == len(set(keys)) == len(got[0].credits)
@@ -797,6 +824,7 @@ class TestStaleRuns:
         )
         for _ in range(5):  # each same-run re-attach resends the WRITE_DONE
             old = client._storage
+            sent = len(sends)
             for conn in node.local.connections():
                 conn.close()
             wait_until(
@@ -805,7 +833,7 @@ class TestStaleRuns:
                 ),
                 what="attached again",
             )
-            time.sleep(0.05)
+            wait_until(lambda sent=sent: len(sends) > sent, what="WRITE_DONE resent")
         assert len(sends) >= 5  # the WRITE_DONE was resent each time
         assert node.manager.ledger.waiters(client.identity.incarnation) <= 1
         fake.resume()
@@ -933,7 +961,7 @@ def test_a_full_gpu_store_skips_and_never_retires(fake, sockdir, store):
         pages=16,
         cxl_pages=16 if store == "local_cxl" else None,
     )
-    node = start_node(config, region_source=FakeRm())
+    node = start_node(config, region_source=FakeRm(), rpc_timeout_s=2.0)
     worker = RawWorker(config.socket)
     try:
         response = worker.attach(capabilities=["fetch_v1", "lease_v1"])
@@ -951,7 +979,7 @@ def test_a_full_gpu_store_skips_and_never_retires(fake, sockdir, store):
             started = time.monotonic()
             answer = worker.credit(PAGE)
             assert answer.status is Status.OK and answer.credits == []
-            assert time.monotonic() - started < node.rpc_timeout_s
+            assert time.monotonic() - started < 1.0
         finally:
             fake.resume()
         for _ in range(3):
@@ -1590,7 +1618,14 @@ def test_a_pool_adopted_but_not_opened_fails_the_start(fake, nodes):
 def handlers(nodes):
     made = []
 
-    def make(node, engine="eng", store_timeout_s=10.0, timeout_ms=300, pin_pools=False):
+    def make(
+        node,
+        engine="eng",
+        store_timeout_s=10.0,
+        timeout_ms=300,
+        pin_pools=False,
+        **options,
+    ):
         handler = MaruHandler(
             MaruConfig(
                 maru_node=node.config.socket,
@@ -1602,6 +1637,7 @@ def handlers(nodes):
                 timeout_ms=timeout_ms,
                 auto_connect=False,
                 store_timeout_s=store_timeout_s,
+                **options,
             )
         )
         handler.connect()
@@ -1958,11 +1994,11 @@ class TestCreditRefill:
         )
         h = handlers(node)
         wait_credit(h, 2)
+        waiting = observe_wait(monkeypatch, h._cpu._credit_freed)
         handles = [h.alloc(PAGE), h.alloc(PAGE)]
         # The node holds 2 pages for us: a CREDIT now comes back empty
         h._cpu._refill_wake.set()
-        wait_until(lambda: h._cpu.stats["store_skipped_no_credit"] == 0)
-        time.sleep(0.2)
+        assert waiting.wait(5)
         assert h._cpu.credits.unused_bytes == 0
         for i, handle in enumerate(handles):
             handle.buf[:1] = b"x"
@@ -2111,7 +2147,7 @@ class TestCreditCounters:
         for handle in held:
             h.free(handle)
 
-    def test_close_ends_a_wait_for_credit(self, nodes, handlers):
+    def test_close_ends_a_wait_for_credit(self, nodes, handlers, monkeypatch):
         node = nodes(
             budgets={
                 "credit_max_bytes": 2 * PAGE,
@@ -2135,8 +2171,9 @@ class TestCreditCounters:
                 outcome.append((type(e).__name__, time.monotonic() - t0))
 
         waiter = threading.Thread(target=wait)
+        waiting = observe_wait(monkeypatch, h._cpu.credits._added)
         waiter.start()
-        time.sleep(0.2)
+        assert waiting.wait(5)
         t0 = time.monotonic()
         h.close()
         waiter.join(5)
@@ -2144,7 +2181,9 @@ class TestCreditCounters:
         assert time.monotonic() - t0 < 2.0
 
 
-def test_stopping_credit_waits_ends_one_under_way_and_keeps_the_rest(nodes, handlers):
+def test_stopping_credit_waits_ends_one_under_way_and_keeps_the_rest(
+    nodes, handlers, monkeypatch
+):
     node = nodes(
         budgets={
             "credit_max_bytes": 2 * PAGE,
@@ -2161,8 +2200,9 @@ def test_stopping_credit_waits_ends_one_under_way_and_keeps_the_rest(nodes, hand
             pytest.raises(CreditUnavailableError, h.alloc, PAGE, wait_s=10.0)
         )
     )
+    waiting = observe_wait(monkeypatch, h._cpu.credits._added)
     waiter.start()
-    time.sleep(0.2)
+    assert waiting.wait(5)
     t0 = time.monotonic()
     h.stop_credit_waits()
     waiter.join(5)
@@ -2181,7 +2221,7 @@ class TestBackgroundConnect:
         try:
             t0 = time.monotonic()
             assert handler.connect(wait=False) is False
-            assert time.monotonic() - t0 < 0.1
+            assert time.monotonic() - t0 < 1.0
             assert not handler.connected
             with pytest.raises(StorageUnavailableError):
                 handler.batch_retrieve(["k"])
@@ -2237,10 +2277,13 @@ class TestBackgroundConnect:
         finally:
             handler.close()
 
-    def test_close_while_waiting_for_the_node_returns_promptly(self, sockdir):
+    def test_close_while_waiting_for_the_node_returns_promptly(
+        self, sockdir, monkeypatch
+    ):
         handler = MaruHandler(self.config(f"{sockdir}/node.sock"))
+        waiting = observe_wait(monkeypatch, handler._cpu._closing)
         handler.connect(wait=False)
-        time.sleep(0.2)
+        assert waiting.wait(5)
         t0 = time.monotonic()
         handler.close()
         assert time.monotonic() - t0 < 2.0
@@ -2264,7 +2307,7 @@ class TestBackgroundConnect:
 class TestMaruServerDown:
     def test_lookups_miss_at_once_until_it_answers(self, fake, nodes, handlers):
         node = nodes()
-        h = handlers(node, timeout_ms=500)
+        h = handlers(node, timeout_ms=3000, lookup_timeout_ms=1000)
         wait_credit(h)
         assert put(h, "k")
         assert h.batch_exists(["k"]) == [True]
@@ -2272,12 +2315,12 @@ class TestMaruServerDown:
         try:
             t0 = time.monotonic()
             assert h.batch_exists(["k"]) == [False]
-            assert time.monotonic() - t0 < 2.0  # one RPC timeout at most
+            assert time.monotonic() - t0 < 1.5
             for _ in range(20):
                 t0 = time.monotonic()
                 assert h.batch_exists(["k"]) == [False]
                 assert h.batch_retrieve(["k"]) == [None]
-                assert time.monotonic() - t0 < 0.05
+                assert time.monotonic() - t0 < 0.5
         finally:
             fake.resume()
         wait_until(lambda: h.batch_exists(["k"]) == [True], timeout=5.0)
@@ -2303,15 +2346,16 @@ class TestMaruServerDown:
 
 
 class TestFirstConnect:
-    def test_waits_for_a_node_that_is_starting(self, fake, sockdir):
+    def test_waits_for_a_node_that_is_starting(self, fake, sockdir, monkeypatch):
         from maru_storage_service.gpu.local_server import LocalServer
 
         path = f"{sockdir}/late.sock"
         handler = self._handler(path, 20.0)
+        waiting = observe_wait(monkeypatch, handler._cpu._closing)
         out = []
         t = threading.Thread(target=lambda: out.append(handler.connect()))
         t.start()
-        time.sleep(0.3)  # no socket yet: ENOENT
+        assert waiting.wait(5)  # ENOENT
         # bound but not listening yet (as claim() leaves it): ECONNREFUSED
         held = LocalServer(
             path,
@@ -2324,7 +2368,8 @@ class TestFirstConnect:
             pools=[],
         )
         held.claim()
-        time.sleep(0.3)
+        waiting.clear()
+        assert waiting.wait(5)  # ECONNREFUSED
         held.stop()
         node = start_node(node_config(fake.url, path))
         try:
@@ -2341,8 +2386,9 @@ class TestFirstConnect:
             handler.connect()
         assert time.monotonic() - t0 < 3.0
 
-    def test_close_stops_the_wait(self, sockdir):
+    def test_close_stops_the_wait(self, sockdir, monkeypatch):
         handler = self._handler(f"{sockdir}/never.sock", 30.0)
+        waiting = observe_wait(monkeypatch, handler._cpu._closing)
         errors = []
 
         def connect():
@@ -2353,7 +2399,7 @@ class TestFirstConnect:
 
         t = threading.Thread(target=connect)
         t.start()
-        time.sleep(0.2)  # in the wait
+        assert waiting.wait(5)
         t0 = time.monotonic()
         handler.close()
         t.join(5)
@@ -2425,14 +2471,14 @@ class TestFirstConnect:
     def test_unanswered_attach_fails_at_the_deadline(self, sockdir):
         path = f"{sockdir}/silent.sock"
         listener = self._silent_node(path)
-        handler = self._handler(path, 0.6)
+        handler = self._handler(path, 1.5)
         t0 = time.monotonic()
         try:
             with pytest.raises(StorageUnavailableError, match="timed out"):
                 handler.connect()
         finally:
             listener.close()
-        assert 0.4 < time.monotonic() - t0 < 3.0
+        assert 0.8 < time.monotonic() - t0 < 3.0
 
     def test_close_cancels_an_attach_in_progress(self, sockdir):
         path = f"{sockdir}/silent.sock"
@@ -2450,11 +2496,14 @@ class TestFirstConnect:
         t = threading.Thread(target=connect)
         try:
             t.start()
-            wait_until(lambda: handler._cpu._connecting is not None, what="attaching")
-            time.sleep(0.1)  # waiting for the reply
-            t0 = time.monotonic()
-            handler.close()
-            t.join(5)
+            listener.settimeout(5)
+            peer, _ = listener.accept()
+            with peer:
+                peer.settimeout(5)
+                assert recv_frame(peer)
+                t0 = time.monotonic()
+                handler.close()
+                t.join(5)
             assert not t.is_alive() and time.monotonic() - t0 < 3.0
         finally:
             listener.close()

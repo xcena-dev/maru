@@ -45,7 +45,7 @@ def env(request):
         pin_pools=False,
         chunk_size_bytes=PAGE,
         rdma_staging_size=settings.get("slots", 4) * PAGE,
-        rdma_timeout_s=0.03,
+        rdma_timeout_s=1.0,
     )
     reader = WorkerRdma(
         config,
@@ -596,7 +596,7 @@ def test_gate_wait_expires_while_the_owner_keeps_the_gate(env, operation):
     with env.reader.gate:
         caller.start()
         assert entered.wait(1)
-        caller.join(0.1)
+        caller.join(1)
         returned_while_held = not caller.is_alive()
     caller.join(1)
     assert not caller.is_alive() and not errors
@@ -729,7 +729,7 @@ def test_engine_release_does_not_wait_for_read_post_gate(env, client):
     try:
         releasing.start()
         assert entered.wait(1)
-        returned_without_gate = finished.wait(0.1)
+        returned_without_gate = finished.wait(1)
     finally:
         env.reader.gate.release()
         releasing.join(1)

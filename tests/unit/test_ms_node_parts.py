@@ -333,11 +333,11 @@ class TestMsRpcClient:
             with pytest.raises(RpcUnknownError):
                 client.call(MessageType.NODE_OPEN, _open())
             # a late reply to a request given up is dropped, not mismatched
-            fake.delay(MessageType.NODE_OPEN, 0.5)
+            fake.delay(MessageType.NODE_OPEN, 1.0)
             with pytest.raises(RpcUnknownError):
                 client.call(MessageType.NODE_OPEN, _open())
             fake.delay(MessageType.NODE_OPEN, 0)
-            time.sleep(0.4)
+            time.sleep(1.2)
             assert client.call(MessageType.NODE_OPEN, _open()).status.value == "OK"
         finally:
             client.close()

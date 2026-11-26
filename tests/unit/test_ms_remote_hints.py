@@ -476,7 +476,7 @@ def test_a_wait_that_runs_out_still_writes(world):
 
 
 def test_a_waiting_store_holds_up_no_other_connection(world):
-    w = world(write_hints=True, write_wait_ms=1000)
+    w = world(write_hints=True, write_wait_ms=3000, timeout_s=5)
     w.ext.release.clear()
     clients = []
     t = threading.Thread(target=lambda: clients.append(w.client()))
@@ -487,8 +487,9 @@ def test_a_waiting_store_holds_up_no_other_connection(world):
         from maru_common.remote_protocol import PingRequest
 
         assert (
-            other.call(RemoteMessageType.PING, PingRequest(), 0.5).status == Status.OK
+            other.call(RemoteMessageType.PING, PingRequest(), 1.0).status == Status.OK
         )
+        assert not clients
     finally:
         w.ext.release.set()
         t.join(3)

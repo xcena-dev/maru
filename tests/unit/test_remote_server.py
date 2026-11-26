@@ -464,7 +464,7 @@ def test_serializer_request_cannot_skip_proof(make_server):
 
 
 def test_proof_timeout_cuts_partial_frames(make_server, monkeypatch):
-    monkeypatch.setattr(remote_server, "AUTH_TIMEOUT_S", 0.05)
+    monkeypatch.setattr(remote_server, "AUTH_TIMEOUT_S", 1.0)
     h = make_server()
     sock = h.raw(authenticate=False)
     sock.sendall(b"\0")

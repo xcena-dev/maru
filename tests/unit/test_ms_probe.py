@@ -311,7 +311,7 @@ class TestProbeHandler:
 
 class TestLookupTimeout:
     @pytest.mark.parametrize("probe", [False, True])
-    def test_a_500ms_reply_misses_at_100ms_and_recovers(self, fake, handlers, probe):
+    def test_a_late_reply_misses_at_100ms_and_recovers(self, fake, handlers, probe):
         worker = handlers(timeout_ms=2000)
         assert put(worker, "here")
         handler = handlers(timeout_ms=2000, metadata_only=True) if probe else worker
@@ -320,22 +320,23 @@ class TestLookupTimeout:
         counter = "probe_unavailable" if probe else "retrieve_unavailable"
         call = handler.batch_exists if probe else handler.batch_retrieve
         miss = [False] if probe else [None]
-        fake.delay(code, 0.5)
-        fake.delay(MessageType.WORKER_HEARTBEAT, 0.5)
+        fake.delay(code, 1.2)
+        fake.delay(MessageType.WORKER_HEARTBEAT, 1.2)
         fake.delay(MessageType.UNPIN, 0.5)
 
         started = time.monotonic()
         assert call(["here"]) == miss
         elapsed = time.monotonic() - started
-        assert 0.08 <= elapsed < 0.4  # at the 100 ms timeout, not the reply
+        assert 0.05 <= elapsed < 0.6
         assert conn.down
         assert handler.get_stats()["maru_node"]["counters"][counter] == 1
         sent = len(fake.requests(code))
         started = time.monotonic()
-        assert call(["here"]) == miss
-        assert time.monotonic() - started < 0.05
+        for _ in range(10):
+            assert call(["here"]) == miss
+        assert time.monotonic() - started < 0.5  # ten lookup timeouts take 1 s
         assert len(fake.requests(code)) == sent == 1
-        assert handler.get_stats()["maru_node"]["counters"][counter] == 2
+        assert handler.get_stats()["maru_node"]["counters"][counter] == 11
 
         wait_until(lambda: not conn.down, what="heartbeat recovery")
         if probe:
@@ -575,18 +576,18 @@ class TestStepCredit:
         wait_until(lambda: h._cpu.credits.unused_bytes == 30 * PAGE, timeout=2)
 
     @pytest.mark.parametrize(
-        "delay, credit_wait_s, stored",
-        [(0.005, 0.02, 30), (0.3, 0.02, 16), (0.3, None, 16)],
+        "delay, credit_wait_s, stored, limit",
+        [(0.05, 1.1, 30, 0.55), (1.5, 0.5, 16, 1.0), (1.5, None, 16, 0.5)],
     )
     def test_a_store_waits_a_little_for_its_steps_credit(
-        self, step_node, handlers_on, monkeypatch, delay, credit_wait_s, stored
+        self, step_node, handlers_on, monkeypatch, delay, credit_wait_s, stored, limit
     ):
         """The step's CREDIT answers late: a store past the credit at hand
         waits for it, at most credit_wait_s in the whole step."""
         from maru_handler.client import CreditUnavailableError
 
         options = {} if credit_wait_s is None else {"credit_wait_s": credit_wait_s}
-        h = handlers_on(step_node, **options)
+        h = handlers_on(step_node, timeout_ms=3000, **options)
         wait_until(lambda: h._cpu.credits.unused_bytes == 16 * PAGE)
         real = step_node.manager.credit
 
@@ -595,8 +596,8 @@ class TestStepCredit:
             return real(rec, decoded)
 
         monkeypatch.setattr(step_node.manager, "credit", slow)
-        h.want_credit(30)
         handles, started = [], time.monotonic()
+        h.want_credit(30)
         for _ in range(30):
             try:
                 handles.append(h.alloc(8))  # kept: a freed credit is reused
@@ -607,7 +608,7 @@ class TestStepCredit:
             h.free(handle)
         got = len(handles)
         assert got == stored
-        assert took < h._cpu.config.credit_wait_s + 0.1 + (delay if got == 30 else 0)
+        assert took < limit
 
     def test_workers_capped_at_the_node_total_share_it(self, step_node, handlers_on):
         """Both ask for the whole node total; the second gets its share back

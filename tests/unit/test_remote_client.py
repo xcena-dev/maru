@@ -211,7 +211,7 @@ def test_call_timeout_discards_only_its_pending_response(make_server):
     h.ops.hold.add(Code.RESERVE)
     conn, _ = h.open()
     with pytest.raises(TimeoutError):
-        conn.call(Code.RESERVE, request(Code.RESERVE), 0.03)
+        conn.call(Code.RESERVE, request(Code.RESERVE), 0.5)
     h.ops.wait_calls(Code.RESERVE)
     assert not conn._pending
     h.ops.finish(ORIGIN, 1)
@@ -233,7 +233,7 @@ def test_send_deadline_closes_the_stream(block):
 
     def call():
         try:
-            conn.call(Code.AGENTS, request, 0.02)
+            conn.call(Code.AGENTS, request, 0.5)
         except OSError as exc:
             errors.append(exc)
 
@@ -242,7 +242,7 @@ def test_send_deadline_closes_the_stream(block):
     caller = threading.Thread(target=call)
     try:
         caller.start()
-        caller.join(0.5)
+        caller.join(2)
         assert not caller.is_alive()
         assert len(errors) == 1 and isinstance(errors[0], TimeoutError)
         assert closed.wait(WAIT) and not conn._pending

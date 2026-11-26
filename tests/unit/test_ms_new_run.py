@@ -538,21 +538,36 @@ def test_maru_off_ends_its_maruserver_session(fake, nodes, handlers):
     assert sent == len([r for _, r in fake.log if getattr(r, "incarnation", None)])
 
 
-def test_a_refused_open_on_a_lookup_polls_the_session_back(fake, runs, handlers):
+def wait_for_long_heartbeat(server, monkeypatch):
+    waiting = threading.Event()
+    wait = server._beat.wait
+
+    def observed(timeout):
+        if timeout == 60.0:
+            waiting.set()
+        return wait(timeout)
+
+    monkeypatch.setattr(server._beat, "wait", observed)
+    server.heartbeat_s = 60.0
+    assert waiting.wait(5)
+
+
+def test_a_refused_open_on_a_lookup_polls_the_session_back(
+    fake, runs, handlers, monkeypatch
+):
     node = runs()
     first = node.service
     h = handlers(node)
     server = h._cpu.server_conn
-    server.heartbeat_s = 60.0
     assert put(h, "k")
-    time.sleep(0.2)  # the loop waits out its long beat now
+    wait_for_long_heartbeat(server, monkeypatch)
     fake.fail_requests(MessageType.NODE_OPEN, Status.BUSY, count=1000)
     fake.restart()
-    rpcs = len(fake.log)
     wait_until(lambda: h.retrieve("k") is None and server._refused, what="refused")
+    lookups = len(fake.requests(MessageType.LOOKUP_AND_PIN))
     for _ in range(10):
         assert h.retrieve("k") is None  # no RPC each
-    assert len(fake.log) - rpcs < 10
+    assert len(fake.requests(MessageType.LOOKUP_AND_PIN)) == lookups
     with fake._lock:
         fake._fail[int(MessageType.NODE_OPEN)].clear()
     second = new_run(node, first)
@@ -604,7 +619,8 @@ def test_a_worker_ahead_of_its_node_logs_no_warning(fake, runs, handlers, caplog
         caplog.set_level("DEBUG", logger=log.name)
         fake.restart()
         wait_until(lambda: server._refused, what="refused before the node opened")
-        time.sleep(0.6)
+        opens = len(fake.requests(MessageType.WORKER_OPEN))
+        wait_until(lambda: len(fake.requests(MessageType.WORKER_OPEN)) > opens)
         with fake._lock:
             fake._fail[int(MessageType.NODE_OPEN)].clear()
         attached_to(h, new_run(node, first), fake)
@@ -616,14 +632,13 @@ def test_a_worker_ahead_of_its_node_logs_no_warning(fake, runs, handlers, caplog
     ]
 
 
-def test_a_server_seen_down_is_polled_at_once(fake, runs, handlers):
+def test_a_server_seen_down_is_polled_at_once(fake, runs, handlers, monkeypatch):
     node = runs()
     first = node.service
     h = handlers(node)
     server = h._cpu.server_conn
-    server.heartbeat_s = 60.0  # a slow beat must not delay the poll
     assert put(h, "k")
-    time.sleep(0.2)  # the loop waits out its long beat now
+    wait_for_long_heartbeat(server, monkeypatch)
     fake.pause(hold=False)
     assert h.retrieve("k") is None  # unanswered: down
     assert server.down
@@ -645,7 +660,11 @@ def test_a_node_that_does_not_open_is_warned_about_once(fake, nodes, handlers, c
         caplog.set_level("INFO", logger=log.name)
         fake.restart()  # the run ends, and no next run opens
         wait_until(lambda: server._refused, what="waiting for the node")
-        time.sleep(2.0)  # polls go on
+        wait_until(
+            lambda: any("has not opened" in r.getMessage() for r in caplog.records)
+        )
+        opens = len(fake.requests(MessageType.WORKER_OPEN))
+        wait_until(lambda: len(fake.requests(MessageType.WORKER_OPEN)) >= opens + 2)
     finally:
         log.removeHandler(caplog.handler)
     # pytest >= 9.1 also attaches caplog.handler to the non-propagating
@@ -690,12 +709,15 @@ def test_a_late_open_reply_never_takes_the_epoch_back():
     conn.on_server_epoch.append(client._server_epoch_changed)
     entered, release = threading.Event(), threading.Event()
     answers = iter(["old", "new"])  # in the order the requests reach a server
+    second_sent = threading.Event()
 
     def call(code, request):
         epoch = next(answers)
         if epoch == "old":
             entered.set()
             assert release.wait(5)
+        else:
+            second_sent.set()
         return WorkerOpenResponse(
             status=Status.OK,
             worker_session=f"{epoch}-session",
@@ -711,7 +733,7 @@ def test_a_late_open_reply_never_takes_the_epoch_back():
         first.start()
         assert entered.wait(2)
         second.start()
-        time.sleep(0.05)
+        assert not second_sent.wait(0.5)
         release.set()
         first.join(2)
         second.join(2)

@@ -492,7 +492,7 @@ def test_write_wait_does_not_block_another_connection(extension_env):
 
     def hint(conn, message, ranges):
         entered.set()
-        assert release.wait(1)
+        assert release.wait(5)
 
     ext.hint = hint
     answers = []
@@ -502,7 +502,7 @@ def test_write_wait_does_not_block_another_connection(extension_env):
                 first,
                 RemoteMessageType.RESERVE,
                 ReserveRequest(
-                    env.op(), 1, hint=HintAction.WRITE_WAIT, wait_ms=1000, domain=DOMAIN
+                    env.op(), 1, hint=HintAction.WRITE_WAIT, wait_ms=5000, domain=DOMAIN
                 ),
             )
         )
@@ -511,8 +511,9 @@ def test_write_wait_does_not_block_another_connection(extension_env):
     try:
         assert entered.wait(3)
         assert (
-            other.call(RemoteMessageType.PING, PingRequest(), 0.5).status == Status.OK
+            other.call(RemoteMessageType.PING, PingRequest(), 1.0).status == Status.OK
         )
+        assert not answers
     finally:
         release.set()
         thread.join(3)

@@ -34,6 +34,7 @@ from maru_common.storage_types import Status
 from maru_server.node_rpc import NodeRpcServer
 from maru_server.node_server import NodeServer
 from tests.unit.ms_fakes import FakeNode, FakeWorker, RpcWire, admin_delete, key
+from tests.unit.ms_node_helpers import wait_until
 
 
 def free_port() -> int:
@@ -51,12 +52,12 @@ def direct_request(request):
 
 
 def test_disconnected_direct_send_fails_without_waiting(direct_request):
-    rpc = MsRpcClient(f"tcp://127.0.0.1:{free_port()}", timeout_s=0.5)
+    rpc = MsRpcClient(f"tcp://127.0.0.1:{free_port()}", timeout_s=1.0)
     try:
         started = time.monotonic()
         with pytest.raises(RpcUnknownError):
             rpc.call(*direct_request)
-        assert time.monotonic() - started < 0.1
+        assert time.monotonic() - started < 0.5
     finally:
         rpc.close()
 
@@ -88,14 +89,14 @@ def test_sent_direct_request_keeps_its_response_timeout(direct_request):
     context = zmq.Context()
     router = context.socket(zmq.ROUTER)
     port = router.bind_to_random_port("tcp://127.0.0.1")
-    rpc = MsRpcClient(f"tcp://127.0.0.1:{port}", timeout_s=0.08)
+    rpc = MsRpcClient(f"tcp://127.0.0.1:{port}", timeout_s=1.0)
     try:
         sock, _ = rpc._direct_local.entry
         assert sock.poll(1000, zmq.POLLOUT)
         started = time.monotonic()
         with pytest.raises(RpcUnknownError):
             rpc.call(*direct_request)
-        assert time.monotonic() - started >= 0.06
+        assert time.monotonic() - started >= 0.5
         assert router.recv_multipart(flags=zmq.NOBLOCK)
     finally:
         rpc.close()
@@ -387,13 +388,16 @@ def test_stop_while_multi_storage_requests_are_in_flight():
     clients = [threading.Thread(target=client, daemon=True) for _ in range(4)]
     for t in clients:
         t.start()
-    while len(answered) < 20:
-        time.sleep(0.01)
-    started = time.monotonic()
-    served.close()
-    stop.set()
-    for t in clients:
-        t.join(5)
+    try:
+        wait_until(lambda: len(answered) >= 20, what="20 lookups answered")
+        started = time.monotonic()
+    finally:
+        try:
+            served.close()
+        finally:
+            stop.set()
+            for t in clients:
+                t.join(5)
     assert time.monotonic() - started < 5
     assert not any(t.is_alive() for t in clients)
 

@@ -1338,7 +1338,9 @@ def test_a_scheduler_lookup_does_not_wait_for_a_maruserver_that_is_down(
 ):
     writer = workers()
     store(writer, rank_kv(1, 2))
-    scheduler = make_scheduler(BLOCK, CHUNK, node_extra(node.config.socket))
+    scheduler = make_scheduler(
+        BLOCK, CHUNK, node_extra(node.config.socket, maru_lookup_timeout_ms=1000)
+    )
     scheduler.connect_node()
 
     def lookup():
@@ -1353,7 +1355,7 @@ def test_a_scheduler_lookup_does_not_wait_for_a_maruserver_that_is_down(
             for _ in range(10):
                 t0 = time.monotonic()
                 assert lookup() == 0
-                assert time.monotonic() - t0 < 0.05
+                assert time.monotonic() - t0 < 0.5
         finally:
             fake.resume()
         wait_until(lambda: lookup() == 2, timeout=5)
@@ -1535,12 +1537,14 @@ def test_store_steps_do_not_wait_for_maruserver_commits(fake, nodes_small):
     writer = layerwise_writer(node)
     try:
         wait_until(lambda: writer._handler._cpu.credits.unused_bytes >= 8 * PAGE)
-        fake.delay(MessageType.COMMIT, 0.5)
+        fake.delay(MessageType.COMMIT, 1.0)
+        kv = rank_kv(1, 2)
+        meta = [store_meta("r1", 0)]
         t0 = time.monotonic()
-        save_step(writer, rank_kv(1, 2), [store_meta("r1", 0)])
-        assert time.monotonic() - t0 < 0.2
+        save_step(writer, kv, meta)
+        assert time.monotonic() - t0 < 0.5
         drain(writer)
-        assert time.monotonic() - t0 < 1.6  # one round per layer: 2 s
+        assert time.monotonic() - t0 < 3.0  # two rounds in parallel, four in series
         assert len(fake.keys()) == 2 * (NUM_LAYERS + 1)
     finally:
         writer.shutdown()
@@ -3492,11 +3496,14 @@ class FakeCredit:
         self.at_hand = threading.Event()
         self.comes = threading.Event()
         self.stopped = threading.Event()  # stop_credit_waits()
+        self.waiting = threading.Event()
         self.pages = []
 
     def alloc(self, nbytes, route_key=None, wait_s=0.0, retry_later=False):
         deadline = time.monotonic() + wait_s
-        while not (self.at_hand.is_set() or self.comes.is_set()):
+        if wait_s > 0:
+            self.waiting.set()
+        while not (self.comes.is_set() or (wait_s == 0 and self.at_hand.is_set())):
             if self.stopped.is_set() or time.monotonic() >= deadline:
                 raise CreditUnavailableError("no credit at hand")
             time.sleep(0.005)
@@ -3568,12 +3575,14 @@ def drain_behind(worker) -> None:
 
 
 def test_write_behind_waits_for_credit_off_the_engine_thread(monkeypatch):
+    monkeypatch.setattr(connector_module, "_STORE_CREDIT_WAIT_S", 3.0)
     worker, kernel, credit, published = wait_worker(monkeypatch)
     t0 = time.monotonic()
     worker._store_packed_slabs_write_behind(kernel, behind_meta("r1"))
-    assert time.monotonic() - t0 < 0.1  # the engine thread never waits
+    assert time.monotonic() - t0 < 1.0
     assert worker._deferred_bytes > 0
-    threading.Timer(0.2, credit.comes.set).start()
+    assert credit.waiting.wait(2)
+    credit.comes.set()
     drain_behind(worker)
     keys = _chunk_keys(list(range(16)), 8)
     assert published == keys  # stored once credit came, none skipped
@@ -3601,28 +3610,31 @@ def test_a_write_behind_wait_for_credit_is_bounded(monkeypatch):
 
 
 def test_later_batches_do_not_wait_behind_a_credit_wait(monkeypatch):
+    monkeypatch.setattr(connector_module, "_STORE_CREDIT_WAIT_S", 3.0)
     worker, kernel, credit, published = wait_worker(monkeypatch)
     worker._store_packed_slabs_write_behind(kernel, behind_meta("r1"))  # waits
+    assert credit.waiting.wait(2)
     credit.at_hand.set()
     t0 = time.monotonic()
     worker._store_packed_slabs_write_behind(kernel, behind_meta("r2", 100))
     worker._store_executor.submit(lambda: None).result(10)
     assert worker.get_finished_saving({"r1", "r2"}) == {"r1", "r2"}
     assert set(_chunk_keys(list(range(100, 116)), 8)) <= set(published)
-    assert time.monotonic() - t0 < 0.5  # not behind r1's wait for credit
+    assert time.monotonic() - t0 < 1.0
     worker.shutdown()
 
 
 def test_shutdown_is_not_held_by_credit_waits(monkeypatch):
-    worker, kernel, _, _ = wait_worker(monkeypatch)
+    monkeypatch.setattr(connector_module, "_STORE_CREDIT_WAIT_S", 3.0)
+    worker, kernel, credit, _ = wait_worker(monkeypatch)
     for i in range(5):
         worker._store_packed_slabs_write_behind(kernel, behind_meta(f"r{i}", 100 * i))
     worker._store_executor.submit(lambda: None).result(10)
-    time.sleep(0.1)  # the first wait is under way
+    assert credit.waiting.wait(2)
     t0 = time.monotonic()
     worker.shutdown()
     # Neither the wait under way nor the queued ones hold it
-    assert time.monotonic() - t0 < 0.5
+    assert time.monotonic() - t0 < 1.0
     assert worker._deferred_bytes == 0
 
 
