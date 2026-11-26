@@ -45,6 +45,7 @@ from vllm.logger import init_logger
 from vllm.v1.attention.backend import AttentionMetadata
 from vllm.v1.core.sched.output import SchedulerOutput
 
+from maru_common.config import reject_removed_backend
 from maru_common.kv_shard import (
     WHOLE_MODEL,
     KVShard,
@@ -823,11 +824,7 @@ def _validate_node_config(extra: dict[str, Any]) -> None:
 def _validate_storage_config(extra: dict[str, Any]) -> bool:
     """Validate the node or CXL configuration before using cache data."""
     backend = extra.get("maru_storage_backend", "cxl")
-    if backend in {"cpu", "mixed", "remote_cxl"}:
-        raise ValueError(
-            f"maru_storage_backend={backend!r} was removed; see "
-            "docs/source/getting_started/migrating_to_maru_node.md"
-        )
+    reject_removed_backend("maru_storage_backend", backend)
     if _is_node(extra):
         _validate_node_config(extra)
         return False
@@ -835,8 +832,8 @@ def _validate_storage_config(extra: dict[str, Any]) -> bool:
         raise ValueError("maru_storage_backend must be 'cxl'")
     if any(name in extra for name in _REMOVED_STORAGE_KNOBS):
         raise ValueError(
-            "Storage-session settings were removed; see "
-            "docs/source/getting_started/migrating_to_maru_node.md"
+            "Storage-session settings were removed; configure the store on the GPU "
+            "StorageService and set maru_node to its socket path"
         )
     return False
 

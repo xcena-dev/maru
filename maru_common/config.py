@@ -4,6 +4,19 @@ import os
 from dataclasses import dataclass
 
 
+def reject_removed_backend(name: str, backend: str) -> None:
+    store = {
+        "cpu": "a dram store",
+        "mixed": "a dram or local_cxl store",
+        "remote_cxl": "a remote store",
+    }.get(backend)
+    if store:
+        raise ValueError(
+            f"{name}={backend!r} was removed; use maru_node with {store} "
+            "(docs/source/getting_started/quick_start_node.md)"
+        )
+
+
 def _parse_env_bool(name: str) -> bool | None:
     """Parse an optional boolean env var.
 
@@ -109,11 +122,7 @@ class MaruConfig:
             )
         if type(self.lookup_timeout_ms) is not int or self.lookup_timeout_ms <= 0:
             raise ValueError("lookup_timeout_ms must be a positive integer")
-        if self.storage_backend in {"cpu", "mixed", "remote_cxl"}:
-            raise ValueError(
-                f"storage_backend={self.storage_backend!r} was removed; see "
-                "docs/source/getting_started/migrating_to_maru_node.md"
-            )
+        reject_removed_backend("storage_backend", self.storage_backend)
         if self.storage_backend != "cxl":
             raise ValueError("storage_backend must be 'cxl'")
         if self.maru_node is not None:
