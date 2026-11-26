@@ -28,6 +28,11 @@ On the `cxl` storage backend (the default) and the `remote_cxl` backend:
    | Gated DeltaNet (Mamba-type) +  | Qwen3.5, Qwen3.6, Qwen3.8 (except  | 🟢              | 🟢              |
    | full attention                 | Flash-Next), Qwen3-Next            |                 |                 |
    +--------------------------------+------------------------------------+-----------------+-----------------+
+   | Gated DeltaNet (Mamba-type) +  | Qwen3.8-Flash-Next                 | 🟢              | 🟢              |
+   | indexed attention: full        |                                    |                 |                 |
+   | attention with compressed      |                                    |                 |                 |
+   | indexer keys                   |                                    |                 |                 |
+   +--------------------------------+------------------------------------+-----------------+-----------------+
    | Sliding-window MLA +           | DeepSeek-V4.1-Flash                | 🟢              | 🟢              |
    | compressed MLA latent and      |                                    |                 |                 |
    | indexer cache                  |                                    |                 |                 |
@@ -48,7 +53,8 @@ On the `cxl` storage backend (the default) and the `remote_cxl` backend:
 
 🟢 means that Maru stores and loads the KV cache of such models, and ❌ that
 the connector refuses them at startup. Each model family in a 🟢 row has been
-run with its own weights while Maru stored and loaded its KV cache. Models with
+run with its own weights while Maru stored and loaded its KV cache
+(Qwen3.8-Flash-Next at TP=4; see {ref}`vllm-qwen38-flash-next`). Models with
 several KV cache groups also need the settings in {ref}`vllm-hybrid-models`;
 DeepSeek-V4.1-Flash has notes of its own in {ref}`vllm-deepseek-v41`.
 
@@ -59,10 +65,12 @@ of the KV cache.
 ## Storage backends
 
 The table holds for the `cxl` and `remote_cxl` backends, except that
-`remote_cxl` takes no MLA model. `remote_cxl` was tested with gpt-oss-20b and
-Qwen3.5-0.8B on a single GPU and at TP=2, with Llama-3.1-8B at TP=2, and with
-all three at DP=2. The `cpu` and `mixed` backends take only text-only models
-with one KV cache group and without MLA, at TP=1 and without data parallelism.
+`remote_cxl` takes no MLA model and not Qwen3.8-Flash-Next, whose indexed
+attention is stored like an MLA model's caches. `remote_cxl` was tested with
+gpt-oss-20b and Qwen3.5-0.8B on a single GPU and at TP=2, with Llama-3.1-8B at
+TP=2, and with all three at DP=2. The `cpu` and `mixed` backends take only
+text-only models with one KV cache group and without MLA, at TP=1 and without
+data parallelism.
 The `remote_cxl`, `cpu` and `mixed` backends refuse LoRA and quantized KV
 caches.
 

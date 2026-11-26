@@ -49,6 +49,7 @@ from tests.unit.test_vllm_kv_groups import (
     _stored_qwen,
     _storing_worker,
     _token_rows,
+    flash_next_config,
     gpt_oss_config,
     tiny_config,
     tiny_kv_caches,
@@ -393,6 +394,17 @@ def test_remote_cxl_serves_the_text_requests_of_a_multimodal_model():
     config.lora_config = object()
     with pytest.raises(ValueError, match="without LoRA or MLA"):
         _cpu_engine_config(remote_cxl_extra(), config)
+
+
+def test_remote_cxl_refuses_an_mla_group_of_a_model_vllm_does_not_call_mla():
+    """Qwen3.8-Flash-Next keeps its full-attention KV and the indexer's
+    compressed keys in a group that is copied block by block like an MLA
+    model's, which remote_cxl has not run."""
+    groups = describe_kv_groups(flash_next_config("scheduler"))
+    config = engine_config()
+    assert _cpu_engine_config(remote_cxl_extra(), config)["maru_cache_namespace"]
+    with pytest.raises(ValueError, match="without LoRA or MLA"):
+        _cpu_engine_config(remote_cxl_extra(), config, groups)
 
 
 def test_a_rank_that_stores_nothing_opens_a_one_page_session(monkeypatch):
