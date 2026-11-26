@@ -53,10 +53,9 @@ On the `cxl` storage backend (the default) and the `remote_cxl` backend:
 
 🟢 means that Maru stores and loads the KV cache of such models, and ❌ that
 the connector refuses them at startup. Each model family in a 🟢 row has been
-run with its own weights while Maru stored and loaded its KV cache, except
-Qwen3.8-Flash-Next, which was run with randomly initialized weights and 8 of
-its 48 layers (see {ref}`vllm-qwen38-flash-next`). Models with several KV
-cache groups also need the settings in {ref}`vllm-hybrid-models`;
+run with its own weights while Maru stored and loaded its KV cache
+(Qwen3.8-Flash-Next at TP=4; see {ref}`vllm-qwen38-flash-next`). Models with
+several KV cache groups also need the settings in {ref}`vllm-hybrid-models`;
 DeepSeek-V4.1-Flash has notes of its own in {ref}`vllm-deepseek-v41`.
 
 Pipeline parallelism and decode or prefill context parallelism are refused at
