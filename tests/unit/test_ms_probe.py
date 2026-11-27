@@ -386,6 +386,11 @@ class TestLookupTimeout:
         with pytest.raises(ValueError, match="lookup_timeout_ms"):
             MaruConfig(lookup_timeout_ms=value)
 
+    def test_positional_arguments_keep_their_places(self):
+        # lookup_timeout_ms is keyword-only; the 7th argument is use_async_rpc
+        config = MaruConfig("tcp://h:5555", None, 1 << 20, 1 << 20, False, 2000, False)
+        assert config.use_async_rpc is False and config.lookup_timeout_ms == 100
+
 
 class TestRankIdentity:
     def test_ranks_share_the_engine_id_and_name_their_ranks(self, fake, node, handlers):

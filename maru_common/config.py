@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 XCENA Inc.
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 
 def reject_removed_backend(name: str, backend: str) -> None:
@@ -62,7 +62,9 @@ class MaruConfig:
     chunk_size_bytes: int = 1024 * 1024  # 1MB default
     auto_connect: bool = True
     timeout_ms: int = 2000  # Socket timeout in milliseconds
-    lookup_timeout_ms: int = 100  # Foreground PROBE and LOOKUP_AND_PIN timeout
+    # Foreground PROBE and LOOKUP_AND_PIN timeout; keyword-only, so the
+    # positions of the fields after it stay as they were
+    lookup_timeout_ms: int = field(default=100, kw_only=True)
     use_async_rpc: bool = True  # Use async DEALER-ROUTER RPC (RpcAsyncClient)
     max_inflight: int = 64  # Max concurrent in-flight async requests (backpressure)
     eager_map: bool = True  # Pre-map all shared regions on connect
