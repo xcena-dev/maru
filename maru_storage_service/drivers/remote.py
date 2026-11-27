@@ -32,14 +32,16 @@ def parse(raw: dict, ctx: TierContext) -> dict:
         raise NodeConfigError(
             f"{ctx.what}.write_wait_ms: expected an integer from 0 to 10000"
         )
+    page = ctx.page_size
+    # Default: max(1 GiB, 64 pages), rounded up to whole pages
+    default_staging = max(-(-(1 << 30) // page), 64) * page
     staging = parse_size(
-        raw.get("staging_size", max(1 << 30, 64 * ctx.page_size)),
-        f"{ctx.what}.staging_size",
+        raw.get("staging_size", default_staging), f"{ctx.what}.staging_size"
     )
     total = parse_size(raw.get("staging_max_bytes", staging), "staging_max_bytes")
     kept = parse_size(raw.get("quarantine_max", staging // 2), "quarantine_max")
     if staging < 2 * ctx.page_size or staging % ctx.page_size:
-        raise NodeConfigError("staging_size: need at least two whole pages")
+        raise NodeConfigError("staging_size: need two or more whole pages")
     if total < staging or not ctx.page_size <= kept <= staging:
         raise NodeConfigError(
             "need staging_max_bytes >= staging_size >= quarantine_max >= page_size"

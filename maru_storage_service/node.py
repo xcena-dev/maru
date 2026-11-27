@@ -64,8 +64,9 @@ class Node:
 
     def run(self) -> bool:
         """Serve until stop() (True), or until no run may follow (False):
-        another run claimed the node, or a teardown failed (``failed``). A
-        start that fails otherwise raises."""
+        another run claimed the node, or a teardown failed or did not end in
+        STOP_WAIT_S after stop() (``failed``). A start that fails otherwise
+        raises."""
         try:
             return self._run()
         finally:
@@ -110,7 +111,8 @@ class Node:
                     daemon=True,
                 ).start()
             if not self._finished(service):
-                return True
+                self.failed = f"it did not end within {STOP_WAIT_S:g} s"
+                return False
             if service.teardown_failed is not None:
                 self.failed = service.teardown_failed
                 logger.error("no new run: the teardown failed (%s)", self.failed)

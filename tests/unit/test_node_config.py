@@ -436,6 +436,15 @@ def test_remote_uses_worker_staging_and_no_local_pool():
     assert config.budgets.transfer_reserve_bytes == {}
 
 
+@pytest.mark.parametrize("page", [3 * M, 5 * M, 1536 << 10, 100000, 2 * M, 32 * M])
+def test_default_staging_is_whole_pages(page):
+    config = parse_node_config(edit(REMOTE_NODE, page_size=page))
+    check_servable(config)
+    staging = config.top.options["staging_size"]
+    floor = max(1 << 30, 64 * page)
+    assert staging % page == 0 and floor <= staging < floor + page
+
+
 @pytest.mark.parametrize(
     "page_mib,total_mib,worker_mib", [(3, 512, 510), (32, 512, 512), (64, 1024, 1024)]
 )

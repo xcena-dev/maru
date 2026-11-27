@@ -101,9 +101,16 @@ class RemoteControl:
             self.options["timeout_s"],
         )
         self.connection = conn
+        if hello.status != Status.OK:
+            conn.close()
+            why = hello.refusal or hello.error or "no reason given"
+            if hello.refusal == "page_size":
+                why += f" (this node's page_size is {run.config.page_size})"
+            raise ConnectionError(
+                f"memory node refused HELLO ({hello.status.value}): {why}"
+            )
         if (
-            hello.status != Status.OK
-            or hello.server_epoch != run.server.server_epoch
+            hello.server_epoch != run.server.server_epoch
             or not hello.node_id
             or not hello.node_epoch
             or MEMORY_CAPABILITY not in hello.capabilities
@@ -112,7 +119,7 @@ class RemoteControl:
             or any(p.pool_registration <= 0 for p in hello.pools)
         ):
             conn.close()
-            raise ConnectionError("memory node HELLO refused or incomplete")
+            raise ConnectionError("memory node HELLO incomplete")
         # Full agent metadata includes every registered pool.
         self.hint_actions = hello.hint_actions
         self.peers = [

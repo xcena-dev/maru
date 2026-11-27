@@ -172,6 +172,27 @@ def test_a_teardown_that_never_ends_does_not_hold_up_a_stop(monkeypatch):
     node.stop()
     thread.join(5)
     assert not thread.is_alive() and not run.wait_finished(0)
+    assert "did not end" in node.failed
+
+
+def test_a_teardown_that_never_ends_exits_failed(monkeypatch):
+    monkeypatch.setattr(node_module, "STOP_WAIT_S", 0.2)
+    run = FakeRun(finishes=False)
+    made = []
+
+    def make(c):
+        made.append(fake_node([run]))
+        return made[-1]
+
+    monkeypatch.setattr(service_module, "Node", make)
+
+    def stop():
+        wait_until(lambda: made and made[0].runs == 1, what="a run")
+        made[0].stop()
+
+    threading.Thread(target=stop, daemon=True).start()
+    assert serve(config()) == EXIT_FAILED
+    assert not run.wait_finished(0)
 
 
 def test_another_runs_claim_after_another_end_ends_the_node():

@@ -301,7 +301,8 @@ def test_locks_survive_unfinished_teardown(setup, monkeypatch):
         node.stop()
         assert entered.wait(10)
         thread.join(5)
-        assert result == [True] and not run.wait_finished(0)
+        assert result == [False] and not run.wait_finished(0)
+        assert "did not end" in node.failed
         locks(config)
         finish.set()
         assert run.wait_finished(10)

@@ -227,6 +227,35 @@ def store(pair, value=b"a" * PAGE):
     return writer
 
 
+def test_a_page_size_refusal_reaches_the_start_error(pair, capsys):
+    from maru_storage_service.cli import EXIT_START, serve
+
+    base = pair.config
+    options = base.top.options
+    other = parse_node_config(
+        {
+            "node_id": "gpu2",
+            "socket": f"{base.state_dir}/node2.sock",
+            "state_dir": base.state_dir,
+            "server": base.server,
+            "page_size": 2 * PAGE,
+            "tiers": [
+                {
+                    "store": "remote",
+                    "url": options["url"],
+                    "key_file": options["key_file"],
+                    "staging_size": 16 * PAGE,
+                    "quarantine_max": 2 * PAGE,
+                    "timeout_s": 0.5,
+                }
+            ],
+        }
+    )
+    assert serve(other) == EXIT_START
+    err = capsys.readouterr().err
+    assert "refused HELLO" in err and f"page_size is {2 * PAGE}" in err
+
+
 def test_worker_writer_commits_and_another_worker_reads_without_a_copy_cache(pair):
     writer = store(pair)
     reader = pair.client("reader", load_only=True)
