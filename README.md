@@ -39,7 +39,7 @@ See [Node StorageService](docs/source/design_doc/node_storage_service.md) for st
 
 ### System Components
 
-Node deployments use the processes in the table above. The quick start below describes `cxl`; it needs a Resource Manager, MaruServer and a CXL-attached client. For node-owned DRAM or remote storage, use the [node setup](docs/source/integration/vllm.md#node-backend).
+Follow the [Quick Start](docs/source/getting_started/quick_start.md) to share KV cache between two vLLM engines on one GPU node using DRAM. See [Deployments](docs/source/getting_started/deployments/index.md) for shared CXL and RDMA setups. The `cxl` example below uses a Resource Manager, MaruServer and a CXL-attached client.
 
 ### Prerequisites
 

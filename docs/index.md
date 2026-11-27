@@ -6,7 +6,7 @@ Maru stores reusable KV in a shared pool. With the `cxl` backend, CXL-attached n
 
 Node A stores the KV it computes in a shared KV cache, and nodes B and C load it instead of recomputing. The shared KV cache lives in either kind of pool: nodes use the `cxl` backend for a CXL memory pool and the node backend with a `remote` store for an RDMA memory pool, and each node shares KV with the other nodes that use the same pool through the same backend.
 
-On a single GPU node, engines can also share a node-owned DRAM or local CXL store. Choose a setup in {doc}`Quick Start <source/getting_started/quick_start>`. The example below shows a memory node backed by CXL.
+On a single GPU node, engines can also share a node-owned DRAM or local CXL store. Choose a setup in {doc}`Deployments <source/getting_started/deployments/index>`. The example below shows a memory node backed by CXL.
 
 :::{image} source/image/maru_shared_kv_cache.png
 :alt: Node A stores the KV of request 1 in a shared KV cache, and nodes B and C load that KV for requests 2 and 3. The shared KV cache holds a CXL memory pool, CXL memory behind a CXL switch, and an RDMA memory pool, CXL memory in memory pool nodes reached over an RDMA network
@@ -112,9 +112,10 @@ Maru (/mɑːruː/) — named after the *maru* (마루), the central open floor i
 
 ## Getting Started
 
-- {doc}`System Setup <source/getting_started/bios_setup>`
 - {doc}`Installation <source/getting_started/installation>`
-- {doc}`Quick Start <source/getting_started/quick_start>` — Shared CXL and node store setups
+- {doc}`Quick Start <source/getting_started/quick_start>` — Share KV cache between two vLLM engines on one GPU node
+- {doc}`Deployments <source/getting_started/deployments/index>` — Choose a setup for your nodes
+- {doc}`CXL System Setup <source/getting_started/bios_setup>`
 - {doc}`Examples <source/getting_started/examples/index>`
 - {doc}`Supported Models <source/integration/supported_models>` — Models Maru stores with vLLM, by KV cache structure
 - {doc}`Architecture Overview <source/design_doc/architecture_overview>`
@@ -124,9 +125,10 @@ Maru (/mɑːruː/) — named after the *maru* (마루), the central open floor i
 :caption: Getting Started
 :hidden:
 
-System Setup <source/getting_started/bios_setup>
 Installation <source/getting_started/installation>
 Quick Start <source/getting_started/quick_start>
+Deployments <source/getting_started/deployments/index>
+CXL System Setup <source/getting_started/bios_setup>
 Examples <source/getting_started/examples/index>
 ```
 

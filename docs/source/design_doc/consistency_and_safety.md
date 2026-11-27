@@ -46,7 +46,7 @@ CPU access to a shared payload can leave cached copies that other hosts do not i
 1. **Writer:** write the payload to `handle.buf`, call `flush_range(handle.buf)`, then `store()`.
 2. **Reader:** `retrieve()`, call `flush_range(result.view)` to drop local cached copies, then read `result.view`.
 
-The {doc}`../getting_started/quick_start_cxl` producer and consumer follow this pattern. The CPU-based `examples/basic/producer.py` and `consumer.py` are single-host examples and do not flush.
+The {doc}`../getting_started/deployments/shared_cxl` producer and consumer follow this pattern. The CPU-based `examples/basic/producer.py` and `consumer.py` are single-host examples and do not flush.
 
 For multi-node use, validate the deployed transfer path across repeated updates and memory reuse, including any CPU access performed by the runtime or driver.
 

@@ -7,7 +7,7 @@ With the `cxl` backend, vLLM engines on nodes attached to the same CXL memory ma
 | {ref}`Single node <quickstart-single-host>` | One x86 node with a CXL DEV_DAX device and two NVIDIA GPUs | Both on the same node |
 | {ref}`Multiple nodes <quickstart-multi-host>` | Two x86 nodes connected to shared CXL memory through a CXL switch/fabric, each with an NVIDIA GPU | Engine 1 on Node A, engine 2 on Node B |
 
-Complete {doc}`bios_setup`. On each GPU node, install vLLM 0.16 or later for deferred loading before installing Maru. See the {ref}`vLLM prerequisites <vllm-prerequisites>` and {doc}`installation`. Activate the Maru environment in each terminal. Install one Resource Manager on the node that owns the shared CXL pool. Both clients reach that Resource Manager on port `9850` and MaruServer (`maru-server --backend cxl`) on port `5555`.
+Complete {doc}`../bios_setup`. On each GPU node, install vLLM 0.16 or later for deferred loading before installing Maru. See the {ref}`vLLM prerequisites <vllm-prerequisites>` and {doc}`../installation`. Activate the Maru environment in each terminal. Install one Resource Manager on the node that owns the shared CXL pool. Both clients reach that Resource Manager on port `9850` and MaruServer (`maru-server --backend cxl`) on port `5555`.
 
 ## 1. Start the services
 
@@ -168,7 +168,7 @@ with MaruHandler(config) as handler:
     print("Success: read the producer's data from shared CXL memory")
 ```
 
-The consumer should print `Success: read the producer's data from shared CXL memory`. The `flush_range` calls make CPU writes and reads visible across nodes and are used in both setups. They require Maru's x86 cache-flush extension; if the import fails, see {ref}`verifying the installation <installation-verify>`. See {doc}`../design_doc/consistency_and_safety` for the write-back and invalidation pattern.
+The consumer should print `Success: read the producer's data from shared CXL memory`. The `flush_range` calls make CPU writes and reads visible across nodes and are used in both setups. They require Maru's x86 cache-flush extension; if the import fails, see {ref}`verifying the installation <installation-verify>`. See {doc}`../../design_doc/consistency_and_safety` for the write-back and invalidation pattern.
 
 Press Enter in the producer terminal after the consumer exits, then continue to {ref}`the vLLM engines <quickstart-cxl-engines>`.
 
@@ -261,9 +261,9 @@ Press Ctrl+C in the engine terminals, then stop MaruServer, then the Resource Ma
 
 ## Next steps
 
-- {doc}`examples/vllm/index` — More vLLM serving examples
-- {doc}`examples/dynamo/index` — Run Dynamo with Maru-backed vLLM workers
-- {doc}`examples/lmcache/index` — Use Maru as a shared KV cache backend for LMCache
-- {doc}`../design_doc/architecture_overview` — System architecture and component interactions
-- {doc}`../api_reference/api` — Python API
-- {doc}`../api_reference/config` — Configuration options
+- {doc}`../examples/vllm/index` — More vLLM serving examples
+- {doc}`../examples/dynamo/index` — Run Dynamo with Maru-backed vLLM workers
+- {doc}`../examples/lmcache/index` — Use Maru as a shared KV cache backend for LMCache
+- {doc}`../../design_doc/architecture_overview` — System architecture and component interactions
+- {doc}`../../api_reference/api` — Python API
+- {doc}`../../api_reference/config` — Configuration options

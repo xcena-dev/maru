@@ -264,7 +264,7 @@ For remote storage, start `maru-storage --role memory --config memory.json` on t
 
 Both node transfer defaults are `false`. Async scheduling automatically enables deferred loads; an explicit `maru_async_load=false` then requires `--no-async-scheduling`. TP > 1 or multiple KV groups require deferred loads. Store credit waits default to zero (`maru_credit_wait_ms`), and lookup timeout defaults to 100 ms (`maru_lookup_timeout_ms`). `maru_load_read_depth` defaults to 2 and must be at least 1.
 
-Remote keys become visible after memory-node COMMIT. Workers discard read copies after use. See {doc}`../getting_started/quick_start_node` for setup and {doc}`../design_doc/node_storage_service` for service configuration, capacity and recovery.
+Remote keys become visible after memory-node COMMIT. Workers discard read copies after use. See {doc}`../getting_started/deployments/memory_node` for setup and {doc}`../design_doc/node_storage_service` for service configuration, capacity and recovery.
 
 (vllm-node-support)=
 

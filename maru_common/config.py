@@ -5,15 +5,16 @@ from dataclasses import dataclass
 
 
 def reject_removed_backend(name: str, backend: str) -> None:
-    store = {
-        "cpu": "a dram store",
-        "mixed": "a dram or local_cxl store",
-        "remote_cxl": "a remote store",
+    replacement = {
+        "cpu": ("a dram store", "quick_start.md"),
+        "mixed": ("a dram or local_cxl store", "quick_start.md"),
+        "remote_cxl": ("a remote store", "deployments/memory_node.md"),
     }.get(backend)
-    if store:
+    if replacement:
+        store, guide = replacement
         raise ValueError(
             f"{name}={backend!r} was removed; use maru_node with {store} "
-            "(docs/source/getting_started/quick_start_node.md)"
+            f"(docs/source/getting_started/{guide})"
         )
 
 

@@ -1,6 +1,6 @@
 # Basic Examples
 
-Demonstrates the default `cxl` backend: write into a mapped CXL page, publish its key, and retrieve a memoryview of that page. Writing the initial payload still copies bytes. See the [Node Store quick start](../../docs/source/getting_started/quick_start_node.md) for node storage and worker RDMA.
+Demonstrates the default `cxl` backend: write into a mapped CXL page, publish its key, and retrieve a memoryview of that page. Writing the initial payload still copies bytes. See the [Quick Start](../../docs/source/getting_started/quick_start.md) for node-owned DRAM and [Memory Node over RDMA](../../docs/source/getting_started/deployments/memory_node.md) for remote storage.
 
 ## Prerequisites
 

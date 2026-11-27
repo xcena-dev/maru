@@ -1,4 +1,4 @@
-# System Setup
+# CXL System Setup
 
 CXL stores require memory exposed as **DEV_DAX** (`/dev/dax*`) on each host mapping the memory. Follow the platform vendor's instructions on CXL-attached workers and on memory nodes using `local_cxl`. GPU workers using remote storage and nodes using only DRAM need none of the CXL settings on this page.
 

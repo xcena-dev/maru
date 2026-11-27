@@ -6,7 +6,7 @@ This document describes how to build and install Maru.
 
 The node backend (selected by `maru_node`) uses one MaruServer (`maru-server --backend node`) and a GPU StorageService (`maru-storage --role gpu`) on each GPU node. A remote store adds a memory StorageService (`maru-storage --role memory`) that registers its pool for RDMA. A node that owns local CXL regions also runs a Resource Manager.
 
-The `cxl` backend uses MaruServer (`maru-server --backend cxl`), the Resource Manager and CXL-attached clients. LMCache and SGLang use this directly mapped backend. See {doc}`quick_start` to choose a backend and {doc}`../design_doc/node_storage_service` for node configuration.
+The `cxl` backend uses MaruServer (`maru-server --backend cxl`), the Resource Manager and CXL-attached clients. LMCache and SGLang use this directly mapped backend. See {doc}`deployments/index` to choose a setup and {doc}`../design_doc/node_storage_service` for node configuration.
 
 ## Prerequisites
 
@@ -56,6 +56,8 @@ source .venv/bin/activate
 > Pass `--python 3.12` explicitly so the interpreter matches the one your LLM engine (vLLM, SGLang) was built against. Without it, uv may pick any interpreter satisfying `requires-python >= 3.12`.
 
 Run `./install.sh` to install the Python package and the Resource Manager. Use `./install.sh --no-rm` for the Python package alone. A directly mapped `cxl` client needs DAX access and a connection to its Resource Manager.
+
+(node-store-requirements)=
 
 #### Node Store requirements
 
@@ -172,7 +174,7 @@ Verify that the Maru Python package is installed:
 python3 -c "import maru_shm; print('ok')"
 ```
 
-Verify the x86 cache-flush extension used by the {doc}`quick_start_cxl` producer and consumer. It is an optional build product, so the install succeeds without it when no C compiler is available:
+Verify the x86 cache-flush extension used by the {doc}`deployments/shared_cxl` producer and consumer. It is an optional build product, so the install succeeds without it when no C compiler is available:
 
 ```bash
 python3 -c "from maru_shm._cxl_flush import HAVE_CLFLUSH; print(HAVE_CLFLUSH)"
@@ -188,7 +190,7 @@ which maru-resource-manager
 
 Once the Resource Manager runs, `sudo maru-rm-ctl status` shows the devices it serves and why any other device is not served. See [`maru-rm-ctl`](../api_reference/maru_rm_ctl.md).
 
-Once installation is verified, choose a setup in {doc}`quick_start` to start services and verify KV sharing.
+After installation, follow the {doc}`quick_start` to share KV cache on one GPU node. See {doc}`deployments/index` for other setups.
 
 <br/>
 
@@ -240,4 +242,4 @@ sudo systemctl restart maru-resource-manager
 
 > **Security:** When binding to a non-loopback address, auth tokens and device paths are transmitted in plaintext. Use an encrypted tunnel (WireGuard, SSH tunnel, IPsec) in production.
 
-Follow the {ref}`multi-host quickstart <quickstart-multi-host>` to start the services and share data between a Python producer and consumer on two hosts.
+Follow the {ref}`multi-host Shared CXL setup <quickstart-multi-host>` to start the services and share data between a Python producer and consumer on two hosts.
