@@ -31,7 +31,7 @@ The command selects the role. JSON rejects `role`, unknown keys and duplicate ke
 | GPU service | Store `dram`, `local_cxl` or `remote` | `socket` (`/run/maru/node.sock`), `socket_group`, `local_pin` (only `false`) |
 | Memory service | Store `dram` or `local_cxl` | `remote_server`, `region_extension` |
 | `dram` | `size` | `hugepage` (`true`) |
-| `local_cxl` | `size` to serve | `region_size` (`1GiB`), `rm` (`127.0.0.1:9850`), `visibility` (`coherent` or `flush`) |
+| `local_cxl` | `size` to serve | `region_size` (`max(1GiB, ceil(size / 1024))`, rounded up to a multiple of `page_size`), `rm` (`127.0.0.1:9850`), `visibility` (`coherent` or `flush`) |
 | `remote` | One `url`, `key_file` | `rdma_device` (empty), `timeout_s` (`30`), `staging_size`, `staging_max_bytes`, `quarantine_max`, `write_hints` (`false`), `write_wait_ms` (`50`) |
 | `remote_server` | `listen`, `key_file` | `rdma_device`, `reserve_ttl_s` (`60`), `peer_quarantine_max`, `quarantine_max` |
 | `region_extension` | `name`; memory `local_cxl` only | `config` (empty), `generation_poll_s` (`0.1`), `generation_grace_s` (`2.0`), `hint_requests_max` (`4096`) |

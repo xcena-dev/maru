@@ -23,6 +23,7 @@ from typing import Protocol
 
 from maru_common.node_protocol import process_identity, process_start_time
 from maru_common.storage_types import (
+    MAX_BATCH,
     DaxMapping,
     PoolDescriptor,
     PoolInfo,
@@ -68,7 +69,7 @@ HOLDS_LOG_S = 30.0
 # Holder name of the StorageService's own holds (run_holder)
 OWN_HOLDER = "ss"
 DEFAULT_RM = "127.0.0.1:9850"
-DEFAULT_REGION_SIZE = 1 << 30
+DEFAULT_REGION_SIZE = 1 << 30  # Lower bound for the default.
 
 # Holds the node failed to drop, sent again until the RM confirms them; for
 # the process, so they outlive the run that queued them
@@ -124,9 +125,13 @@ def cxl_pool_id(rm_domain: str, region_id: int) -> str:
     return f"cxl:{rm_domain}:{region_id}"
 
 
+def _ceil_div(value: int, divisor: int) -> int:
+    return (value + divisor - 1) // divisor
+
+
 @dataclass
 class CxlRegionPool:
-    """One RM region as a pool. An L1Pool; workers map it by its handle."""
+    """One usable RM region is one pool in the run's NODE_OPEN list."""
 
     node_id: str
     rm_domain: str
@@ -302,20 +307,29 @@ class CxlTier(L1Tier, Leased):
         self.lease_s = claim.lease_s
         # A region on a device the RM does not serve now has no path, and one
         # smaller than a (new) page holds none: still the node's, not used
-        unusable = [
-            r
+        claimed_pools = [
+            self._pool(r, claimed=True)
             for r in claim.regions
-            if not r.dax_path or r.handle.length < self.page_size
+            if r.dax_path and r.handle.length >= self.page_size
         ]
+        claimed = len(claim.regions)
+        unusable = claimed - len(claimed_pools)
         if unusable:
             logger.warning(
                 "local_cxl tier: %d regions are on devices the RM does not serve now or "
                 "smaller than a page; kept, not used",
-                len(unusable),
+                unusable,
             )
-        self.pools = [
-            self._pool(r, claimed=True) for r in claim.regions if r not in unusable
-        ]
+        size, region_size = self.tier.size, self.tier.region_size
+        assert size is not None and region_size is not None
+        total = sum(p.capacity for p in claimed_pools)
+        additional = _ceil_div(max(0, size - total), region_size)
+        if claimed + additional > MAX_BATCH:
+            raise CxlTierError(
+                f"local_cxl: {claimed} claimed regions and {additional} more needed "
+                f"exceed the node limit of {MAX_BATCH}"
+            )
+        self.pools = claimed_pools
         with self._lock:
             for pool in self.pools:
                 held = self._earlier_holds(pool.region) - self._drop_ended_own(pool)
@@ -323,14 +337,11 @@ class CxlTier(L1Tier, Leased):
                     self._earlier[pool.pool_id] = held
         if self._earlier:
             self._check_node_holds()
-        total = sum(p.capacity for p in self.pools)
-        size = self.tier.size
-        assert size is not None and self.tier.region_size is not None
         while total < size and not stopped.is_set():
             sent = self._clock()
             try:
                 region = self.source.node_alloc(
-                    self.node_id, self.node_epoch, self.tier.region_size
+                    self.node_id, self.node_epoch, region_size
                 )
             except StaleNodeEpochError as e:
                 if not isinstance(e, NodeLeaseExpiredError):
@@ -663,13 +674,22 @@ def _make(tier: TierConfig, env: TierEnv) -> CxlTier:
 def _parse(raw: dict, ctx: TierContext) -> dict:
     what, size, page_size = ctx.what, ctx.size, ctx.page_size
     tier: dict = {}
-    region = parse_size(
-        raw.get("region_size", DEFAULT_REGION_SIZE), f"{what}.region_size"
-    )
-    if region < page_size or region % page_size:
-        raise NodeConfigError(
-            f"{what}.region_size: {region} must be a multiple of page_size {page_size}"
-        )
+    if "region_size" in raw:
+        region = parse_size(raw["region_size"], f"{what}.region_size")
+        if region < page_size or region % page_size:
+            raise NodeConfigError(
+                f"{what}.region_size: {region} must be a multiple of page_size {page_size}"
+            )
+        count = _ceil_div(size or 0, region)
+        if count > MAX_BATCH:
+            raise NodeConfigError(
+                f"{what}: size {raw['size']} with region_size {raw['region_size']} "
+                f"needs {count} regions (node limit {MAX_BATCH}). "
+                "Raise region_size or leave it unset."
+            )
+    else:
+        minimum = max(DEFAULT_REGION_SIZE, _ceil_div(size or 0, MAX_BATCH))
+        region = _ceil_div(minimum, page_size) * page_size
     if size is not None and size < region:
         raise NodeConfigError(
             f"{what}.size: {size} is smaller than region_size {region}"

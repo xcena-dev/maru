@@ -319,6 +319,33 @@ def test_sizes_and_visibility():
     )
 
 
+@pytest.mark.parametrize("raw,role", [(LOCAL_CXL_NODE, "gpu"), (MEMORY_NODE, "memory")])
+@pytest.mark.parametrize(
+    "size,page,expected",
+    [
+        ("1TiB", "32MiB", G),
+        ("2TiB", "32MiB", 2 * G),
+        (T + 1, "32MiB", G + 32 * M),
+        ("256GiB", "3MiB", 1026 * M),
+    ],
+)
+def test_check_shows_default_region_size(
+    tmp_path, capsys, raw, role, size, page, expected
+):
+    path = tmp_path / "node.json"
+    path.write_text(json.dumps(edit(with_tier(raw, 0, size=size), page_size=page)))
+    assert main(["--config", str(path), "--role", role, "--check"]) == 0
+    resolved = json.loads(capsys.readouterr().out)
+    assert resolved["tiers"][0]["region_size"] == expected
+    assert parse_node_config(resolved, role=role).top.region_size == expected
+
+
+@pytest.mark.parametrize("raw,role", [(LOCAL_CXL_NODE, "gpu"), (MEMORY_NODE, "memory")])
+def test_explicit_region_size_counts_the_last_partial_region(raw, role):
+    raw = with_tier(raw, 0, size=T + 1, region_size="1GiB")
+    rejects(raw, r"region_size 1GiB needs 1025 regions \(node limit 1024\)", role)
+
+
 def test_local_cxl_without_size_needs_explicit_budgets():
     raw = edit(LOCAL_CXL_NODE, tiers=[{"store": "local_cxl"}])
     rejects(raw, "credit_total_max_bytes: required")

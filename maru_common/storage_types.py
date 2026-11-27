@@ -177,7 +177,7 @@ class WaitLevel(StrEnum):
 @unique
 class NotifyKind(StrEnum):
     CREDIT_RETURN = "credit_return"
-    POOL_ADD = "pool_add"
+    POOL_ADD = "pool_add"  # Reserved. Nodes do not send it.
     POOL_REMOVE = "pool_remove"
 
 

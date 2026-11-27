@@ -9,7 +9,7 @@ import time
 
 import pytest
 
-from maru_common.storage_types import CloseMode, PoolKind, Visibility
+from maru_common.storage_types import MAX_BATCH, CloseMode, PoolKind, Visibility
 from maru_shm.types import (
     MaruHandle,
     NodeHostConflictError,
@@ -71,7 +71,8 @@ def test_a_first_claim_allocates_up_to_the_tier_size():
     assert sum(p.capacity for p in t.pools) == 4 * PAGE
 
 
-def test_a_new_run_takes_the_regions_back_and_tops_up():
+def test_a_new_run_takes_the_regions_back_and_tops_up_at_the_limit(monkeypatch):
+    monkeypatch.setattr("maru_storage_service.drivers.cxl.MAX_BATCH", 2)
     rm = FakeRm()
     rm.regions["n"] = [rm.region(2 * PAGE)]
     t = tier(rm, epoch="e2")
@@ -419,6 +420,32 @@ def cxl_only_config(
         },
         role=role,
     )
+
+
+@pytest.mark.parametrize(
+    "role,claimed,pages,additional",
+    [("gpu", MAX_BATCH - 1, MAX_BATCH + 8, 2), ("memory", MAX_BATCH + 1, 16, 0)],
+)
+def test_excess_claimed_regions_stop_startup_before_alloc(
+    fake, sockdir, role, claimed, pages, additional
+):
+    rm = FakeRm()
+    config = cxl_only_config(fake, sockdir, pages=pages, region_pages=8, role=role)
+    regions = [rm.region(PAGE) for _ in range(claimed)]
+    regions[0] = dataclasses.replace(regions[0], dax_path="")
+    rm.regions[config.node_id] = regions
+    rm.hold(regions[1], "ss@old", "old")
+
+    with pytest.raises(
+        CxlTierError,
+        match=rf"{claimed} claimed regions and {additional} more.*{MAX_BATCH}",
+    ):
+        start_node(config, region_source=rm)
+
+    assert rm.calls == ["claim"]
+    assert rm.released == rm.freed == rm.unholds == []
+    assert "ss@old" in rm.holds[regions[1].handle.region_id]
+    assert fake.log == []
 
 
 def test_a_cxl_only_node_gives_credit_from_its_regions(fake, sockdir):

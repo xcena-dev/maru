@@ -137,11 +137,13 @@ GPU-only keys are `socket` (default `/run/maru/node.sock`), `socket_group` (defa
 |---|---|---|
 | `dram.size` | Required | At least one page; capacity uses whole pages |
 | `dram.hugepage` | `true` | Huge pages must be available; `false` uses ordinary pages |
-| `local_cxl.size` | Required to serve | Target capacity, at least `region_size`. Usable capacity depends on the whole regions the Resource Manager grants. |
-| `local_cxl.region_size` | `1GiB` | A multiple of `page_size`, at least one page |
+| `local_cxl.size` | Required to serve | Store size limit, at least `region_size`. The service requests regions up to this size. Whole regions can take usable capacity above it. |
+| `local_cxl.region_size` | `max(1GiB, ceil(size / 1024))`, rounded up to a multiple of `page_size` | At least one page and a multiple of `page_size` |
 | `local_cxl.rm` | `127.0.0.1:9850` | Resource Manager address |
 | `local_cxl.visibility` | `coherent` | `coherent` or `flush` |
 | `high_watermark`, `low_watermark` | `0.9`, `0.8` | Memory nodes only; `0 < low < high <= 1` |
+
+Each usable `local_cxl` region is one pool. A node registers at most 1,024 pools. `NODE_OPEN` lists every pool in the current run. MaruServer uses this list to decide which pools from the previous run to adopt or remove.
 
 `remote` is GPU-only and accepts these keys in its tier object:
 
