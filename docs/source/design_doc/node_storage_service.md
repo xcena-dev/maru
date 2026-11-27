@@ -72,7 +72,11 @@ sequenceDiagram
     W->>W: GPU copy, then return the staging slot
 ```
 
-Unavailable keys, stale locations and lack of a staging slot produce a MISS and recomputation. The read path does not wait for capacity or retry a failed read. Synchronous loads use the same direct reader on the engine thread. Deferred loads use the loader thread.
+Unavailable keys, stale locations and failed READs produce a MISS and recomputation. The read path does not retry a failed read. A READ misses when it reaches the `timeout_s` of the GPU node's `remote` tier (30 s by default).
+
+Synchronous loads use the same direct reader on the engine thread. A synchronous load with no free staging slot misses at once. After its READ is posted, the engine step waits for that READ until it completes or reaches its deadline.
+
+Deferred loads run on the loader thread while vLLM keeps the request waiting. Before each batch, a deferred load that is short of staging slots waits for slots that older loads on the same thread hold. It waits for the oldest READ in flight, up to that READ's deadline, or for the GPU copies of the oldest parked batch. It then reads as many chunks as there are free slots. With no free slot, it misses and vLLM recomputes the request.
 
 (node-capacity-lifetimes)=
 
@@ -153,7 +157,7 @@ Each usable `local_cxl` region is one pool. A node registers at most 1,024 pools
 | `key_file` | Required | Shared deployment key readable by the service |
 | `rdma_device` | Empty | UCX chooses the NIC unless a device is specified |
 | `timeout_s` | `30` | Positive transfer/control timeout in seconds |
-| `staging_size` | `max(1GiB, 64 * page_size)` | Per worker; at least two whole pages and a multiple of `page_size` |
+| `staging_size` | `max(1GiB, 64 * page_size)`, rounded up to a multiple of `page_size` | Per worker; at least two whole pages and a multiple of `page_size` |
 | `staging_max_bytes` | `staging_size` | Node-wide admission cap; at least `staging_size` |
 | `quarantine_max` | Half of `staging_size` | Between one page and `staging_size` |
 | `write_hints` | `false` | Send supported advisory write actions during reservation |

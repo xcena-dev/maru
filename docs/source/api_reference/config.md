@@ -36,7 +36,7 @@ The command selects the role. JSON rejects `role`, unknown keys and duplicate ke
 | `remote_server` | `listen`, `key_file` | `rdma_device`, `reserve_ttl_s` (`60`), `peer_quarantine_max`, `quarantine_max` |
 | `region_extension` | `name`; memory `local_cxl` only | `config` (empty), `generation_poll_s` (`0.1`), `generation_grace_s` (`2.0`), `hint_requests_max` (`4096`) |
 
-`high_watermark` (`0.9`) and `low_watermark` (`0.8`) are memory-store options only. Remote `staging_size` defaults to `max(1GiB, 64 * page_size)` per worker; `staging_max_bytes` defaults to that same amount for the whole GPU node. Increase the total for simultaneous workers.
+`high_watermark` (`0.9`) and `low_watermark` (`0.8`) are memory-store options only. Remote `staging_size` defaults to `max(1GiB, 64 * page_size)`, rounded up to a multiple of `page_size`, per worker; `staging_max_bytes` defaults to that same amount for the whole GPU node. Increase the total for simultaneous workers.
 
 See {doc}`../design_doc/node_storage_service` for every store and budget validation rule, derived defaults and complete JSON examples. See {doc}`../design_doc/read_hints` for extension hooks and memory generations.
 
@@ -81,6 +81,7 @@ See {doc}`../design_doc/node_storage_service` for every store and budget validat
 | Page size and mapping | `maru_chunk_size`, `maru_pin_pools`, `maru_eager_map` |
 | Server, identity and backend | `maru_server_url`, `maru_node_id`, `maru_instance_id`, `maru_storage_backend` |
 | Remote credentials and write hints | `maru_remote_cxl_agent_key_file`, `maru_write_hints`, `maru_write_wait_ms` |
+| Remote staging and RDMA | `maru_rdma_device`, `maru_rdma_staging_size`, `maru_rdma_timeout_s` |
 
 Configure remote staging size, RDMA device and timeout on the GPU StorageService. ATTACH supplies the effective values to the worker.
 
