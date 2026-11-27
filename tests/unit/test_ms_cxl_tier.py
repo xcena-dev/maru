@@ -1074,7 +1074,20 @@ def holding_rm(monkeypatch):
     rm = HoldingRm(f"/proc/self/fd/{fd}")
     monkeypatch.setattr(pool_maps, "_rm_client", lambda address: rm)
     monkeypatch.setattr(pool_maps, "_HOLDS", pool_maps.RegionHolds())
+    created = []
+    init = pool_maps.PoolMaps.__init__
+
+    def tracked(self, *args, **kwargs):
+        init(self, *args, **kwargs)
+        created.append(self)
+
+    monkeypatch.setattr(pool_maps.PoolMaps, "__init__", tracked)
     yield rm
+    # Send this test's queued closes and unholds now: a late one would reach
+    # the next test's RM through the patched _rm_client
+    for maps in created:
+        assert maps.flush(5)
+    assert pool_maps._HOLDS.unholds.flush(5)
     os.close(fd)
 
 
