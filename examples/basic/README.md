@@ -1,6 +1,6 @@
 # Basic Examples
 
-Demonstrates the default `cxl` backend: write into a mapped CXL page, publish its key, and retrieve a memoryview of that page. Writing the initial payload still copies bytes. The `remote_cxl` backend instead uses host staging and RDMA; see the [remote CXL example](../vllm/remote_cxl/README.md).
+Demonstrates the default `cxl` backend: write into a mapped CXL page, publish its key, and retrieve a memoryview of that page. Writing the initial payload still copies bytes. See the [Quick Start](../../docs/source/getting_started/quick_start.md) for node-owned DRAM and [Memory Node over RDMA](../../docs/source/getting_started/deployments/memory_node.md) for remote storage.
 
 ## Prerequisites
 

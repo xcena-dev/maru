@@ -135,12 +135,16 @@ dt.sig > a.internal {
     float: right;                      /* move [source] to right side */
 }
 
-/* Sidebar: always expand Architecture Overview children */
+/* Sidebar: always expand Deployments and Architecture Overview children */
+.globaltoc li.toctree-l1:has(> a[href*="deployments/index"]) > ul,
+.globaltoc li.toctree-l1:has(ul > .toctree-l2 > a:is([href$="shared_cxl.html"], [href$="memory_node.html"])) > ul,
 .globaltoc li.toctree-l1:has(> a[href*="architecture_overview"]) > ul,
 .globaltoc li.toctree-l1:has(ul > .toctree-l2 > a[href*="maru_handler"]) > ul {
     display: block !important;
 }
 
+.globaltoc li.toctree-l1:has(> a[href*="deployments/index"]) > button,
+.globaltoc li.toctree-l1:has(ul > .toctree-l2 > a:is([href$="shared_cxl.html"], [href$="memory_node.html"])) > button,
 .globaltoc li.toctree-l1:has(> a[href*="architecture_overview"]) > button,
 .globaltoc li.toctree-l1:has(ul > .toctree-l2 > a[href*="maru_handler"]) > button {
     display: none !important;

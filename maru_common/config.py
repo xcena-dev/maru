@@ -1,14 +1,21 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 XCENA Inc.
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
-from maru_remote.region_map import MAX_WRITE_WAIT_MS
 
-from .storage_policy import validate_order
-
-#: Backends that send read hints and read promotes.
-_HINT_BACKENDS = frozenset({"remote_cxl", "cxl"})
+def reject_removed_backend(name: str, backend: str) -> None:
+    replacement = {
+        "cpu": ("a dram store", "quick_start.md"),
+        "mixed": ("a dram or local_cxl store", "quick_start.md"),
+        "remote_cxl": ("a remote store", "deployments/memory_node.md"),
+    }.get(backend)
+    if replacement:
+        store, guide = replacement
+        raise ValueError(
+            f"{name}={backend!r} was removed; use maru_node with {store} "
+            f"(docs/source/getting_started/{guide})"
+        )
 
 
 def _parse_env_bool(name: str) -> bool | None:
@@ -55,6 +62,9 @@ class MaruConfig:
     chunk_size_bytes: int = 1024 * 1024  # 1MB default
     auto_connect: bool = True
     timeout_ms: int = 2000  # Socket timeout in milliseconds
+    # Foreground PROBE and LOOKUP_AND_PIN timeout; keyword-only, so the
+    # positions of the fields after it stay as they were
+    lookup_timeout_ms: int = field(default=100, kw_only=True)
     use_async_rpc: bool = True  # Use async DEALER-ROUTER RPC (RpcAsyncClient)
     max_inflight: int = 64  # Max concurrent in-flight async requests (backpressure)
     eager_map: bool = True  # Pre-map all shared regions on connect
@@ -64,55 +74,34 @@ class MaruConfig:
     enable_stats: bool = False  # Enable handler-side stats reporting to server
     storage_backend: str = "cxl"
     metadata_only: bool = False
-    engine_id: str | None = None  # Shared by one scheduler and one CPU worker
+    engine_id: str | None = None  # Shared by one scheduler and its workers
     cache_namespace: str | None = None
-    node_id: str | None = None  # Defaults to hostname; used for CPU host budgets
     storage_schema: str = "opaque-bytes-v1"
-    cxl_pool_size: int | None = None  # Fixed CXL budget in mixed mode
-    write_order: tuple[str, ...] = ("cpu", "cxl")
-    read_order: tuple[str, ...] = ("cpu", "cxl")
-    # cpu and mixed: fault the pools in and register them with CUDA when they
-    # open, as the cxl backend's regions are; False keeps them pageable
-    pin_pools: bool = True
-    # Remote CXL storage: pool_size is the size of one region in a memory node's CXL;
-    # the session gets one more region whenever all of its regions are full
+    pin_pools: bool = True  # Register mapped node pools with CUDA
     rdma_device: str = ""  # RDMA NIC for NIXL/UCX, e.g. "mlx5_0:1"; empty = default
     rdma_staging_size: int | None = None  # Host staging buffer; None = derived
     rdma_timeout_s: float = 30.0  # Deadline of one RDMA batch
     # Share of staging slots that stores leave free for loads; set when loads
     # and stores run on separate threads (asynchronous transfers)
     rdma_load_reserve: float = 0.0
-    # alloc is called from a thread that must not wait (vLLM's engine thread):
-    # it takes only a staging slot, the store gives the remote page, and a
-    # background thread gets more room ahead of the stores
-    rdma_nonblocking_alloc: bool = False
-    # Key the remote CXL agents of the pool require (a copy of the memory node's
-    # /etc/maru/remote-cxl-agent.key, readable by the worker's user only)
-    remote_cxl_agent_key_file: str = "~/.maru/remote-cxl-agent.key"
-    # Send read hints (remote_cxl and cxl): before a load starts, the memory
-    # side hears which bytes it will read (maru_handler.hints).
-    # remote_cxl sends them to the remote CXL agents whose region extension
-    # takes them; cxl gives them to the handler plugins that take them
-    # (MaruHandlerPlugin.on_memory_hint). Advice; the data path is the same.
     read_hints: bool = False
-    # Send write hints (remote_cxl only): a store's pages are named to the
-    # remote CXL agents whose region extension takes them before its WRITEs,
-    # so memory that fills a written page from a slow tier can prepare it.
-    write_hints: bool = False
-    # With write hints, how long a store waits (ms) for an agent whose
-    # region extension takes ``write_wait`` to prepare its pages before it
-    # posts the WRITEs; the WRITEs go either way. 0: never wait.
-    write_wait_ms: int = 50
-    # Send read promotes (remote_cxl and cxl): when a load starts for a
-    # request another process hinted (a vLLM worker loads what its scheduler
-    # hinted), the memory side hears that this request is loading now (the
-    # same receivers as read hints).
     read_promotes: bool = False
-
-    @property
-    def server_urls(self) -> list[str]:
-        """MaruServer URLs; the remote_cxl backend uses one pool per URL."""
-        return [url.strip() for url in self.server_url.split(",") if url.strip()]
+    # UDS of this node's StorageService; set, the handler uses MaruClient
+    maru_node: str | None = None
+    # maru_node: how long store/batch_store wait for publication
+    store_timeout_s: float = 10.0
+    # maru_node: how long a step's stores wait in all for the credit the
+    # step asked for when it started (0: never)
+    credit_wait_s: float = 0.0
+    # maru_node: how long the first connect waits for the node to listen
+    node_connect_timeout_s: float = 30.0
+    # maru_node: this worker's data-parallel index and tensor-parallel rank
+    dp_index: int = 0
+    tp_rank: int = 0
+    # maru_node: a worker that never stores asks no credit
+    load_only: bool = False
+    # maru_node: objects this worker may store in one engine step (0: unknown)
+    step_objects: int = 0
 
     def __post_init__(self):
         """Generate instance_id if not provided. Validate config."""
@@ -134,64 +123,29 @@ class MaruConfig:
             raise ValueError(
                 f"chunk_size_bytes must be positive, got {self.chunk_size_bytes}"
             )
-        if self.storage_backend not in {"cpu", "cxl", "mixed", "remote_cxl"}:
-            raise ValueError(
-                "storage_backend must be 'cpu', 'cxl', 'mixed' or 'remote_cxl'"
-            )
-        if self.storage_backend == "mixed":
-            if (
-                type(self.cxl_pool_size) is not int
-                or self.cxl_pool_size <= 0
-                or (
-                    not self.metadata_only
-                    and self.cxl_pool_size < self.chunk_size_bytes
-                )
-            ):
-                raise ValueError(
-                    "mixed storage requires cxl_pool_size >= chunk_size_bytes"
-                )
-            if self.cxl_pool_size // self.chunk_size_bytes > 1_000_000:
-                raise ValueError("CXL pool supports at most 1000000 pages")
-            for name in ("write_order", "read_order"):
-                setattr(self, name, validate_order(getattr(self, name)))
-        elif self.cxl_pool_size is not None:
-            raise ValueError("cxl_pool_size is only supported by mixed storage")
-        if self.storage_backend in {"cpu", "mixed", "remote_cxl"}:
+        if type(self.lookup_timeout_ms) is not int or self.lookup_timeout_ms <= 0:
+            raise ValueError("lookup_timeout_ms must be a positive integer")
+        reject_removed_backend("storage_backend", self.storage_backend)
+        if self.storage_backend != "cxl":
+            raise ValueError("storage_backend must be 'cxl'")
+        if self.maru_node is not None:
+            if not isinstance(self.maru_node, str) or not self.maru_node:
+                raise ValueError("maru_node must be the path of the node socket")
             if not self.engine_id or not self.cache_namespace:
-                raise ValueError(
-                    "Storage sessions require engine_id and cache_namespace"
-                )
-            if self.expand_size is not None:
-                raise ValueError(
-                    "Remote CXL regions grow by pool_size; expand_size is unsupported"
-                    if self.storage_backend == "remote_cxl"
-                    else "CPU M1 uses a fixed pool; expand_size is unsupported"
-                )
-            if (
-                not self.metadata_only
-                and self.pool_size // self.chunk_size_bytes > 1_000_000
-            ):
-                raise ValueError("CPU pool supports at most 1000000 pages")
-        if self.read_hints and self.storage_backend not in _HINT_BACKENDS:
-            raise ValueError(
-                "read_hints is supported by the remote_cxl and cxl backends"
-            )
-        if self.write_hints and self.storage_backend != "remote_cxl":
-            raise ValueError("write_hints is supported by the remote_cxl backend")
-        if (
-            type(self.write_wait_ms) is not int
-            or not 0 <= self.write_wait_ms <= MAX_WRITE_WAIT_MS
-        ):
-            raise ValueError(
-                f"write_wait_ms must be an integer from 0 to {MAX_WRITE_WAIT_MS}"
-            )
-        if self.read_promotes and self.storage_backend not in _HINT_BACKENDS:
-            raise ValueError(
-                "read_promotes is supported by the remote_cxl and cxl backends"
-            )
-        if "," in self.server_url and self.storage_backend != "remote_cxl":
-            raise ValueError("Several MaruServer URLs require the remote_cxl backend")
-        if self.storage_backend == "remote_cxl":
+                raise ValueError("maru_node requires engine_id and cache_namespace")
+            for name in ("dp_index", "tp_rank", "step_objects"):
+                value = getattr(self, name)
+                if type(value) is not int or value < 0:
+                    raise ValueError(f"{name} must be an integer >= 0")
+            if not 0 < self.store_timeout_s < float("inf"):
+                raise ValueError("store_timeout_s must be a positive number")
+            if not 0 <= self.credit_wait_s < float("inf"):
+                raise ValueError("credit_wait_s must be a number >= 0")
+            if not 0 <= self.node_connect_timeout_s < float("inf"):
+                raise ValueError("node_connect_timeout_s must be a number >= 0")
+        if "," in self.server_url:
+            raise ValueError("server_url must name one MaruServer")
+        if self.maru_node:
             if self.rdma_timeout_s <= 0:
                 raise ValueError("rdma_timeout_s must be positive")
             if not 0 <= self.rdma_load_reserve < 1:
@@ -205,12 +159,16 @@ class MaruConfig:
             self.rdma_staging_size is not None
             or self.rdma_device
             or self.rdma_load_reserve
-            or self.rdma_nonblocking_alloc
         ):
-            raise ValueError("RDMA settings require the remote_cxl storage backend")
+            raise ValueError("RDMA settings require maru_node")
         if self.pool_size < 0:
             raise ValueError("pool_size must be nonnegative")
-        if not self.metadata_only and self.pool_size < self.chunk_size_bytes:
+        # maru_node: the StorageService sizes the pool
+        if (
+            not self.metadata_only
+            and self.maru_node is None
+            and self.pool_size < self.chunk_size_bytes
+        ):
             raise ValueError(
                 f"pool_size ({self.pool_size}) must be >= "
                 f"chunk_size_bytes ({self.chunk_size_bytes})"

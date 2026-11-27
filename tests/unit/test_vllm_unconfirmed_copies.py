@@ -36,15 +36,13 @@ from maru_vllm.connector import (
     _UnconfirmedCopyError,
 )
 from maru_vllm.trace import _GpuClock, _LoadTiming, _StepTiming
-from tests.unit.test_vllm_cpu_config import extra as cpu_extra
-from tests.unit.test_vllm_cpu_config import mixed_extra
-from tests.unit.test_vllm_remote_cxl_config import extra as remote_cxl_extra
 from tests.unit.vllm_connector_helpers import (
     cuda_error,
     holds,
     kept_by,
     make_flash_attn_metadata,
     make_worker,
+    node_extra,
 )
 
 BLOCK = 4
@@ -53,12 +51,7 @@ PROMPT = 16
 LAYER = "model.layers.0.self_attn"
 UNCONFIRMED = "could not be confirmed finished"
 
-BACKENDS = {
-    "cxl": dict,
-    "cpu": cpu_extra,
-    "mixed": mixed_extra,
-    "remote_cxl": remote_cxl_extra,
-}
+BACKENDS = {"cxl": dict, "node": node_extra}
 
 
 class Done:
@@ -278,7 +271,7 @@ def test_an_undrained_copy_into_reclaimed_blocks_stops_the_worker():
 
 def test_a_group_batch_wait_that_fails_once_stops_the_worker(monkeypatch):
     """A later wait that succeeds does not make the reads go back."""
-    worker = worker_of("cpu")
+    worker = worker_of("node")
     stream = FailsOnce()
     reads = views("a")
     monkeypatch.setattr(
@@ -542,7 +535,7 @@ def test_a_failed_group_placement_is_reported_only_once_drained(
         assert stopped(worker, "req r1")
 
 
-@pytest.mark.parametrize("backend", ["cpu", "remote_cxl"])
+@pytest.mark.parametrize("backend", ["node"])
 def test_a_group_batch_whose_copies_cannot_be_waited_for_keeps_its_reads(
     monkeypatch, backend
 ):
@@ -569,7 +562,7 @@ def test_a_failed_parked_group_load_is_recomputed_only_once_drained(
 ):
     """A load that failed before its copies, or whose copies ended, is a plain
     recompute; one whose copies cannot be waited for stops the worker."""
-    worker = worker_of("cpu")
+    worker = worker_of("node")
     monkeypatch.setattr(torch.cuda, "set_device", lambda device: None)
     monkeypatch.setattr(torch.cuda, "stream", lambda s: contextlib.nullcontext())
     worker._deferred_stream = Done() if drained else FailedWait()
@@ -588,66 +581,8 @@ def test_a_failed_parked_group_load_is_recomputed_only_once_drained(
 
 
 # =============================================================================
-# Load copies on the current stream: cpu and mixed without a kernel
+# Load copies and retained node reads
 # =============================================================================
-
-
-def session_worker(backend: str):
-    """A cpu or mixed worker whose one-layer cache takes real injects."""
-    worker = make_worker(BLOCK, CHUNK, BACKENDS[backend](), num_kv_heads=1, head_size=1)
-    cache = torch.full((8, 2, 4, 1, 1), -1.0)
-    worker._kv_layout = worker._resolve_kv_layout({"layer": cache})
-    worker._handler = MagicMock()
-    worker._handler.storage_gpu_accessible.return_value = False
-    slab = torch.arange(16, dtype=torch.float32).reshape(2, 1, 8, 1)
-    worker._batch_retrieve_all = lambda keys, **route: [
-        SimpleNamespace(view=bytearray(slab.numpy().tobytes())) for _ in keys
-    ]
-    context = SimpleNamespace(
-        no_compile_layers={LAYER: SimpleNamespace(kv_cache=cache)},
-        attn_metadata=make_flash_attn_metadata(),
-    )
-    return worker, context
-
-
-def failing_inject(worker, error, at: int):
-    """Make the ``at``-th inject raise ``error``; returns the load's refs."""
-    inject = worker._inject_kv_into_layer
-    calls, seen = [], {}
-
-    def maybe_fail(*args, **kwargs):
-        calls.append(1)
-        if len(calls) == at:
-            raise error
-        return inject(*args, **kwargs)
-
-    worker._inject_kv_into_layer = maybe_fail
-    copy = worker._inject_slab_layers
-
-    def note_refs(*args, **kwargs):
-        seen["refs"] = kwargs.get("refs")
-        return copy(*args, **kwargs)
-
-    worker._inject_slab_layers = note_refs
-    return calls, seen
-
-
-@pytest.mark.parametrize("backend", ["cpu", "mixed"])
-def test_a_current_stream_inject_cuda_error_stops_the_worker(backend):
-    """Nothing waits for the injects queued on the current stream: the leases,
-    the slot mapping and the device slab in use are kept, and the load is not
-    reported."""
-    worker, context = session_worker(backend)
-    calls, seen = failing_inject(worker, cuda_error(), at=2)
-    meta = load_meta(block_ids=[3, 1, 5, 7])
-    with pytest.raises(_UnconfirmedCopyError, match="req r1"):
-        worker.start_load_kv(context, MaruConnectorMetadata(requests=[meta]))
-    assert len(calls) == 2
-    worker._handler.release_retrieved.assert_not_called()
-    assert not worker._failed_load_blocks
-    refs = seen["refs"]
-    assert holds(worker, refs[-1]) and holds(worker, refs[-2])  # slab, slots
-    assert stopped(worker, "req r1")
 
 
 @pytest.mark.parametrize("pinned", [True, False], ids=["pinned", "staged"])
@@ -752,31 +687,6 @@ def test_an_inline_layerwise_step_logs_only_the_loads_it_took(caplog):
     assert len(loaded) == 1 and loaded[0].endswith("for req r1")
 
 
-@pytest.mark.parametrize("backend", ["cpu", "mixed"])
-@pytest.mark.parametrize("failure", ["short slab", "oom", "layout", "shape"])
-def test_a_load_failing_without_a_cuda_error_is_recomputed(backend, failure):
-    """As on main: a slab too short to view, out of memory or a rejected
-    layout in the first copy call, or a copy whose shapes differ, recompute
-    the request and give its leases back."""
-    worker, context = session_worker(backend)
-    if failure == "short slab":
-        worker._batch_retrieve_all = lambda keys, **route: [
-            SimpleNamespace(view=bytearray(12)) for _ in keys
-        ]
-    else:
-        error = {
-            "oom": torch.OutOfMemoryError("CUDA out of memory"),
-            "layout": RuntimeError("Maru: cannot inject KV for layout (8, 2)"),
-            "shape": RuntimeError("The size of tensor a (2) must match (3)"),
-        }[failure]
-        failing_inject(worker, error, at=1)
-    meta = load_meta(block_ids=[3, 1, 5, 7])
-    worker.start_load_kv(context, MaruConnectorMetadata(requests=[meta]))
-    assert worker.take_failed_load_blocks() == {3, 1, 5, 7}
-    assert worker._handler.release_retrieved.call_count == 1
-    assert worker._stopped is None
-
-
 @pytest.mark.parametrize("error", ["cuda", "other"])
 def test_an_inline_layerwise_inject_error_stops_only_on_a_cuda_error(error):
     worker = worker_of("cxl")
@@ -797,7 +707,7 @@ def test_an_inline_layerwise_inject_error_stops_only_on_a_cuda_error(error):
     assert stopped(worker, "req r1")
 
 
-@pytest.mark.parametrize("backend", ["cpu", "mixed"])
+@pytest.mark.parametrize("backend", ["node"])
 def test_session_reads_of_an_unconfirmed_load_are_kept(backend):
     worker = worker_of(backend)
     worker._batch_retrieve_all = lambda keys, **route: views(keys)
@@ -806,7 +716,9 @@ def test_session_reads_of_an_unconfirmed_load_are_kept(backend):
         worker._stop_if_unconfirmed(cuda_error(), prepared, req_id="r1")
         raise _UnconfirmedCopyError(worker._stopped)
 
-    worker._load_packed = unconfirmed
+    worker._load_leased_request = lambda layers, meta, attn: unconfirmed(
+        layers, [(meta, 1, None, views("a"))], attn
+    )
     with pytest.raises(_UnconfirmedCopyError, match="req r1"):
         worker.start_load_kv(forward(), MaruConnectorMetadata(requests=[load_meta()]))
     worker._handler.release_retrieved.assert_not_called()
@@ -900,7 +812,7 @@ def test_a_layer_copy_that_raises_keeps_its_device_tensor(monkeypatch, layout):
 # =============================================================================
 
 
-@pytest.mark.parametrize("backend", ["cxl", "cpu", "mixed"])
+@pytest.mark.parametrize("backend", ["cxl"])
 def test_a_stop_leaves_the_later_loads_of_the_step_unread(backend):
     """Another load stops the worker while this step reads r1's chunks."""
     worker = worker_of(backend)
@@ -922,7 +834,7 @@ def test_a_stop_leaves_the_later_loads_of_the_step_unread(backend):
 
 
 def test_a_stop_leaves_the_later_leased_loads_of_the_step_unread():
-    worker = worker_of("remote_cxl")
+    worker = worker_of("node")
     calls = []
     worker._load_leased_request = stop_at_r1(worker, calls)
     with pytest.raises(_UnconfirmedCopyError, match="req r1"):
@@ -930,7 +842,7 @@ def test_a_stop_leaves_the_later_leased_loads_of_the_step_unread():
     assert calls == ["r1"]
 
 
-@pytest.mark.parametrize("backend", ["cxl", "cpu", "remote_cxl"])
+@pytest.mark.parametrize("backend", ["cxl"])
 def test_a_stop_leaves_the_later_group_loads_of_the_step_unread(backend):
     worker = worker_of(backend)
     worker._group_caches = [SimpleNamespace(tensors=[torch.zeros(1)])]
@@ -944,7 +856,7 @@ def test_a_stop_leaves_the_later_group_loads_of_the_step_unread(backend):
     assert stopped(worker, "req r1")
 
 
-@pytest.mark.parametrize("backend", ["cxl", "cpu", "remote_cxl"])
+@pytest.mark.parametrize("backend", ["cxl"])
 def test_a_queued_load_job_reads_nothing_once_the_worker_stopped(backend):
     worker = worker_of(backend)
     worker._stop_if_unconfirmed(cuda_error(), req_id="r0")
@@ -967,7 +879,7 @@ def test_a_queued_load_job_reads_nothing_once_the_worker_stopped(backend):
 
 
 def test_a_stopped_leased_load_sends_no_read_promote():
-    worker = worker_of("remote_cxl")
+    worker = worker_of("node")
     worker._stop_if_unconfirmed(cuda_error(), req_id="r0")
     worker._batch_retrieve_all = MagicMock()
     worker._load_leased_request([(LAYER, None, 0)], load_meta(), None)
@@ -975,7 +887,7 @@ def test_a_stopped_leased_load_sends_no_read_promote():
     worker._batch_retrieve_all.assert_not_called()
 
 
-@pytest.mark.parametrize("backend", ["cpu", "remote_cxl"])
+@pytest.mark.parametrize("backend", ["node"])
 def test_a_group_load_stopped_during_retrieve_keeps_without_placing(
     monkeypatch, backend
 ):

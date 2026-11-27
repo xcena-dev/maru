@@ -14,7 +14,7 @@ from types import ModuleType, SimpleNamespace
 
 import pytest
 
-from maru_handler.storage.remote_cxl.datapath import _default_transport
+from maru_handler.client.worker_rdma import _transport
 from maru_remote import native_agent
 from maru_remote.native_agent import NativeNixlAgent
 from maru_remote.transport import NixlTransport, TransferTimeout, TransferUncertainError
@@ -215,7 +215,7 @@ def test_importing_adapter_does_not_import_nixl_or_torch():
 
 
 def test_worker_factory_enables_event_progress_without_replacing_an_agent(bindings):
-    transport = _default_transport(SimpleNamespace(rdma_device="nic:1"))("worker")
+    transport = _transport(SimpleNamespace(rdma_device="nic:1"), "worker")
     native = NativeAgent.instances[-1]
     assert native.config.useProgThread is True
     assert native.config.pthrDelay == 1000
@@ -227,7 +227,7 @@ def test_worker_factory_enables_event_progress_without_replacing_an_agent(bindin
 
 
 def test_worker_factory_creates_ucx_even_with_default_device(bindings):
-    transport = _default_transport(SimpleNamespace(rdma_device=""))("worker")
+    transport = _transport(SimpleNamespace(rdma_device=""), "worker")
     assert NativeAgent.instances[-1].calls == [("create", "UCX", {})]
     transport.close()
 

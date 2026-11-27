@@ -1,28 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
-"""A bounded, process-local CPU pool and explicit read-buffer ownership.
-
-``page_lock`` faults the pool in and registers it with CUDA, as DaxMapper does
-for CXL regions; the storage client does so when it opens the pool. GPU copies
-then run at the DMA rate instead of being staged through the driver's own
-pinned buffers, and a store no longer faults in fresh pages. Registration is
-best effort. A pool that fails it stays pageable, and copies check each slab's
-pin status. The pool never hands a host pointer to the direct-access CUDA
-kernels. Eviction is a later capability, not an assumption of this allocator.
-"""
+"""Mapped node pools and explicit read-buffer ownership."""
 
 import ctypes
 import errno
 import logging
 import mmap
 import time
-import uuid
-from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from threading import RLock
 
-from maru_common.storage_types import CpuLocation
+from maru_common.storage_types import StorageLocation
 
 logger = logging.getLogger(__name__)
 
@@ -83,17 +72,6 @@ def _available_memory() -> int | None:
 
 
 @dataclass(eq=False)
-class CpuAllocation:
-    buf: memoryview
-    location: CpuLocation
-    state: str = "writing"
-
-    @property
-    def size(self) -> int:
-        return self.location.length
-
-
-@dataclass(eq=False)
 class CpuReadLease:
     """Keep the pool alive until the caller's final read/copy completes.
 
@@ -102,7 +80,7 @@ class CpuReadLease:
     """
 
     view: memoryview
-    location: CpuLocation
+    location: StorageLocation
     _release: Callable[[], None]
     _released: bool = False
 
@@ -128,25 +106,27 @@ class CpuPool:
         *,
         medium: str = "cpu",
         mapping: mmap.mmap | None = None,
+        shared: bool = False,
     ):
         if capacity < page_size or page_size <= 0 or capacity % page_size:
             raise ValueError(
                 "CPU pool capacity must be a positive multiple of page size"
             )
         self.pool_id = pool_id
+        # A mapping other processes write too (a node's memfd pool)
+        self._shared = shared
         self.capacity = capacity
         self.page_size = page_size
         self.medium = medium
         if mapping is not None and len(mapping) < capacity:
             raise ValueError("Mapped region is smaller than the pool capacity")
         self._mapping = mapping if mapping is not None else mmap.mmap(-1, capacity)
-        self._free = deque(range(capacity // page_size))
-        self._generation = 0
-        self._allocations: dict[str, CpuAllocation] = {}
         self._lock = RLock()
         self._closed = False
-        # Whether the pool is registered with CUDA (see page_lock)
+        # Whether the pool is registered with CUDA (see page_lock), and whether
+        # unregistering it failed
         self.cuda_registered = False
+        self.unlock_failed = False
         self._cuda_address = 0
 
     def page_lock(self, keepalive: Callable[[], None] | None = None) -> None:
@@ -162,8 +142,8 @@ class CpuPool:
 
         Args:
             keepalive: Called after each prefault step and after the
-                registration, so that a storage session outlives the
-                page-lock (about 15 s for 72 GiB).
+                registration, to keep the connection alive while
+                the pool is registered.
         """
         if self.cuda_registered:
             return
@@ -185,8 +165,7 @@ class CpuPool:
                 logger.warning(
                     "The %s (%d MiB) is larger than the memory available "
                     "(%d MiB), so it stays pageable: page-locking commits the "
-                    "whole pool at once. Lower its size, or set "
-                    "maru_pin_pools=false",
+                    "whole pool at once. Lower its size",
                     name,
                     self.capacity >> 20,
                     available >> 20,
@@ -270,7 +249,12 @@ class CpuPool:
                         )
                         return False
                     populate = False
-            if not populate:
+            if not populate and self._shared:
+                # Another process may write a byte between our read and write
+                # back; the pages are allocated already, so reads suffice
+                for page in range(offset, end, _PAGE_SIZE):
+                    self._mapping[page]
+            elif not populate:
                 # Kernels before 5.14. Writing each page's first byte back
                 # faults it in writable without changing what it holds; a
                 # read would map the shared zero page of an anonymous pool.
@@ -281,7 +265,8 @@ class CpuPool:
         return True
 
     def _page_unlock(self) -> None:
-        """Unregister the pool from CUDA, before its mapping is closed."""
+        """Unregister the pool from CUDA, before its mapping is closed. A
+        failure is kept in ``unlock_failed``: the GPU may still reach it."""
         if not self.cuda_registered:
             return
         self.cuda_registered = False
@@ -293,6 +278,7 @@ class CpuPool:
             rc = _cuda_rc(torch.cuda.cudart().cudaHostUnregister(self._cuda_address))
             if rc != 0:
                 _clear_cuda_sticky_error()
+                self.unlock_failed = True
                 logger.warning(
                     "cudaHostUnregister failed for the %s pool %s: rc=%d",
                     self.medium.upper(),
@@ -300,6 +286,7 @@ class CpuPool:
                     rc,
                 )
         except (ImportError, RuntimeError, OSError) as exc:
+            self.unlock_failed = True
             logger.warning(
                 "cudaHostUnregister failed for the %s pool %s: %s",
                 self.medium.upper(),
@@ -307,80 +294,14 @@ class CpuPool:
                 exc,
             )
 
-    def alloc(self, size: int) -> CpuAllocation:
-        with self._lock:
-            if self._closed:
-                raise RuntimeError("CPU pool is closed")
-            if type(size) is not int or not 0 < size <= self.page_size:
-                raise ValueError("CPU allocation must fit in one page")
-            if not self._free:
-                raise MemoryError(
-                    f"{self.medium.upper()} cache is full; skipping new cache admission"
-                )
-            page = self._free.popleft()
-            self._generation += 1
-            offset = page * self.page_size
-            location = CpuLocation(
-                self.pool_id,
-                uuid.uuid4().hex,
-                self._generation,
-                offset,
-                size,
-                self.medium,
-            )
-            handle = CpuAllocation(
-                memoryview(self._mapping)[offset : offset + size], location
-            )
-            self._allocations[location.allocation_id] = handle
-            return handle
-
-    def validate(self, handle: CpuAllocation) -> None:
-        if (
-            not isinstance(handle, CpuAllocation)
-            or self._allocations.get(handle.location.allocation_id) is not handle
-        ):
-            raise ValueError("Allocation does not belong to this CPU pool")
-
-    def free(self, handle: CpuAllocation) -> None:
-        with self._lock:
-            self.validate(handle)
-            if handle.state != "writing":
-                # Ownership was transferred to commit. In particular a lost
-                # reply must never cause the connector's cleanup to reuse it.
-                return
-            handle.buf.release()
-            handle.state = "freed"
-            del self._allocations[handle.location.allocation_id]
-            self._free.append(handle.location.offset // self.page_size)
-
-    def resolve(self, location: CpuLocation) -> memoryview:
-        with self._lock:
-            handle = self._allocations.get(location.allocation_id)
-            if self._closed or handle is None or handle.location != location:
-                raise ValueError("Stale or foreign CPU location")
-            if handle.state != "ready":
-                raise ValueError("CPU allocation is not ready")
-            return handle.buf[:]
-
-    def usage(self) -> dict:
-        with self._lock:
-            return {
-                "allocated_bytes": len(self._allocations) * self.page_size,
-                "quarantined_bytes": sum(
-                    h.state == "quarantined" for h in self._allocations.values()
-                )
-                * self.page_size,
-            }
+    def view(self, offset: int, length: int) -> memoryview:
+        """Bytes of the mapping at ``offset``; the caller releases the view."""
+        return memoryview(self._mapping)[offset : offset + length]
 
     def close(self) -> None:
         with self._lock:
             if not self._closed:
                 self._closed = True
-                for handle in self._allocations.values():
-                    handle.buf.release()
-                    handle.state = "closed"
-                self._allocations.clear()
-                self._free.clear()
             self._page_unlock()
             try:
                 self._mapping.close()

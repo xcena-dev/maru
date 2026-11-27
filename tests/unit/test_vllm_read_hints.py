@@ -12,7 +12,7 @@ pytest.importorskip("vllm")
 
 import maru
 from maru_vllm.connector import _chunk_keys, _create_maru_handler
-from tests.unit.test_vllm_remote_cxl_config import extra
+from tests.unit.test_vllm_node import node_extra as extra
 from tests.unit.vllm_connector_helpers import make_scheduler
 
 
@@ -71,7 +71,7 @@ def test_the_first_hit_hints_the_keys_the_load_reads_once():
     (hint,) = sched._handler.hints
     # Computed tokens 0-7 are chunk 0: the load reads chunks 1-4, from the
     # pool of the request's first chunk key, where the load goes too.
-    assert hint == ("r1", keys[1:5], keys[0])
+    assert hint == ("r1", keys[1:5], None)
     sched.request_finished(request, [])
     _drain(sched)
     assert sched._handler.ends == ["r1"]
@@ -94,7 +94,7 @@ def test_an_arrival_hint_is_sent_off_the_caller_and_never_after_the_end():
         assert time.monotonic() < deadline
         time.sleep(0.01)
     keys = _chunk_keys(request.prompt_token_ids, 8)
-    assert sched._handler.hints == [("r1", keys, keys[0])]
+    assert sched._handler.hints == [("r1", keys, None)]
     sched.get_num_new_matched_tokens(request, 0)
     _drain(sched)
     assert len(sched._handler.hints) == 1  # the first hit finds it hinted
@@ -114,36 +114,19 @@ def test_only_the_scheduler_sends_read_hints(monkeypatch):
         def __init__(self, config):
             seen.append(config)
 
-        def connect(self):
+        def connect(self, **kwargs):
             return True
 
     monkeypatch.setattr(maru, "MaruHandler", Recorder)
-    config = extra(
-        maru_remote_cxl_agent_key_file="/k", maru_read_hints=True, maru_async_load=True
-    )
+    config = extra(maru_read_hints=True, maru_async_load=True)
     _create_maru_handler(config, metadata_only=True)
     _create_maru_handler(config, metadata_only=False)
-    # The scheduler hints each load before its worker reads it; the worker
-    # hints its stores, as read hints are on.
     assert [c.read_hints for c in seen] == [True, False]
-    assert [c.write_hints for c in seen] == [False, True]
-    # The worker promotes each load its scheduler hinted as it starts.
+    assert all(not hasattr(c, "write_hints") for c in seen)
     assert [c.read_promotes for c in seen] == [False, True]
-    assert seen[1].write_wait_ms == 50
     seen.clear()
-    _create_maru_handler({**config, "maru_write_wait_ms": 0}, metadata_only=False)
-    assert seen[0].write_wait_ms == 0
-    seen.clear()
-    # Without asynchronous loads the scheduler hints nothing to promote.
     _create_maru_handler({**config, "maru_async_load": False}, metadata_only=False)
     assert not seen[0].read_promotes
-    seen.clear()
-    _create_maru_handler({**config, "maru_write_hints": False}, metadata_only=False)
-    _create_maru_handler(
-        {**extra(maru_remote_cxl_agent_key_file="/k"), "maru_write_hints": True},
-        metadata_only=False,
-    )
-    assert [c.write_hints for c in seen] == [False, True]
 
 
 def test_a_hint_ends_when_its_load_is_done_and_only_once():
@@ -321,12 +304,12 @@ def test_the_cxl_backend_takes_read_hints_and_no_write_hints(monkeypatch):
     _create_maru_handler(config, metadata_only=True)
     _create_maru_handler(config, metadata_only=False)
     # Its hints go to handler plugins: the scheduler hints, the worker
-    # promotes; write hints stay with remote_cxl.
+    # promotes. Write hints belong in the node config.
     assert [c.read_hints for c in seen] == [True, False]
     assert [c.read_promotes for c in seen] == [False, True]
-    assert [c.write_hints for c in seen] == [False, False]
+    assert all(not hasattr(c, "write_hints") for c in seen)
     for knob in ("maru_write_hints", "maru_rdma_device"):
-        with pytest.raises(ValueError, match="remote_cxl"):
+        with pytest.raises(ValueError, match="were removed"):
             _validate_storage_config({**config, knob: True})
 
 
@@ -516,8 +499,8 @@ def test_the_scheduler_names_layers_as_the_workers_do():
     assert _scheduler_layer_indices([], None) == []
 
 
-@pytest.mark.parametrize("cpu_mode", [False, True], ids=["cxl", "storage-session"])
-def test_a_group_load_promotes_its_request_before_its_first_read(cpu_mode):
+@pytest.mark.parametrize("node_mode", [False, True], ids=["cxl", "node"])
+def test_a_group_load_promotes_its_request_before_its_first_read(node_mode):
     """Several KV cache groups load in _group_load_job; it promotes the
     hinted request before it reads, as the one-group load does."""
     import threading
@@ -526,11 +509,10 @@ def test_a_group_load_promotes_its_request_before_its_first_read(cpu_mode):
 
     worker = object.__new__(MaruWorkerConnector)
     calls = []
-    worker._cpu_mode = cpu_mode
+    worker._node_mode = node_mode
     worker._handler = SimpleNamespace(
         promote_read=lambda rid, **route: calls.append(("promote", rid, route))
     )
-    worker._route = lambda meta: {"route_key": "k0"} if cpu_mode else {}
     worker._retrieve_group_objects = lambda meta: calls.append(("read",))
     worker._load_group_leased = lambda *a, **k: calls.append(("read",))
     worker._fail_load = lambda meta, exc: calls.append(("failed",))
@@ -539,8 +521,7 @@ def test_a_group_load_promotes_its_request_before_its_first_read(cpu_mode):
     worker._inflight_deferred_req_ids = set()
     worker._abandoned_req_ids = set()
     meta = SimpleNamespace(req_id="r1")
-    # The storage-session path goes on to CUDA, which this test has none of.
+    # The node path goes on to CUDA, which this test has none of.
     worker._group_load_job(meta, None, None)
-    route = {"route_key": "k0"} if cpu_mode else {}
-    assert calls[0] == ("promote", "r1", route)
+    assert calls[0] == ("promote", "r1", {})
     assert calls[1] in {("read",), ("failed",)}

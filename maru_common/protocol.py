@@ -14,9 +14,28 @@ See docs/protocol.md for full specification.
 
 import struct
 from dataclasses import dataclass, field
-from enum import IntEnum, IntFlag
+from enum import IntEnum, IntFlag, unique
 
 from maru_shm.types import MaruHandle
+
+from .storage_types import (
+    AccessHints,
+    BlockRequest,
+    CloseMode,
+    ExitCause,
+    ItemOutcome,
+    Key,
+    KeyLocation,
+    Location,
+    OpRef,
+    OrphanWorker,
+    PoolInfo,
+    PoolUsage,
+    RmDomain,
+    SessionRole,
+    Status,
+    WorkerRef,
+)
 
 # =============================================================================
 # Protocol Constants
@@ -34,6 +53,7 @@ HEADER_FORMAT = "!HBBBBBBII"  # network byte order, big-endian
 # =============================================================================
 
 
+@unique
 class MessageType(IntEnum):
     """Message type codes for the protocol."""
 
@@ -57,8 +77,29 @@ class MessageType(IntEnum):
     BATCH_PIN_KV = 0x23
     BATCH_UNPIN_KV = 0x24
 
-    # Opt-in storage directory, independent of legacy CXL key semantics.
-    STORAGE = 0x30
+    # 0x30 reserved: removed storage-session protocol
+
+    # Multi-storage (0x40 - 0x5F)
+    NODE_OPEN = 0x40
+    NODE_HEARTBEAT = 0x41
+    NODE_CLOSE = 0x42
+    NODE_RECOVER_LIST = 0x44
+    WORKER_EXIT = 0x45
+    ADMIN_DELETE = 0x46
+    NODE_ORPHANS = 0x47
+    WORKER_OPEN = 0x48
+    WORKER_HEARTBEAT = 0x49
+    WORKER_CLOSE = 0x4A
+    PROBE = 0x50
+    LOOKUP_AND_PIN = 0x51
+    UNPIN = 0x52
+    # 0x53: reserved; never reuse
+    COMMIT = 0x58
+    RETIRE = 0x59
+    # 0x5B: reserved; never reuse
+    # 0x5A: reserved (FINALIZE_MOVE)
+    # 0x43, 0x5C, 0x5E, 0x5F: retired (NODE_REREGISTER, RELEASE_FINALIZER,
+    # REGION_REQUEST, REGION_RETURN); never reuse them
 
     # Admin (0xF0 - 0xFF)
     GET_STATS = 0xF0
@@ -452,8 +493,6 @@ class GetStatsResponse:
     # Shared CXL device capacity {"total_size", "free_size"} summed across
     # resource-manager pools; empty when the server omits it (older servers).
     cxl_pool: dict = field(default_factory=dict)
-    cpu_storage: dict = field(default_factory=dict)
-    l1_storage: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -493,8 +532,6 @@ class GetUsageResponse:
     instances: list[InstanceUsage] = field(default_factory=list)
     pool_total: int = 0
     pool_free: int = 0
-    cpu_storage: dict = field(default_factory=dict)
-    l1_storage: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -547,21 +584,6 @@ class HandshakeResponse:
 
 
 @dataclass
-class StorageRequest:
-    """Capability-negotiated metadata operations; contains no KV bytes."""
-
-    action: str
-    payload: dict = field(default_factory=dict)
-
-
-@dataclass
-class StorageResponse:
-    success: bool
-    result: dict = field(default_factory=dict)
-    error: str | None = None
-
-
-@dataclass
 class ShutdownRequest:
     """SHUTDOWN (0xFF) - Request server shutdown."""
 
@@ -576,12 +598,312 @@ class ShutdownResponse:
 
 
 # =============================================================================
+# Multi-storage Messages (0x40 - 0x5F)
+# =============================================================================
+# Session requests carry ``session`` and ``server_epoch``; state changes carry
+# ``op`` (see OpRef). Response ``items`` follow the request's order.
+
+
+@dataclass
+class RecoverItem:
+    key: Key
+    location: Location
+    logical_bytes: int
+    pinned: bool
+
+
+@dataclass
+class CommitItem:
+    key: Key
+    location: Location
+    logical_bytes: int
+
+
+@dataclass
+class NodeOpenRequest:
+    """NODE_OPEN (0x40) - A StorageService opens its node session."""
+
+    node_id: str
+    node_epoch: str
+    host_boot_id: str
+    protocol: str
+    capabilities: list[str] = field(default_factory=list)
+    pools: list[PoolInfo] = field(default_factory=list)
+    rm_domains: list[RmDomain] = field(default_factory=list)
+    pid_ns: int = 0
+
+
+@dataclass
+class NodeOpenResponse:
+    status: Status
+    error: str | None = None
+    server_epoch: str = ""
+    node_session: str = ""
+    epoch_seq: int = 0
+    heartbeat_s: float = 0.0
+    session_ttl_s: float = 0.0
+    adopted: list[PoolInfo] = field(default_factory=list)
+    # Those of the request MaruServer accepted; none from an older server
+    capabilities: list[str] = field(default_factory=list)
+    orphans: list[OrphanWorker] = field(default_factory=list)
+    next_cursor: str | None = None
+    pool_registrations: dict[str, int] = field(default_factory=dict)
+
+
+@dataclass
+class NodeOrphansRequest:
+    """NODE_ORPHANS (0x47) - Pages of this session's orphan listing."""
+
+    session: str
+    server_epoch: str
+    cursor: str | None = None
+
+
+@dataclass
+class NodeOrphansResponse:
+    status: Status
+    error: str | None = None
+    orphans: list[OrphanWorker] = field(default_factory=list)
+    next_cursor: str | None = None
+
+
+@dataclass
+class NodeHeartbeatRequest:
+    """NODE_HEARTBEAT (0x41)."""
+
+    session: str
+    server_epoch: str
+    usage: list[PoolUsage] = field(default_factory=list)
+    memory_peer: tuple[str, str] | None = None  # connected node_id and node_epoch
+
+
+@dataclass
+class NodeHeartbeatResponse:
+    status: Status
+    error: str | None = None
+    access: AccessHints = field(default_factory=AccessHints)
+    blocks: list[BlockRequest] = field(default_factory=list)
+    policy_version: int = 0
+
+
+@dataclass
+class NodeCloseRequest:
+    """NODE_CLOSE (0x42)."""
+
+    session: str
+    server_epoch: str
+    mode: CloseMode
+
+
+@dataclass
+class NodeCloseResponse:
+    status: Status
+    error: str | None = None
+
+
+@dataclass
+class NodeRecoverListRequest:
+    """NODE_RECOVER_LIST (0x44) - Committed locations of an adopted pool."""
+
+    session: str
+    server_epoch: str
+    pool_id: str
+    cursor: str | None = None
+
+
+@dataclass
+class NodeRecoverListResponse:
+    status: Status
+    error: str | None = None
+    items: list[RecoverItem] = field(default_factory=list)
+    next_cursor: str | None = None
+
+
+@dataclass
+class WorkerExitRequest:
+    """WORKER_EXIT (0x45) - A node reports workers it saw end."""
+
+    session: str
+    server_epoch: str
+    op: OpRef
+    workers: list[WorkerRef]
+    cause: ExitCause
+
+
+@dataclass
+class WorkerExitResponse:
+    status: Status
+    error: str | None = None
+    items: list[ItemOutcome] = field(default_factory=list)
+
+
+@dataclass
+class AdminDeleteRequest:
+    """ADMIN_DELETE (0x46) - Remove keys through block requests to their
+    nodes; idempotent, so no session or op."""
+
+    items: list[Key]
+
+
+@dataclass
+class AdminDeleteResponse:
+    status: Status
+    error: str | None = None
+    items: list[ItemOutcome] = field(default_factory=list)
+
+
+@dataclass
+class WorkerOpenRequest:
+    """WORKER_OPEN (0x48).
+
+    ``pid``/``pid_start`` are the node-view values from the ATTACH reply.
+    """
+
+    node_id: str
+    node_epoch: str
+    engine_id: str
+    dp_index: int
+    tp_rank: int
+    pid: int
+    pid_start: int
+    incarnation: str
+    namespace: str
+    role: SessionRole
+    protocol: str
+    capabilities: list[str] = field(default_factory=list)
+
+
+@dataclass
+class WorkerOpenResponse:
+    status: Status
+    error: str | None = None
+    server_epoch: str = ""
+    worker_session: str = ""
+    heartbeat_s: float = 0.0
+    session_ttl_s: float = 0.0
+
+
+@dataclass
+class WorkerHeartbeatRequest:
+    """WORKER_HEARTBEAT (0x49)."""
+
+    session: str
+    server_epoch: str
+
+
+@dataclass
+class WorkerHeartbeatResponse:
+    status: Status
+    error: str | None = None
+
+
+@dataclass
+class WorkerCloseRequest:
+    """WORKER_CLOSE (0x4A) - Ends the session and releases its pins."""
+
+    session: str
+    server_epoch: str
+
+
+@dataclass
+class WorkerCloseResponse:
+    status: Status
+    error: str | None = None
+
+
+@dataclass
+class ProbeRequest:
+    """PROBE (0x50) - Hit hints for the scheduler; no pin. With
+    ``with_locations`` a HIT item names the location it found (a
+    read hint's range), else none does."""
+
+    session: str
+    server_epoch: str
+    items: list[Key]
+    with_locations: bool = False
+
+
+@dataclass
+class ProbeResponse:
+    status: Status
+    error: str | None = None
+    items: list[ItemOutcome] = field(default_factory=list)
+
+
+@dataclass
+class LookupAndPinRequest:
+    """LOOKUP_AND_PIN (0x51)."""
+
+    session: str
+    server_epoch: str
+    op: OpRef
+    items: list[Key]
+
+
+@dataclass
+class LookupAndPinResponse:
+    status: Status
+    error: str | None = None
+    items: list[ItemOutcome] = field(default_factory=list)
+
+
+@dataclass
+class UnpinRequest:
+    """UNPIN (0x52) - Idempotent by pin_id."""
+
+    session: str
+    server_epoch: str
+    pin_ids: list[str]
+
+
+@dataclass
+class UnpinResponse:
+    status: Status
+    error: str | None = None
+    items: list[ItemOutcome] = field(default_factory=list)
+
+
+@dataclass
+class CommitRequest:
+    """COMMIT (0x58) - An item that asks for a finalizer is REJECTED (none
+    is kept here)."""
+
+    session: str
+    server_epoch: str
+    op: OpRef
+    items: list[CommitItem]
+
+
+@dataclass
+class CommitResponse:
+    status: Status
+    error: str | None = None
+    items: list[ItemOutcome] = field(default_factory=list)
+
+
+@dataclass
+class RetireRequest:
+    """RETIRE (0x59)."""
+
+    session: str
+    server_epoch: str
+    op: OpRef
+    items: list[KeyLocation]
+
+
+@dataclass
+class RetireResponse:
+    status: Status
+    error: str | None = None
+    items: list[ItemOutcome] = field(default_factory=list)
+
+
+# =============================================================================
 # Message Type Mapping
 # =============================================================================
 
 # Map message types to request/response classes
 MESSAGE_CLASSES = {
-    MessageType.STORAGE: (StorageRequest, StorageResponse),
     # Allocation Management
     MessageType.REQUEST_ALLOC: (RequestAllocRequest, RequestAllocResponse),
     MessageType.RETURN_ALLOC: (ReturnAllocRequest, ReturnAllocResponse),
@@ -610,3 +932,27 @@ MESSAGE_CLASSES = {
     MessageType.HANDSHAKE: (HandshakeRequest, HandshakeResponse),
     MessageType.SHUTDOWN: (ShutdownRequest, ShutdownResponse),
 }
+
+# Multi-storage messages, served by the Catalog; the legacy table knows
+# their codes too
+MS_MESSAGE_CLASSES = {
+    MessageType.NODE_OPEN: (NodeOpenRequest, NodeOpenResponse),
+    MessageType.NODE_ORPHANS: (NodeOrphansRequest, NodeOrphansResponse),
+    MessageType.NODE_HEARTBEAT: (NodeHeartbeatRequest, NodeHeartbeatResponse),
+    MessageType.NODE_CLOSE: (NodeCloseRequest, NodeCloseResponse),
+    MessageType.NODE_RECOVER_LIST: (NodeRecoverListRequest, NodeRecoverListResponse),
+    MessageType.WORKER_EXIT: (WorkerExitRequest, WorkerExitResponse),
+    MessageType.ADMIN_DELETE: (AdminDeleteRequest, AdminDeleteResponse),
+    MessageType.WORKER_OPEN: (WorkerOpenRequest, WorkerOpenResponse),
+    MessageType.WORKER_HEARTBEAT: (WorkerHeartbeatRequest, WorkerHeartbeatResponse),
+    MessageType.WORKER_CLOSE: (WorkerCloseRequest, WorkerCloseResponse),
+    MessageType.PROBE: (ProbeRequest, ProbeResponse),
+    MessageType.LOOKUP_AND_PIN: (LookupAndPinRequest, LookupAndPinResponse),
+    MessageType.UNPIN: (UnpinRequest, UnpinResponse),
+    MessageType.COMMIT: (CommitRequest, CommitResponse),
+    MessageType.RETIRE: (RetireRequest, RetireResponse),
+}
+_overlap = set(MESSAGE_CLASSES) & set(MS_MESSAGE_CLASSES)
+if _overlap:
+    raise RuntimeError(f"message codes defined twice: {sorted(_overlap)}")
+MESSAGE_CLASSES.update(MS_MESSAGE_CLASSES)

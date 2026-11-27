@@ -18,6 +18,8 @@ uv pip install --python .venv-3.13/bin/python -e ".[dev]"
 .venv-3.13/bin/python -m pytest -m "not integration"
 ```
 
+The maintenance latency benchmark runs separately, without coverage and on an otherwise idle host: `python -m pytest benchmarks/test_ms_maintenance.py -q`. It retains the 10 ms p99 increase limit. The unit suite checks the corresponding concurrency guarantees deterministically: bounded cleanup batches release the lock and allow real lookups to complete between them.
+
 ```bash
 # Unit tests only
 pytest -v tests/ -m "not integration"

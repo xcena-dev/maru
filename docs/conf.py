@@ -25,7 +25,9 @@ class _MockModule(MagicMock):
 
 _mock = _MockModule()
 sys.modules["maru_shm"] = _mock
+sys.modules["maru_shm.client"] = _mock
 sys.modules["maru_shm.types"] = _mock
+sys.modules["maru_shm.unholds"] = _mock
 
 
 project = "Maru"

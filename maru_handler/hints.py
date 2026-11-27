@@ -1,46 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 XCENA Inc.
-"""Memory hints: tell the memory side which bytes will be read or written soon.
+"""Queue advisory read hints and promotes for node storage and CXL plugins.
 
-A serving engine knows which stored keys a request will load well before
-its worker starts the load: the request waits for the running engine step
-first, and the scheduler looks its prefix up when it picks it. Memory with a
-slow tier behind a fast cache (a CXL-SSD, say) can use that time to bring
-the bytes in. A read hint carries that knowledge to the memory side: the
-backend finds where the hit keys are and sends ``read_hint`` to the remote
-CXL agent of their regions, whose region extension acts on it, and
-``read_hint_end`` once the request is over. Agents without a region
-extension that takes hints get nothing.
-
-A process that gives no early hints (a worker whose engine names no request
-to its storage) can still hint each load as its READs start: the bytes are
-known from the lease, and a long load's later chunks can be brought in while
-its first ones are read.
-
-A read promote (``read_promote``) says that the load of a request someone
-hinted starts now, so the memory side can bring that request's bytes in
-ahead of the other hinted ones. The process that loads is usually not the
-one that hinted (a vLLM worker loads what its scheduler hinted), so it
-sends the promote to every agent of the pool, naming the request only.
-
-A write hint (``write_hint``) names the pages a store is about to WRITE, in
-write order, as soon as the store has its pages and before it posts the
-WRITEs. Memory that would otherwise fill each written page from its slow
-tier on the first WRITE can prepare the pages instead. A write hint has no
-end; it never gives the memory side leave to change the pages.
-
-:class:`MemoryHints` holds what does not depend on a backend: the
-background thread, the queue and its drop policy, and the bookkeeping that
-ends each hinted request at the targets it reached. A backend gives it two
-callables: where the hinted keys are (``locate``) and how a message reaches
-the memory side (``send``). The ``remote_cxl`` backend sends to the remote
-CXL agents of the keys' regions, as described above.
-
-All of it runs on one background thread per client, in the order hints were
-given, so the caller (an engine's input thread or its scheduler) never waits
-for a lookup, a connection or a reply. A hint is advice: one that is late,
-lost or wrong costs only the time it would have saved. The load leases and
-reads every key as it would without hints.
+The background thread locates keys and sends hints in order. Dropped hints
+leave reads unchanged; request ends are retained.
 """
 
 from __future__ import annotations
@@ -51,7 +14,7 @@ import threading
 from collections import OrderedDict
 from collections.abc import Callable
 
-from maru_remote import region_map
+from maru_common.storage_types import Location
 
 logger = logging.getLogger(__name__)
 
@@ -59,34 +22,24 @@ logger = logging.getLogger(__name__)
 MAX_PENDING_HINTS = 1024
 #: A dropped hint is logged as a warning once per this many drops.
 DROP_WARNING_EVERY = 1024
-#: Ranges one hint message names (the agent's limit); a longer hint takes
+#: Ranges one hint message names per target; a longer hint takes
 #: several.
-MAX_HINT_RANGES = region_map.MAX_HINT_RANGES
-#: Hinted requests kept open (not ended); past it the oldest is ended. An
-#: agent lets one connection keep as many open by default.
+MAX_HINT_RANGES = 4096
+#: Hinted requests kept open (not ended); past it the oldest is ended.
 MAX_OPEN_HINTS = 4096
 
 
 class MemoryHints:
-    """Sends read and write hints to the memory side on one background thread.
-
-    A target is whatever ``send`` delivers to; on ``remote_cxl`` it is the
-    remote CXL agent that maps a region.
+    """Send hints to memory nodes or handler plugins on one background thread.
 
     Args:
-        locate: ``keys -> [(agent, ranges)]``: the leading hit keys, per
-            target (agent) that holds their regions, each range a
-            ``{"handle", "offset", "length"}`` map in key order. Called on
-            the hint thread (it may ask MaruServer).
-        send: ``(agent, message) -> bool`` to that target (on
-            ``remote_cxl``, over a connection of this process to the agent);
-            False if the target does not take the message's action (it was
-            not sent).
+        locate: Keys to leading-hit ranges grouped by target.
+        send: Deliver a message to its target; False if unsupported.
     """
 
     def __init__(
         self,
-        locate: Callable[[list[str]], list[tuple[str, list[dict]]]],
+        locate: Callable[[list[str]], list[tuple[str, list[dict | Location]]]],
         send: Callable[[str, dict], bool],
     ) -> None:
         self._locate = locate
@@ -118,13 +71,21 @@ class MemoryHints:
             self._queue_hint(("hint", request_id, list(keys)))
 
     def hint_ranges(
-        self, request_id: str, groups: list[tuple[str, list[dict]]]
+        self,
+        request_id: str,
+        groups: list[tuple[str, list[dict | Location]]],
+        *,
+        append: bool = False,
     ) -> None:
-        """Queue a hint whose ranges are known already (``locate``'s form)."""
+        """Queue known ranges; append retains chunks of a relayed hint."""
         if request_id and groups:
-            self._queue_hint(("ranges", request_id, groups))
+            self._queue_hint(
+                ("append_ranges" if append else "ranges", request_id, groups)
+            )
 
-    def write_hint(self, token: str, groups: list[tuple[str, list[dict]]]) -> None:
+    def write_hint(
+        self, token: str, groups: list[tuple[str, list[dict | Location]]]
+    ) -> None:
         """Queue a write hint: the pages in ``groups`` (``locate``'s form, in
         write order) are about to be written. ``token`` names the store; a
         write hint has no end. Dropped as a read hint is."""
@@ -152,7 +113,7 @@ class MemoryHints:
             end_open: Also send ``read_hint_end`` for every request still
                 open, after the queued hints, so a target that keeps state
                 per request can drop it. A target that ends a closed
-                connection's requests itself (a remote CXL agent) does not
+                connection's requests itself does not
                 need it.
 
         Returns:
@@ -241,6 +202,8 @@ class MemoryHints:
                     self._give(request_id, self._locate(payload))
                 elif kind == "ranges":
                     self._give(request_id, payload)
+                elif kind == "append_ranges":
+                    self._give(request_id, payload, append=True)
                 elif kind == "write":
                     self._send_all("write_hint", request_id, payload)
                 elif kind == "promote":
@@ -256,19 +219,30 @@ class MemoryHints:
                 # Advice only: the load reads the bytes either way.
                 logger.debug("hint %s for %s failed", kind, request_id, exc_info=True)
 
-    def _give(self, request_id: str, groups: list[tuple[str, list[dict]]]) -> None:
-        if request_id in self._agents:
+    def _give(
+        self,
+        request_id: str,
+        groups: list[tuple[str, list[dict | Location]]],
+        *,
+        append: bool = False,
+    ) -> None:
+        if request_id in self._agents and not append:
             return  # hinted already
-        self._agents[request_id] = self._send_all("read_hint", request_id, groups)
+        reached = self._send_all("read_hint", request_id, groups)
+        agents = self._agents.setdefault(request_id, [])
+        agents.extend(agent for agent in reached if agent not in agents)
         while len(self._agents) > MAX_OPEN_HINTS:
             # Its end never came (or comes later): end it now.
             self._finish(next(iter(self._agents)))
 
     def _send_all(
-        self, action: str, request_id: str, groups: list[tuple[str, list[dict]]]
+        self,
+        action: str,
+        request_id: str,
+        groups: list[tuple[str, list[dict | Location]]],
     ) -> list[str]:
-        """Send ``action`` with each agent's ranges, in messages of at most
-        :data:`MAX_HINT_RANGES` (one message if there are none); the agents
+        """Send ``action`` with each target's ranges, in messages of at most
+        :data:`MAX_HINT_RANGES` (one message if there are none); the targets
         that took it."""
         reached: list[str] = []
         for agent, ranges in groups:

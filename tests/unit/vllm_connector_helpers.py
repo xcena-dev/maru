@@ -568,3 +568,99 @@ def fake_new_request_data(
         block_ids=(list(block_ids),),
         num_computed_tokens=num_computed_tokens,
     )
+
+
+def engine_config():
+    return SimpleNamespace(
+        kv_transfer_config=SimpleNamespace(kv_load_failure_policy="recompute"),
+        parallel_config=SimpleNamespace(
+            tensor_parallel_size=1, pipeline_parallel_size=1, data_parallel_size=1
+        ),
+        model_config=SimpleNamespace(
+            model="weights",
+            revision="commit",
+            dtype="float16",
+            enforce_eager=True,
+            hf_config=SimpleNamespace(to_dict=lambda: {"heads": 4}),
+        ),
+        cache_config=SimpleNamespace(cache_dtype="auto", block_size=16),
+    )
+
+
+def model_vllm_config(
+    tp_size: int = 1,
+    total_heads: int = 8,
+    *,
+    block_size: int = 4,
+    extra: dict | None = None,
+    **parallel,
+) -> SimpleNamespace:
+    """The model geometry and scheduling fields a connector reads."""
+    return SimpleNamespace(
+        kv_transfer_config=SimpleNamespace(
+            kv_connector_extra_config={} if extra is None else extra,
+            kv_load_failure_policy="recompute",
+        ),
+        scheduler_config=SimpleNamespace(async_scheduling=False),
+        cache_config=SimpleNamespace(
+            block_size=block_size,
+            num_gpu_blocks=None,
+            cache_dtype="auto",
+            mamba_cache_mode="align",
+        ),
+        parallel_config=SimpleNamespace(tensor_parallel_size=tp_size, **parallel),
+        model_config=SimpleNamespace(
+            use_mla=False,
+            max_model_len=4096,
+            enforce_eager=True,
+            revision="commit",
+            dtype="float16",
+            hf_config=SimpleNamespace(to_dict=lambda: {"heads": total_heads}),
+            get_total_num_kv_heads=lambda: total_heads,
+            get_num_kv_heads=lambda pc: max(1, total_heads // pc.tensor_parallel_size),
+            get_head_size=lambda: 2,
+        ),
+        speculative_config=None,
+        num_lookahead_tokens=0,
+    )
+
+
+def _slab(i=0):
+    import torch
+
+    return torch.arange(16, dtype=torch.float32).reshape(2, 1, 8, 1) + i * 100
+
+
+def _view(slab):
+    return SimpleNamespace(view=bytearray(slab.numpy().tobytes()))
+
+
+def _cpu_cuda(monkeypatch):
+    import contextlib
+
+    import torch
+
+    """Let the write-behind path run its CUDA stream calls on the CPU."""
+    # CPU copies end before the call returns: waiting is a no-op
+    stream = SimpleNamespace(wait_stream=lambda other: None, synchronize=lambda: None)
+    monkeypatch.setattr(torch.cuda, "Stream", lambda device=None, **kw: stream)
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda device=None: stream)
+    monkeypatch.setattr(torch.cuda, "stream", lambda s: contextlib.nullcontext())
+    monkeypatch.setattr(torch.cuda, "Event", _FakeCudaEvent)
+
+
+class _FakeCudaEvent:
+    def record(self, stream=None):
+        pass
+
+    def synchronize(self):
+        pass
+
+
+def node_extra(socket: str = "/unused", **kwargs):
+    return {
+        "maru_node": socket,
+        "maru_engine_id": "one",
+        "maru_cache_namespace": "model-revision-1",
+        **kwargs,
+    }

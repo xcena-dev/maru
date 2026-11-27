@@ -30,11 +30,12 @@ dependencies = [
 dev = [
     "pytest>=7.0.0",
     "pytest-cov>=4.0.0",
+    "hypothesis>=6.0",
     "mypy>=1.0.0",
     "ruff>=0.1.0",
     "pre-commit>=3.0.0",
 ]
-# NIXL for the remote_cxl storage backend and the remote CXL agent (maru-remote-cxl-agent)
+# NIXL for worker RDMA and memory nodes
 rdma = [
     "nixl>=1.2.0,<2",
 ]
@@ -47,11 +48,10 @@ docs = [
 ]
 
 [project.scripts]
-maru-server = "maru_server.server:main"
+maru-server = "maru_server.cli:main"
+maru-storage = "maru_storage_service.cli:main"
 install-maru-resource-manager = "maru_common.resource_manager_installer:main"
-install-maru-remote-cxl-agent = "maru_remote_cxl_agent.installer:main"
 marutop = "maru_tools.cli:main"
-maru-remote-cxl-agent = "maru_remote_cxl_agent.cli:main"
 
 [project.urls]
 Homepage = "https://xcena-dev.github.io/maru/"

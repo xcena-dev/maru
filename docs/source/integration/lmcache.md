@@ -2,7 +2,7 @@
 
 ## Integration Architecture
 
-This guide describes LMCache's directly mapped `cxl` integration. Its memoryview and allocator diagrams refer to that path. The `remote_cxl` storage backend and its CPU staging/RDMA path are documented for the native {doc}`vLLM connector <vllm>`; the configuration below does not select that backend.
+This guide describes LMCache's directly mapped `cxl` integration. Its allocator and memoryview diagrams show mapped CXL pages. The native {doc}`vLLM connector <vllm>` also supports the node backend (selected by `maru_node`) for node-owned pools and worker RDMA.
 
 The full stack from inference engine to shared memory:
 
@@ -24,10 +24,9 @@ The full stack from inference engine to shared memory:
 | **MaruBackend** | LMCache `AllocatorBackendInterface` — allocates directly on CXL, async store, sync get | Integration boundary |
 | **CxlMemoryAdapter** | LMCache `MemoryAllocatorInterface` — translates Maru pages to `TensorMemoryObj` pool | Integration boundary |
 | **MaruHandler** | Client-side KV operations, memory mapping, connection management | Maru client |
-| **MaruServer** | Central metadata store, memory allocation coordinator | Maru server |
+| **MaruServer** (`maru-server --backend cxl`) | Central metadata store, memory allocation coordinator | MaruServer |
 
-The **integration boundary** sits at MaruBackend + CxlMemoryAdapter. Everything above is LMCache;
-everything below is Maru. These two classes are the only components that import from both projects.
+The **integration boundary** sits at MaruBackend + CxlMemoryAdapter. Everything above is LMCache; everything below is Maru. These two classes are the only components that import from both projects.
 
 ## Backend Design
 
@@ -44,8 +43,7 @@ MaruBackend (AllocatorBackendInterface)
         └── OwnedRegionManager (page allocation)
 ```
 
-**MaruHandler** manages CXL memory (regions, pages, mmap). **CxlMemoryAdapter** translates
-pages into LMCache's `TensorMemoryObj` format.
+**MaruHandler** manages CXL memory (regions, pages, mmap). **CxlMemoryAdapter** translates pages into LMCache's `TensorMemoryObj` format.
 
 ## Data Path
 
@@ -100,14 +98,11 @@ sequenceDiagram
     CE-->>IE: KV tensors
 ```
 
-The key design point is that **data never travels over the network**. Only metadata
-(region ID, offset, length) is exchanged via RPC. The actual KV tensor data is
-accessed directly from CXL shared memory through memory-mapped regions.
+The key design point is that **data never travels over the network**. Only metadata (region ID, offset, length) is exchanged via RPC. The actual KV tensor data is accessed directly from CXL shared memory through memory-mapped regions.
 
 ## Configuration
 
-Maru is configured as a native LMCache storage backend via the `maru_path` and `maru_pool_size`
-config fields. No plugin registration is needed.
+Maru is configured as a native LMCache storage backend via the `maru_path` and `maru_pool_size` config fields. No plugin registration is needed.
 
 ```yaml
 chunk_size: 256
@@ -145,10 +140,6 @@ extra_config:
 | `maru_max_inflight` | `64` | Max concurrent in-flight async RPC requests |
 | `maru_eager_map` | `true` | Pre-map all shared regions on connect |
 
-For runnable examples, see
-[LMCache Examples](../getting_started/examples/lmcache/index.md).
+For runnable examples, see [LMCache Examples](../getting_started/examples/lmcache/index.md).
 
-> **See also:** [Architecture Overview](../design_doc/architecture_overview.md),
-> [MaruHandler Design](../design_doc/maru_handler.md),
-> [Python API Reference](../api_reference/api.md),
-> [Configuration Reference](../api_reference/config.md)
+> **See also:** [Architecture Overview](../design_doc/architecture_overview.md), [MaruHandler Design](../design_doc/maru_handler.md), [Python API Reference](../api_reference/api.md), [Configuration Reference](../api_reference/config.md)

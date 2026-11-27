@@ -2114,7 +2114,7 @@ class TestBuildConnectorMetaStoreAccumulation:
     def test_inline_load_stores_the_chunks_computed_after_it(self):
         """A request that loads a hit stores what it computes past it (#111)."""
         sched = self._make_scheduler()
-        sched._count_matched_chunks = lambda tokens: 2
+        sched._count_matched_chunks = lambda tokens, keys=None: 2
         token_ids = list(range(64))
         request = SimpleNamespace(request_id="r1", prompt_token_ids=token_ids)
         assert sched.get_num_new_matched_tokens(request, 0) == (16, False)
@@ -5826,7 +5826,9 @@ class TestDeferredAdmissionFitsCache:
     def _engine(self, tmp_path):
         engine = make_vllm_scheduler(tmp_path, 4, 8, {"maru_async_load": True})
         chunks = dict(self.PROMPTS.values())
-        engine.connector._scheduler._count_matched_chunks = lambda ids: chunks[len(ids)]
+        engine.connector._scheduler._count_matched_chunks = lambda ids, keys=None: (
+            chunks[len(ids)]
+        )
         return engine
 
     def _add(self, engine, name):
@@ -5875,8 +5877,8 @@ class TestDeferredAdmissionFitsCache:
 
         engine = self._engine(tmp_path)
         chunks = dict(self.PROMPTS.values())
-        engine.connector._scheduler._count_matched_chunks = lambda ids: chunks.get(
-            len(ids), 0
+        engine.connector._scheduler._count_matched_chunks = lambda ids, keys=None: (
+            chunks.get(len(ids), 0)
         )
         running = Request(
             "running", list(range(64)), SamplingParams(max_tokens=1), None
@@ -5925,7 +5927,9 @@ class TestDeferredAdmissionFitsCache:
         # but the oldest needs four more blocks for its draft tokens.
         small_tokens = 52 if prompt_tokens == 200 else 48
         chunks = {prompt_tokens: 12, small_tokens: small_chunks}
-        engine.connector._scheduler._count_matched_chunks = lambda ids: chunks[len(ids)]
+        engine.connector._scheduler._count_matched_chunks = lambda ids, keys=None: (
+            chunks[len(ids)]
+        )
         requests = []
         for name, count in (("big", prompt_tokens), ("small", small_tokens)):
             request = Request(
@@ -5958,7 +5962,7 @@ class TestDeferredAdmissionFitsCache:
             speculative_method=method,
             max_model_len=252,
         )
-        engine.connector._scheduler._count_matched_chunks = lambda ids: 12
+        engine.connector._scheduler._count_matched_chunks = lambda ids, keys=None: 12
         request = Request("big", list(range(251)), SamplingParams(max_tokens=1), None)
         engine.add_request(request)
         engine.schedule()
@@ -5975,7 +5979,7 @@ class TestDeferredAdmissionFitsCache:
         )
         chunks = {200: 12, 52: 6}
         sched = engine.connector._scheduler
-        sched._count_matched_chunks = lambda ids: chunks[len(ids)]
+        sched._count_matched_chunks = lambda ids, keys=None: chunks[len(ids)]
         requests = [
             Request(name, list(range(count)), SamplingParams(max_tokens=1), None)
             for name, count in (("big", 200), ("small", 52))
@@ -6009,7 +6013,7 @@ class TestDeferredAdmissionFitsCache:
         )
         chunks = {199: 12, 52: 4}
         sched = engine.connector._scheduler
-        sched._count_matched_chunks = lambda ids: chunks[len(ids)]
+        sched._count_matched_chunks = lambda ids, keys=None: chunks[len(ids)]
         requests = [
             Request(name, list(range(count)), SamplingParams(max_tokens=1), None)
             for name, count in (("big", 199), ("small", 52))
@@ -6043,7 +6047,7 @@ class TestDeferredAdmissionFitsCache:
         if Version(vllm.__version__) < Version("0.23.0"):
             pytest.skip("upstream async-load reservation requires vLLM >= 0.23")
         engine = self._engine(tmp_path)
-        engine.connector._scheduler._count_matched_chunks = lambda ids: {
+        engine.connector._scheduler._count_matched_chunks = lambda ids, keys=None: {
             200: 12,
             60: 6,
         }[len(ids)]
@@ -6059,7 +6063,7 @@ class TestDeferredAdmissionFitsCache:
         sched = make_scheduler(4, 8, {"maru_async_load": True})
         sched._num_gpu_blocks = num_gpu_blocks
         chunks = dict(self.PROMPTS.values())
-        sched._count_matched_chunks = lambda ids: chunks[len(ids)]
+        sched._count_matched_chunks = lambda ids, keys=None: chunks[len(ids)]
         return sched
 
     def _request(self, name):
@@ -6133,7 +6137,7 @@ class TestDeferredAdmissionFitsCache:
         engine = self._engine(tmp_path)
         chunks = dict(self.PROMPTS.values())
         sched = engine.connector._scheduler
-        sched._count_matched_chunks = lambda ids: chunks.get(len(ids), 0)
+        sched._count_matched_chunks = lambda ids, keys=None: chunks.get(len(ids), 0)
         engine.add_request(
             Request("running", list(range(64)), SamplingParams(max_tokens=1), None)
         )
@@ -6166,7 +6170,7 @@ class TestDeferredAdmissionFitsCache:
         chunks = dict(self.PROMPTS.values())
         lookups = []
 
-        def count(ids):
+        def count(ids, keys=None):
             lookups.append(len(ids))
             return chunks[len(ids)]
 
@@ -6187,7 +6191,8 @@ class TestDeferredAdmissionFitsCache:
         big, mid = self._request("big"), self._request("mid")
         self._park(sched, big)
         assert sched.get_num_new_matched_tokens(mid, 0)[0] is None
-        sched._count_matched_chunks = lambda ids: 0  # evicted while it waited
+        # Evicted while it waited.
+        sched._count_matched_chunks = lambda ids, keys=None: 0
         # The budget still has no room: mid keeps waiting without a lookup.
         assert sched.get_num_new_matched_tokens(mid, 0) == (None, False)
         sched.build_connector_meta(self._finished("big"))
@@ -6266,7 +6271,7 @@ class TestAbortDeferredWriteBehind:
         sched = engine.connector._scheduler
         # One chunk of the 8-token prompt is in Maru, so vLLM parks the
         # request in WAITING_FOR_REMOTE_KVS for a deferred load.
-        sched._count_matched_chunks = lambda token_ids: 1
+        sched._count_matched_chunks = lambda token_ids, keys=None: 1
         worker = make_worker(4, 8, config)
         facade = SimpleNamespace(_worker=worker, _scheduler=sched)
         pool = engine.kv_cache_manager.block_pool
@@ -6595,7 +6600,7 @@ class TestRequestTrace:
         if not hasattr(engine, "reset_preempted_req_ids"):
             pytest.skip("vLLM scheduler does not report reset preemptions")
         scheduler = engine.connector._scheduler
-        scheduler._count_matched_chunks = lambda ids: 1
+        scheduler._count_matched_chunks = lambda ids, keys=None: 1
         request = Request("r1", list(range(8)), SamplingParams(max_tokens=8), None)
         engine.add_request(request)
         engine.schedule()
@@ -6641,7 +6646,7 @@ class TestRequestTrace:
                 "maru_overlap_load_with_compute": True,
             },
         )
-        engine.connector._scheduler._count_matched_chunks = lambda ids: 1
+        engine.connector._scheduler._count_matched_chunks = lambda ids, keys=None: 1
         pool = engine.kv_cache_manager.block_pool
         free = pool.get_num_free_blocks()
         request = Request("r1", list(range(8)), SamplingParams(max_tokens=8), None)
@@ -6675,7 +6680,9 @@ class TestRequestTrace:
         }
         engine = make_vllm_scheduler(tmp_path, 4, 8, config)
         engine.use_v2_model_runner = False
-        engine.connector._scheduler._count_matched_chunks = lambda token_ids: 1
+        engine.connector._scheduler._count_matched_chunks = (
+            lambda token_ids, keys=None: 1
+        )
         request = Request("r1", list(range(8)), SamplingParams(max_tokens=1), None)
         if preempted:
             request.status = RequestStatus.PREEMPTED

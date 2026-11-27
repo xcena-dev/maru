@@ -40,6 +40,14 @@ class TestMaruHandlerConfig:
         assert config.chunk_size_bytes == 4096
         assert config.auto_connect is False
 
+    @pytest.mark.parametrize("use_async_rpc", [False, True])
+    def test_single_server_url_is_trimmed(self, use_async_rpc):
+        config = MaruConfig(
+            server_url=" \ttcp://127.0.0.1:5555\n ", use_async_rpc=use_async_rpc
+        )
+        handler = MaruHandler(config)
+        assert handler._rpc._server_url == "tcp://127.0.0.1:5555"
+
     def test_config_invalid_chunk_size(self):
         """Test that invalid chunk_size_bytes raises ValueError."""
         with pytest.raises(ValueError, match="chunk_size_bytes must be positive"):
@@ -2086,5 +2094,17 @@ class TestFixedPoolAllocation:
 
         with pytest.raises(ValueError, match="after expansion attempt"):
             handler.alloc(size=4)
+
+        handler.close()
+
+
+class TestStartRetrieve:
+    def test_start_retrieve_retrieves_at_once_without_a_node(self):
+        handler = _make_mock_handler()
+
+        handler._rpc.batch_lookup_kv = MagicMock(side_effect=RuntimeError("RPC failed"))
+
+        started = handler.start_retrieve(keys=["1"])
+        assert started.done() and started.result() == [None]
 
         handler.close()

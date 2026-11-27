@@ -115,6 +115,11 @@ def discover_servers(self_pid: int) -> list[tuple[str, int, int]]:
         joined = " ".join(tokens)
         if "maru_server" not in joined and "maru-server" not in joined:
             continue
+        if (
+            _extract_opt(tokens, "--backend") == "node"
+            or "maru_server.node_server" in tokens
+        ):
+            continue
         port = _extract_opt(tokens, "--port")
         if not port:
             continue

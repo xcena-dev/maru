@@ -4,28 +4,13 @@ Maru stores KV cache data as fixed-size units called **KV cache chunks**. Each c
 
 ## Backend, identity and sharing
 
-The numbered sections below describe the legacy `cxl` key registry. Storage
-sessions (`cpu`, `mixed`, `remote_cxl`) use `ReplicaDirectory` instead of
-`LOOKUP_KV` and can represent typed replicas and read leases.
+The numbered sections below describe the `cxl` key registry on MaruServer (`maru-server --backend cxl`). On the node backend (selected by `maru_node`), MaruServer (`maru-server --backend node`) keeps keys in the Catalog.
 
-| Backend | Which cached object can be reused? | Lookup and read lifetime |
+| Backend | Reusable object | Read lifetime |
 |---|---|---|
-| `cxl` | A key in the legacy registry whose CXL region the reader can map | Lookup returns a region handle and byte range |
-| `remote_cxl` | A compatible object in the same pool and cache namespace | `probe` finds a candidate; `acquire` grants a server lease, RDMA fills staging, and a local lease protects the copy to the GPU |
-| `cpu`, current `mixed` | A replica owned by the requesting worker | Same-namespace objects on another worker are not automatically accessible |
-
-For storage sessions, `cache_namespace` must identify the exact immutable
-weights revision. Equal token text and model shape are insufficient if weights
-differ. The schema/layout and chunk geometry must also match. A multi-pool
-`remote_cxl` request allocates, looks up and reads with the same first-chunk
-`route_key`, and each store goes to the pool its allocation came from; there is
-no global search or replication across independent pools.
-
-Region IDs are assigned within one Resource Manager, not across every Maru
-deployment. Keep the pool/server identity with a location. Reusing the same
-physical CXL memory through different backends does not merge their registries.
-
----
+| `cxl` | A registered key whose CXL region the reader can map | Lookup returns a region handle and byte range; the caller keeps the key and region valid while reading |
+| node: `dram`, `local_cxl` | A published object on the same GPU node with matching namespace and geometry | A Catalog source pin and worker mapping protect the read through GPU copy completion |
+| node: `remote` | A memory-node object with matching namespace and geometry | A source pin protects the RDMA READ; worker staging stays owned through GPU copy completion |
 
 ## 1. Key Semantics
 

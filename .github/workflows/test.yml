@@ -103,11 +103,13 @@ jobs:
 
       - name: Run unit tests with coverage
         run: |
-          pytest -m "not integration" \
+          pytest -x --durations=20 -m "not integration" \
             --cov=maru_handler \
             --cov=maru_server \
             --cov=maru_common \
             --cov=maru_shm \
+            --cov=maru_storage_service \
+            --cov=maru_remote \
             --cov-report=term-missing \
             --cov-report=xml:coverage.xml \
             --junitxml=pytest.xml \

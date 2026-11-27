@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Thin NIXL wrapper: register host memory, exchange metadata, batch READ/WRITE.
 
-A memory node's remote CXL agent registers mapped CXL regions; a worker registers
-its host staging buffer. Metadata bytes travel in remote CXL agent replies, not
+A memory node's memory node registers mapped CXL regions; a worker registers
+its host staging buffer. Metadata bytes travel in memory node replies, not
 through NIXL's own side channels, so the transport never opens sockets.
 
 A timed-out transfer or failed cancellation can leave the NIC accessing its
@@ -10,11 +10,15 @@ buffers. :class:`TransferTimeout` and :class:`TransferUncertainError` carry a
 :class:`PendingTransfer` so the caller can retain those buffers until
 :meth:`PendingTransfer.poll` confirms handle release.
 
+:meth:`NixlTransport.post` starts a transfer without waiting; its owner polls
+:meth:`PendingTransfer.poll_state`. Only ``DONE`` ends a transfer: one
+released in ``ERR`` may still have bytes in the network.
+
 The default NIXL agent runs without its progress thread. A worker data path
 injects a native adapter with progress enabled and a 1 ms event-wait fallback.
-Transfer state queries still drive UCX on their caller. A remote CXL agent
+Transfer state queries still drive UCX on their caller. A memory node
 issues no transfers and retains progress OFF, so it drives UCX while a worker
-connects (``maru_remote_cxl_agent.progress``).
+connects (``maru_remote.progress``).
 """
 
 from __future__ import annotations
@@ -23,11 +27,18 @@ import ctypes
 import logging
 import threading
 import time
+from collections.abc import Set
+from enum import StrEnum
 from typing import Any
 
 logger = logging.getLogger(__name__)
 
 _POLL_SLEEP_S = 0.0002
+# What NIXL raises for a transfer whose peer is gone: its agent or
+# registration ended, or NIXL invalidated the peer agent once its connection
+# failed (its process died: the RC retries ran out)
+REMOTE_DISCONNECT = "NIXL_ERR_REMOTE_DISCONNECT"
+PEER_INVALIDATED = "NIXL_ERR_NOT_FOUND"
 
 
 def buffer_address(buf: Any) -> int:
@@ -71,6 +82,29 @@ def _default_agent(agent_name: str, ucx_device: str) -> Any:
     return agent
 
 
+class TransferState(StrEnum):
+    """What one poll of a posted transfer found.
+
+    ``ERR`` is no fence: the handle is released and the peer may be
+    disconnected, but bytes can still land on both sides until the
+    registrations they name end.
+    """
+
+    PENDING = "PENDING"  # handle held: running, unreadable, or unreleased
+    DONE = "DONE"  # NIXL said DONE and released the handle: every byte moved
+    ERR = "ERR"  # released without DONE: bytes may still land
+
+    @property
+    def released(self) -> bool:
+        """Whether the handle is released (it no longer holds the peer)."""
+        return self is not TransferState.PENDING
+
+    @property
+    def ended(self) -> bool:
+        """Whether no byte of the transfer moves any more: ``DONE`` only."""
+        return self is TransferState.DONE
+
+
 class PendingTransfer:
     """A transfer whose handle and buffers have not been released."""
 
@@ -99,6 +133,7 @@ class PendingTransfer:
         # Pools of one worker share the transport: two clients may poll the
         # same transfer, and its handle must be released once.
         self._poll_lock = threading.Lock()
+        self._query_warned = False  # a failed state query is logged once
 
     def hand_over(self, finished: bool = False) -> None:
         """Called by the posting thread once it stops using the handle.
@@ -110,8 +145,14 @@ class PendingTransfer:
             self.in_flight = False
             self.finished = self.finished or finished
 
-    def poll(self) -> bool:
+    def poll(self, release_disconnected: bool = False) -> bool:
         """Check whether the transfer has ended; release the handle if so.
+
+        Args:
+            release_disconnected: Take NIXL's errors for a gone peer
+                (remote disconnect, invalidated peer agent) as an error end
+                and release the handle (its pages stay with the caller as
+                for any error end).
 
         Returns:
             True only after a terminal state and NIXL handle release.
@@ -126,12 +167,24 @@ class PendingTransfer:
             try:
                 state = self._transport.check_state(self.handle)
             except Exception as exc:
-                logger.warning(
-                    "NIXL %s to %s: state check failed: %s", self.op, self.peer, exc
-                )
-                # Releasing an active NIXL handle can succeed while its RMA
-                # still touches memory. A failed query is no completion proof.
-                return False
+                text = str(exc)
+                if release_disconnected and (
+                    REMOTE_DISCONNECT in text or PEER_INVALIDATED in text
+                ):
+                    state = "ERR"
+                else:
+                    if not self._query_warned:
+                        self._query_warned = True
+                        logger.warning(
+                            "NIXL %s to %s: state check failed: %s",
+                            self.op,
+                            self.peer,
+                            exc,
+                        )
+                    # Releasing an active NIXL handle can succeed while its
+                    # RMA still touches memory. A failed query is no
+                    # completion proof.
+                    return False
             if state == "PROC":
                 return False
             if state == "DONE":
@@ -144,6 +197,18 @@ class PendingTransfer:
                 self.op, self.peer, self.handle
             )
             return self.finished
+
+    def poll_state(self, release_disconnected: bool = False) -> TransferState:
+        """Poll once and distinguish handle release from DONE.
+
+        Returns:
+            ``DONE`` once NIXL reported DONE and the handle is released;
+            ``ERR`` once the handle is released in any other terminal state;
+            ``PENDING`` otherwise. Only ``DONE`` ends the transfer.
+        """
+        if not self.poll(release_disconnected):
+            return TransferState.PENDING
+        return TransferState.DONE if self.completed else TransferState.ERR
 
 
 class TransferUncertainError(RuntimeError):
@@ -319,14 +384,37 @@ class NixlTransport:
         with self._lock:
             if any(p.peer == name for p in self._pending.values()):
                 raise RuntimeError(f"NIXL peer {name} still has unreleased transfers")
-            self._agent.remove_remote_agent(name)
+            self._remove_remote_agent(name)
             self._peers.discard(name)
             self._tainted.discard(name)
+
+    def _remove_remote_agent(self, name: str) -> None:
+        """Caller holds the lock. A peer NIXL invalidated (its connection
+        failed) is gone already."""
+        try:
+            self._agent.remove_remote_agent(name)
+        except Exception as exc:
+            if PEER_INVALIDATED not in str(exc):
+                raise
 
     def has_peer(self, name: str) -> bool:
         """Whether a peer is loaded (added by :meth:`add_peer`, not removed)."""
         with self._lock:
             return name in self._peers
+
+    def peer_metadata_matches(self, present: Set[str], absent: Set[str]) -> bool:
+        """Check the recorded peers and NIXL registrations after a failed update."""
+        with self._lock:
+            check = self._agent.check_remote_metadata
+            return (
+                self._peers == present
+                and all(check(name) for name in present)
+                and not any(check(name) for name in absent)
+            )
+
+    def peer_ready_hint(self, name: str) -> bool:
+        """Refresh hint. Posting rechecks both sets under the transport lock."""
+        return name in self._peers and name not in self._tainted
 
     def peer_usable(self, name: str) -> bool:
         """Whether NIXL's connection to a loaded peer has not failed.
@@ -360,9 +448,9 @@ class NixlTransport:
         """Send a peer an empty notification once its metadata is loaded.
 
         The notification travels over the connection that loading the peer
-        sets up, so it reaches a remote CXL agent once that connection is
-        complete; the agent drives UCX until then
-        (``maru_remote_cxl_agent.progress``).
+        sets up, so it reaches a memory node once that connection is
+        complete; the memory node drives UCX until then
+        (``maru_remote.progress``).
 
         Args:
             name: Peer name returned by :meth:`add_peer`.
@@ -426,13 +514,77 @@ class NixlTransport:
                     # destroys its rkeys and makes NIXL report ERR before the
                     # RMA has ended. Keep the peer until every transfer ends.
                     return False
-                self._agent.remove_remote_agent(name)
+                self._remove_remote_agent(name)
                 self._peers.discard(name)
                 self._tainted.discard(name)
         except Exception as exc:
             logger.error("closing the NIXL connection to %s failed: %s", name, exc)
             return False
         return True
+
+    def post_nowait(self, op, peer, pairs):
+        """Post once without waiting for transport ownership; None means busy."""
+        if not self._lock.acquire(False):
+            return None
+        pending = None
+        try:
+            if peer not in self._peers or peer in self._tainted:
+                raise RuntimeError("RDMA peer is unavailable")
+            local = self._agent.get_xfer_descs(
+                [(la, n, 0) for la, _, n in pairs], "DRAM"
+            )
+            remote = self._agent.get_xfer_descs(
+                [(ra, n, 0) for _, ra, n in pairs], "DRAM"
+            )
+            handle = self._agent.initialize_xfer(op, local, remote, peer)
+            pending = PendingTransfer(self, op, peer, handle)
+            pending.in_flight = False
+            self._pending[id(handle)] = pending
+            pending.direct_state = self._agent.transfer(handle)
+            pending.completed = pending.direct_state == "DONE"
+            return pending
+        except BaseException as exc:
+            if pending is not None:
+                pending.direct_state = None
+                exc.pending_transfer = pending
+            raise
+        finally:
+            self._lock.release()
+
+    def poll_nowait(self, pending):
+        """Observe completion and release a handle with one lock attempt each."""
+        if not self._lock.acquire(False):
+            return False
+        locked = False
+        try:
+            locked = pending._poll_lock.acquire(False)
+            if not locked:
+                return False
+            if pending.finished:
+                return True
+            if pending.in_flight:
+                return False
+            state = getattr(pending, "direct_state", None)
+            try:
+                if state not in ("DONE", "ERR"):
+                    state = self._agent.check_xfer_state(pending.handle)
+                    pending.direct_state = state
+                if state == "PROC":
+                    return False
+                if state == "DONE":
+                    pending.completed = True
+                else:
+                    self._tainted.add(pending.peer)
+                self._agent.release_xfer_handle(pending.handle)
+            except Exception:
+                return False
+            pending.finished = True
+            self._pending.pop(id(pending.handle), None)
+            return True
+        finally:
+            if locked:
+                pending._poll_lock.release()
+            self._lock.release()
 
     def read(
         self,
@@ -485,6 +637,60 @@ class NixlTransport:
             RuntimeError: if the transfer ends in an error state.
         """
         return self._xfer("WRITE", peer, pairs, timeout_s)
+
+    def post(
+        self, op: str, peer: str, pairs: list[tuple[int, int, int]]
+    ) -> PendingTransfer:
+        """Post one batched READ or WRITE and return without waiting.
+
+        Each remote range resolves to the key loaded with the peer's
+        metadata; local ranges must be registered here. The returned transfer
+        owns its handle, and holds the peer (no :meth:`disconnect`,
+        :meth:`close` or metadata load for it), until
+        :meth:`PendingTransfer.poll_state` leaves ``PENDING``.
+
+        Args:
+            op: ``"READ"`` (remote to local) or ``"WRITE"`` (local to remote).
+            peer: Peer name returned by :meth:`add_peer`.
+            pairs: ``(local_addr, remote_addr, nbytes)`` tuples.
+
+        Returns:
+            The transfer. A failed post still returns it: the request may
+            have reached the NIC, so polling decides, and the peer is
+            marked failed.
+
+        Raises:
+            ValueError: if ``op`` is unknown or ``pairs`` is empty.
+            Exception: if NIXL refuses to create the request; nothing was
+                posted.
+            BaseException: an interrupt after the request exists is raised
+                as is, with the transfer as ``pending_transfer``.
+        """
+        if op not in ("READ", "WRITE"):
+            raise ValueError(f"unknown NIXL operation {op!r}")
+        if not pairs:
+            raise ValueError("a transfer needs at least one range")
+        pending = self._prepare(op, peer, pairs)
+        try:
+            with self._lock:
+                state = self._agent.transfer(pending.handle)
+            if state == "DONE":
+                pending.completed = True
+            elif state == "ERR":
+                self.mark_failed(peer)
+            if state in ("DONE", "ERR"):
+                released = self.release_handle(op, peer, pending.handle)
+                pending.hand_over(finished=released)
+        except Exception as exc:
+            logger.warning("posting NIXL %s to %s failed: %s", op, peer, exc)
+            self.mark_failed(peer)
+        except BaseException as exc:
+            exc.pending_transfer = pending  # type: ignore[attr-defined]
+            raise
+        finally:
+            if pending.in_flight:
+                pending.hand_over()  # polling takes it from here
+        return pending
 
     def check_state(self, handle: Any) -> str:
         """Return the NIXL state string of a transfer handle.
@@ -544,6 +750,22 @@ class NixlTransport:
         for reg in registrations:
             self.deregister(reg)
 
+    def _prepare(
+        self, op: str, peer: str, pairs: list[tuple[int, int, int]]
+    ) -> PendingTransfer:
+        """Create the NIXL request and track it, still in the caller's hands."""
+        with self._lock:
+            local = self._agent.get_xfer_descs(
+                [(la, n, 0) for la, _ra, n in pairs], "DRAM"
+            )
+            remote = self._agent.get_xfer_descs(
+                [(ra, n, 0) for _la, ra, n in pairs], "DRAM"
+            )
+            handle = self._agent.initialize_xfer(op, local, remote, peer)
+            pending = PendingTransfer(self, op, peer, handle)
+            self._pending[id(handle)] = pending
+        return pending
+
     def _xfer(
         self,
         op: str,
@@ -570,16 +792,8 @@ class NixlTransport:
         """
         if not pairs:
             return 0.0
-        with self._lock:
-            local = self._agent.get_xfer_descs(
-                [(la, n, 0) for la, _ra, n in pairs], "DRAM"
-            )
-            remote = self._agent.get_xfer_descs(
-                [(ra, n, 0) for _la, ra, n in pairs], "DRAM"
-            )
-            handle = self._agent.initialize_xfer(op, local, remote, peer)
-            pending = PendingTransfer(self, op, peer, handle)
-            self._pending[id(handle)] = pending
+        pending = self._prepare(op, peer, pairs)
+        handle = pending.handle
         try:
             return self._run(op, peer, handle, pending, timeout_s)
         except BaseException as exc:

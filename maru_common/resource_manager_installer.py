@@ -92,11 +92,6 @@ def _do_uninstall(prefix: str) -> int:
                 service,
             )
 
-    from maru_remote_cxl_agent import installer as remote_cxl_agent_installer
-
-    if remote_cxl_agent_installer.uninstall():
-        removed = True
-
     if not removed:
         fprintf(sys.stderr, "Nothing to remove.\n")
 
@@ -182,12 +177,6 @@ def _do_install(args: argparse.Namespace) -> int:
             capture_output=True,
         )
 
-    # -- remote CXL agent service (remote workers over RDMA) ----------------------
-    if not getattr(args, "no_remote_cxl_agent", False):
-        from maru_remote_cxl_agent import installer as remote_cxl_agent_installer
-
-        remote_cxl_agent_installer.install()
-
     fprintf(sys.stderr, "Installation complete!\n")
     fprintf(sys.stderr, "  Binary: %s/bin/maru-resource-manager\n", args.prefix)
 
@@ -234,13 +223,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--uninstall",
         action="store_true",
-        help="remove the installed resource manager and remote CXL agent service",
-    )
-    parser.add_argument(
-        "--no-remote-cxl-agent",
-        action="store_true",
-        help="do not install the remote CXL agent service, which starts with the "
-        "resource manager and serves remote workers (installed only if NIXL is)",
+        help="remove the installed resource manager",
     )
     args = parser.parse_args(argv)
 

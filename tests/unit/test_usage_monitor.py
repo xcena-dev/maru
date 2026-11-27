@@ -122,51 +122,20 @@ class TestUsageMonitorRendering:
         # slack column == allocated - used
         assert int(row0[5]) == int(row0[3]) - int(row0[4])
 
-    def test_cpu_usage_survives_wire_parsing_and_is_visible(self):
-        usage = _FakeClient(
-            {
-                "cpu_storage": {
-                    "pools": [
-                        {
-                            "pool_id": "cpu-pool",
-                            "engine_id": "cpu-engine",
-                            "active": False,
-                            "capacity_bytes": 4096,
-                            "allocated_bytes": 2048,
-                            "ready_bytes": 1000,
-                            "quarantined_bytes": 1024,
-                        }
-                    ]
-                }
-            }
-        ).get_usage()
-        table = usage_monitor.render_table(usage, "now")
-        assert "CPU DRAM" in table
-        assert "cpu-engine" in table
-        assert "expired" in table
-        assert "4.0K" in table
 
-    def test_remote_cxl_regions_are_listed_under_their_engine(self):
-        usage = _FakeClient(
-            {
-                "l1_storage": {
-                    "pools": [
-                        {
-                            "pool_id": "region-pool",
-                            "engine_id": "worker-1",
-                            "medium": "remote_cxl",
-                            "active": True,
-                            "capacity_bytes": 4096,
-                            "allocated_bytes": 2048,
-                            "ready_bytes": 1000,
-                            "quarantined_bytes": 0,
-                        }
-                    ]
-                }
-            }
-        ).get_usage()
-        lines = usage_monitor.render_table(usage, "now").splitlines()
-        header = next(line for line in lines if "engine_id" in line)
-        row = next(line for line in lines if line.lstrip().startswith("worker-1"))
-        assert "remote_cxl" in row
-        assert row.index("active") == header.index("state")
+def test_discover_only_cxl_servers(monkeypatch, tmp_path):
+    from maru_tools import live
+
+    for pid, options in enumerate(
+        [[], ["--backend=cxl"], ["--backend", "node"], ["--backend=node"]], start=1
+    ):
+        process = tmp_path / str(pid)
+        process.mkdir()
+        argv = ["maru-server", *options, "--port", str(6000 + pid)]
+        (process / "cmdline").write_bytes("\0".join(argv).encode())
+
+    monkeypatch.setattr(live, "Path", lambda _: tmp_path)
+    assert sorted(live.discover_servers(self_pid=0)) == [
+        ("127.0.0.1", 6001, 1),
+        ("127.0.0.1", 6002, 2),
+    ]

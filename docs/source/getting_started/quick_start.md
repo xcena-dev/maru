@@ -1,201 +1,202 @@
+(quickstart-node-local)=
+
 # Quick Start
 
-Choose the storage path first. The Python producer/consumer below exercise
-the default **`cxl` backend**, using direct DAX mappings; they require no GPU
-or inference engine. They are not an RDMA worker setup.
+Two vLLM engines on one GPU node share KV cache through its DRAM store. For shared CXL memory, LMCache or SGLang, see {doc}`Shared CXL <deployments/shared_cxl>`. For several GPU nodes that share a memory node's DRAM or CXL pool over RDMA, see {doc}`Memory Node over RDMA <deployments/memory_node>`.
 
-| Intended setup | Start here |
-|---|---|
-| Directly mapped CXL, one or several hosts | The producer/consumer instructions below |
-| GPU workers without CXL sharing memory-node CXL over RDMA | {doc}`vLLM examples <examples/vllm/index>` and the [remote CXL launch guide](https://github.com/xcena-dev/maru/blob/main/examples/vllm/remote_cxl/README.md) |
-| Worker-private CPU DRAM cache, without CXL or RM | [CPU example](https://github.com/xcena-dev/maru/blob/main/examples/vllm/cpu/README.md) |
-| Worker-private CPU and CXL pools together | [Mixed example](https://github.com/xcena-dev/maru/blob/main/examples/vllm/mixed/README.md) |
+## Prerequisites
 
-CPU storage still serves a model running on a GPU; it does not mean CPU model
-execution. These backends have different lease, sharing and capacity rules;
-see {doc}`../design_doc/memory_model`.
+Use a node with at least one NVIDIA GPU. Install vLLM 0.16 or later for deferred loading. See the {ref}`vLLM prerequisites <vllm-prerequisites>`. Then follow {doc}`installation` and activate the Maru environment in each terminal. The engines use `Qwen/Qwen3-0.6B`. For another {doc}`supported model <../integration/supported_models>`, its largest stored KV object must fit in `page_size`.
 
-| Setup | Required environment | Where the clients run |
-|-------|----------------------|-----------------------|
-| {ref}`Single-host <quickstart-single-host>` | One x86 host with a CXL DEV_DAX device | Two terminals on the same host |
-| {ref}`Multi-host <quickstart-multi-host>` | Two x86 hosts connected to shared CXL memory through a CXL switch/fabric | Producer on Node A, consumer on Node B |
+Create `/run/maru` for the GPU StorageService's node lock and worker socket.
 
-For the CXL producer/consumer, complete {doc}`bios_setup` and {doc}`installation` first. Activate the Maru
-Python environment in each terminal. Both setups use port `9850` for the
-Resource Manager and `5555` for MaruServer.
+```bash
+sudo install -d -o "$USER" -g "$(id -gn)" /run/maru
+```
 
 ## 1. Start the services
 
-Choose one setup below. Keep the services running while using the clients.
-
-(quickstart-single-host)=
-### Single-host
-
-Start the Resource Manager as a systemd service:
+Start MaruServer in its own terminal. It tracks keys for the node backend.
 
 ```bash
-sudo systemctl start maru-resource-manager
+maru-server --backend node --host 127.0.0.1 --port 5556
 ```
 
-Alternatively, with the service stopped, run it in a dedicated terminal:
+The GPU StorageService owns the DRAM store. Write its configuration to `gpu.json`.
+
+```json
+{
+  "node_id": "gpu-1",
+  "server": "tcp://127.0.0.1:5556",
+  "page_size": "32MiB",
+  "tiers": [{"store": "dram", "size": "16GiB", "hugepage": false}]
+}
+```
+
+Check the configuration, then start the GPU StorageService in another terminal. The GPU role is the default for `maru-storage`.
 
 ```bash
-sudo maru-resource-manager --host 127.0.0.1 --port 9850
+maru-storage --role gpu --config gpu.json --check
+maru-storage --role gpu --config gpu.json
 ```
 
-Wait until the Resource Manager logs `ready — listening on 127.0.0.1:9850` (for the systemd service, check `journalctl -u maru-resource-manager`), then start MaruServer in another terminal:
+(quickstart-node-clients)=
 
-```bash
-maru-server
-```
+## 2. Check without a GPU (optional)
 
-In **both client terminals**, set the server address:
+Run two Python processes on this node. Each connects to the GPU StorageService socket with its own engine ID. Both use the same cache namespace.
 
-```bash
-export MARU_SERVER_URL=tcp://127.0.0.1:5555
-```
-
-Continue to {ref}`the producer and consumer <quickstart-clients>`.
-
-(quickstart-multi-host)=
-### Multi-host
-
-This example runs both services and the producer on **Node A**, with the
-consumer on **Node B**:
-
-```mermaid
-flowchart TB
-    subgraph A["Node A · 192.0.2.10"]
-        P["Producer<br/>MaruHandler"]
-        Services["MaruServer: 5555<br/>Resource Manager: 9850"]
-        P -.-> Services
-    end
-    subgraph B["Node B"]
-        C["Consumer<br/>MaruHandler"]
-    end
-
-    C -.-> Services
-    P --- Switch["CXL switch / fabric"]
-    C --- Switch
-    Switch --- Memory[("Shared CXL memory")]
-```
-
-Dashed lines are TCP connections to the services on Node A. Solid lines show
-each host's direct access to the shared memory through its local DEV_DAX device
-and the CXL fabric.
-
-Both hosts must have read/write access to the **same physical CXL memory at
-matching device offsets**. Install Maru with `./install.sh` on Node A and
-`./install.sh --no-rm` on Node B.
-
-Replace `192.0.2.10` with Node A's reachable IP. Node B must be able to reach
-Node A on TCP ports `5555` and `9850`.
-
-Run one Resource Manager for the shared pool on **Node A**. Stop the systemd service first: a service still bound to `127.0.0.1:9850` does not conflict with a second Resource Manager on `192.0.2.10:9850`, and the two would manage the same devices and state directory. Then start it in a dedicated terminal:
-
-```bash
-sudo systemctl stop maru-resource-manager
-sudo maru-resource-manager --host 192.0.2.10 --port 9850
-```
-
-To run it as the systemd service instead, see the {ref}`multi-node configuration <installation-multi-node-config>`.
-
-Wait until it logs `ready — listening on 192.0.2.10:9850`, then start MaruServer in another terminal on **Node A**:
-
-```bash
-maru-server --host 192.0.2.10 --port 5555 \
-    --rm-address 192.0.2.10:9850 \
-    --dax-path /dev/dax0.0
-```
-
-Replace `/dev/dax0.0` with the shared device's path on Node A. Local device
-names may differ on Node B; Maru resolves them by UUID. The advertised
-`--rm-address` must be reachable from Node B, so use Node A's IP here.
-
-In **both client terminals** (one on each host), set the same server address:
-
-```bash
-export MARU_SERVER_URL=tcp://192.0.2.10:5555
-```
-
-Continue to {ref}`the producer and consumer <quickstart-clients>`.
-
-(quickstart-clients)=
-## 2. Run the producer and consumer
-
-Use these same snippets for either setup. Keep `MARU_SERVER_URL` set as shown
-above in each client terminal. For single-host, run both clients on the same
-host; for multi-host, run the producer on Node A and the consumer on Node B.
-
-### Producer: write and store
-
-Run this first and keep it running until the consumer finishes:
+Save the producer as `producer.py`. It stores 1 MiB under one key.
 
 ```python
-import os
+import sys
 
 from maru import MaruConfig, MaruHandler
-from maru_shm._cxl_flush import HAVE_CLFLUSH, flush_range
-
-assert HAVE_CLFLUSH, "This CPU example requires x86 cache-flush support"
 
 config = MaruConfig(
-    server_url=os.environ["MARU_SERVER_URL"],
-    instance_id="producer",
-    pool_size=100 * 1024 * 1024,
+    maru_node=sys.argv[1],
+    engine_id="producer",
+    cache_namespace="quickstart",
+    pin_pools=False,
 )
-
 with MaruHandler(config) as handler:
     data = b"A" * (1024 * 1024)
-    handle = handler.alloc(size=len(data))
+    handle = handler.alloc(len(data))
     handle.buf[:] = data
-    flush_range(handle.buf)  # Make the CPU write visible before publishing.
-    handler.store(key="quickstart-demo", handle=handle)
-
-    print("Stored 1 MiB. Run the consumer.")
-    input("Press Enter after the consumer finishes...")
+    if not handler.store("quickstart-demo", handle):
+        raise RuntimeError("Could not store quickstart-demo")
 ```
 
-### Consumer: retrieve and verify
-
-Run this in the other client terminal:
+Save the consumer as `consumer.py`. It reads the same key and releases the read when it leaves the `with result` block.
 
 ```python
-import os
+import sys
 
 from maru import MaruConfig, MaruHandler
-from maru_shm._cxl_flush import HAVE_CLFLUSH, flush_range
-
-assert HAVE_CLFLUSH, "This CPU example requires x86 cache-flush support"
 
 config = MaruConfig(
-    server_url=os.environ["MARU_SERVER_URL"],
-    instance_id="consumer",
-    pool_size=100 * 1024 * 1024,
+    maru_node=sys.argv[1],
+    engine_id="consumer",
+    cache_namespace="quickstart",
+    pin_pools=False,
 )
-
 with MaruHandler(config) as handler:
-    result = handler.retrieve(key="quickstart-demo")
-    assert result is not None, "Run the producer first"
-    flush_range(result.view)  # Discard local cached copies before reading.
-    assert bytes(result.view) == b"A" * (1024 * 1024)
-    print("Success: read the producer's data from shared CXL memory")
+    result = handler.retrieve("quickstart-demo")
+    if result is None:
+        raise RuntimeError("Run the producer first")
+    with result:
+        if result.view != b"A" * (1024 * 1024):
+            raise ValueError("The stored bytes differ")
+        print("Success: read 1 MiB from the producer")
 ```
 
-The consumer should print `Success: read the producer's data from shared CXL memory`.
-The `flush_range` calls make CPU writes and reads visible across hosts and are used in both setups. They require Maru's x86 cache-flush extension; if the import fails, see {ref}`verifying the installation <installation-verify>`. See {doc}`../design_doc/consistency_and_safety` for the write-back and invalidation pattern.
+Run the producer first. Once it exits, the GPU StorageService still owns the stored data, so the consumer can read it.
 
-## 3. Stop the example
+```bash
+CUDA_VISIBLE_DEVICES="" python3 producer.py /run/maru/node.sock
+CUDA_VISIBLE_DEVICES="" python3 consumer.py /run/maru/node.sock
+```
 
-Press Enter in the producer terminal to exit. Stop MaruServer, then stop the
-Resource Manager if you started it for this example. Use Ctrl+C for foreground
-processes, or `sudo systemctl stop maru-resource-manager` for the systemd service.
+The consumer should print `Success: read 1 MiB from the producer`.
+
+## 3. Start two vLLM engines
+
+Start two engines in separate terminals. They connect to the default socket `/run/maru/node.sock`. Give each engine a distinct `maru_engine_id`. Pin the same immutable revision in both engine commands and include it in their shared namespace so a cache key identifies the same weights on both engines.
+
+```bash
+CUDA_VISIBLE_DEVICES=0 vllm serve Qwen/Qwen3-0.6B --revision c1899de289a04d12100db370d81485cdf75e47ca --port 8000 --kv-transfer-config '{
+  "kv_connector": "MaruKVConnector",
+  "kv_connector_module_path": "maru_vllm",
+  "kv_role": "kv_both",
+  "kv_load_failure_policy": "recompute",
+  "kv_connector_extra_config": {
+    "maru_node": "/run/maru/node.sock",
+    "maru_engine_id": "engine-1",
+    "maru_cache_namespace": "Qwen/Qwen3-0.6B@c1899de289a04d12100db370d81485cdf75e47ca",
+    "maru_async_load": true
+  }
+}'
+```
+
+```bash
+CUDA_VISIBLE_DEVICES=1 vllm serve Qwen/Qwen3-0.6B --revision c1899de289a04d12100db370d81485cdf75e47ca --port 8001 --kv-transfer-config '{
+  "kv_connector": "MaruKVConnector",
+  "kv_connector_module_path": "maru_vllm",
+  "kv_role": "kv_both",
+  "kv_load_failure_policy": "recompute",
+  "kv_connector_extra_config": {
+    "maru_node": "/run/maru/node.sock",
+    "maru_engine_id": "engine-2",
+    "maru_cache_namespace": "Qwen/Qwen3-0.6B@c1899de289a04d12100db370d81485cdf75e47ca",
+    "maru_async_load": true
+  }
+}'
+```
+
+With one GPU, start both engines on GPU 0 and add `--gpu-memory-utilization 0.4` to each.
+
+(quickstart-node-verify)=
+
+## 4. Verify sharing
+
+Save this client as `send.py`. It sends the same prompt to each engine.
+
+```python
+import json
+import sys
+import urllib.request
+
+prompt = " ".join(
+    f"Line {i}: Maru shares KV cache between engines." for i in range(200)
+)
+body = {
+    "model": "Qwen/Qwen3-0.6B",
+    "prompt": prompt,
+    "max_tokens": 16,
+    "temperature": 0,
+}
+request = urllib.request.Request(
+    f"{sys.argv[1]}/v1/completions",
+    data=json.dumps(body).encode(),
+    headers={"Content-Type": "application/json"},
+)
+with urllib.request.urlopen(request) as response:
+    print(json.load(response)["choices"][0]["text"])
+```
+
+From a client terminal, check that both engines are ready.
+
+```bash
+engine_a=http://127.0.0.1:8000
+engine_b=http://127.0.0.1:8001
+curl -fsS "$engine_a/health" && curl -fsS "$engine_b/health"
+```
+
+Once both health checks succeed, send the same prompt to each engine. Keep engine B idle between samples so the counter changes belong to this request.
+
+```bash
+metrics() {
+    curl -fsS "$engine_b/metrics" | grep -E '^vllm:(external_prefix_cache_hits_total|prompt_tokens_by_source_total[{][^}]*source="external_kv_transfer")'
+}
+python3 send.py "$engine_a"
+metrics
+python3 send.py "$engine_b"
+metrics
+```
+
+A rise in `vllm:external_prefix_cache_hits_total` counts tokens matched by the lookup. Check that `vllm:prompt_tokens_by_source_total{source="external_kv_transfer"}` also increases and that the worker reports a completed load. With `kv_load_failure_policy` set to `recompute`, a cache miss or recoverable load failure triggers recomputation. Check the worker log for the reason. A CUDA error that leaves a copy unconfirmed stops the worker.
+
+## 5. Stop
+
+Press Ctrl+C in the engine terminals, then in the GPU StorageService terminal and finally in the MaruServer terminal.
+
+## Local CXL
+
+To use local CXL instead of DRAM, complete {doc}`bios_setup`, start the Resource Manager (`sudo systemctl start maru-resource-manager`) and use `{"store": "local_cxl", "size": "16GiB"}` as the tier.
 
 ## Next steps
 
-- {doc}`examples/vllm/index` — More vLLM serving examples
-- {doc}`examples/dynamo/index` — Run Dynamo with Maru-backed vLLM workers
-- {doc}`examples/lmcache/index` — Use Maru as a shared KV cache backend for LMCache
-- {doc}`../design_doc/architecture_overview` — System architecture and component interactions
-- {doc}`../api_reference/api` — Python API
-- {doc}`../api_reference/config` — Configuration options
+- {doc}`deployments/index` — Choose a setup for your nodes
+- {doc}`examples/index` — Run integration examples
+- {doc}`../design_doc/node_storage_service` — Configuration keys, budgets, eviction and recovery
+- {doc}`../integration/vllm` — Connector settings, tensor parallelism and hybrid models

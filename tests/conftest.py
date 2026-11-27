@@ -17,6 +17,7 @@ from collections.abc import Generator
 
 import pytest
 
+import maru_common.gc_freeze
 import maru_handler.plugin
 from maru_shm import MaruHandle
 
@@ -45,6 +46,15 @@ def _no_installed_handler_plugins(monkeypatch):
     """
     monkeypatch.delenv(maru_handler.plugin.PLUGIN_ALLOWLIST_ENV, raising=False)
     monkeypatch.setattr(maru_handler.plugin, "_discover_entry_points", lambda: [])
+
+
+@pytest.fixture(autouse=True)
+def _no_gc_freezer(monkeypatch):
+    """Service entry points run in the test process too: keep its collector
+    as it is (a frozen object's cycles are never collected)."""
+    monkeypatch.setattr(
+        maru_common.gc_freeze, "start_freezer", lambda *a, **kw: threading.Event()
+    )
 
 
 # =============================================================================

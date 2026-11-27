@@ -54,7 +54,7 @@ flowchart TB
 
 ## 2. IPC Protocol
 
-> **Note:** This section describes the Resource Manager's binary IPC protocol (TCP, port 9850). The Metadata Server (`maru-server`) uses a separate RPC protocol over ZMQ (port 5555) — see the MaruServer documentation for details.
+> **Note:** This section describes the Resource Manager's binary IPC protocol (TCP, port 9850). MaruServer (`maru-server --backend cxl`) uses a separate RPC protocol over ZMQ (port 5555) — see the MaruServer documentation for details.
 
 All messages use a fixed-size binary header (12 bytes) containing protocol magic, version (v2), message type, and payload length, followed by a type-specific payload. Communication is over TCP.
 
@@ -63,9 +63,10 @@ All messages use a fixed-size binary header (12 bytes) containing protocol magic
 | `ALLOC_REQ` / `ALLOC_RESP` | client ↔ server | Allocate shared memory; response includes handle + device path |
 | `FREE_REQ` / `FREE_RESP` | client ↔ server | Free allocation (requires valid auth token) |
 | `GET_ACCESS_REQ` / `GET_ACCESS_RESP` | client ↔ server | Request device path + offset + length for an existing allocation |
-| `HOLD_REQ` / `HOLD_RESP` | client ↔ server | `GET_ACCESS` that also records a hold: a remote CXL agent holds every region it registers with its NIC (§5) |
-| `MAP_HOLD_REQ` / `MAP_HOLD_RESP` | client ↔ server | `GET_ACCESS` that also records a hold with the caller's process identity: a process holds every region it maps (§5) |
-| `UNHOLD_REQ` / `UNHOLD_RESP` | client ↔ server | The holder deregistered or unmapped the region (requires the handle) |
+| `HOLD_REQ` / `HOLD_RESP` | client ↔ server | Get access and record a hold for a named holder and instance |
+| `NODE_HOLD_REQ` / `NODE_HOLD_RESP` | client ↔ server | Get access for a node service or worker and record its process identity and current node run (§5) |
+| `MAP_HOLD_REQ` / `MAP_HOLD_RESP` | client ↔ server | Get access and record the mapping client's process identity (§5) |
+| `UNHOLD_REQ` / `UNHOLD_RESP` | client ↔ server | Drop the holder's hold after deregistration or unmapping (requires the handle) |
 | `RESET_HOLDS_REQ` / `RESET_HOLDS_RESP` | client ↔ server | A restarted holder drops the holds of its earlier process |
 | `STATS_REQ` / `STATS_RESP` | client ↔ server | Query per-pool statistics |
 | `ERROR_RESP` | server → client | Error with status code and message |
@@ -144,7 +145,7 @@ An owner counts as gone only when it is a local process whose PID no longer exis
 
 ## 5. Reaper
 
-The Reaper periodically checks the liveness of each allocation's owner process. If the process no longer exists, its allocations are reclaimed — extents are returned to the free list and the allocation is removed from the map.
+The Reaper periodically checks the liveness of each allocation's owner process. When the process exits, the RM reclaims its allocations. A held allocation drains before its extent returns to the free list.
 
 To defend against **PID reuse**, the server caches each client's process start time at allocation time. If the OS reports the process as alive but the current start time differs from the cached value, the PID has been recycled by the kernel, and the allocations are reclaimed.
 
@@ -154,9 +155,13 @@ The server also monitors TCP connection state, for local and remote clients alik
 
 Local vs. remote is determined by comparing the client's hostname (from `client_id`) against the server's hostname. TCP keepalive (idle 10s, interval 5s, count 3) detects dead connections in ~25 seconds, after which the grace period starts — so a crashed remote client's allocations are reclaimed after ~55 seconds total.
 
-**Held regions.** A remote CXL agent registers the regions it maps with its node's NIC, and a late RDMA WRITE through such a registration would land in whatever region next gets the range. So the agent holds each region it registers (`HOLD`, named by its node and process instance) and unholds it once deregistered. A region freed while held, by its owner, the reaper, `maru-rm-ctl release` or recovery, becomes *draining*: it is freed for its owner and `GET_ACCESS` refuses it, but its range stays out of the free list until the last holder unholds it. A restarted agent drops the holds of its earlier process (`RESET_HOLDS`), whose registrations ended with it. Holds and draining marks are kept in `holds` in the state directory (rewritten atomically on every change), so a restart keeps the range out of use too. A pool with a held region is never reset by recovery. If a memory node is gone for good, `maru-rm-ctl drop-holds NODE --confirm` drops its holds. The RM trusts its network for `RESET_HOLDS`, as for `ALLOC`.
+**Held regions.** A node service or worker holds CXL regions while mappings or NIC registrations can access them. Returning an allocation does not override a hold: the region becomes *draining*, `GET_ACCESS` refuses it, and its range stays out of the free list until the final hold ends. Services remove NIC registrations before releasing their holds, so late RDMA writes cannot target reused ranges. Node ownership and process identity protect restart adoption; a live old worker can keep an earlier run's range held. Holds survive Resource Manager restart. If a holder is gone permanently, `maru-rm-ctl drop-holds HOLDER --confirm` removes its holds. See {doc}`node_storage_service` for source pins and write-domain fencing.
 
-**Mapped regions.** A process that maps a region, such as a `cxl` Handler, can write through that mapping for as long as it lives, whatever happens to the region's owner: the owner is usually `maru-server`, and a Handler stores KV into its region before it registers the key there. So `MaruShmClient.mmap()` takes a hold first (`MAP_HOLD`) and `munmap()`, `free()` and `close()` drop it once the mapping is closed. A region that is freed or reclaimed while mapped drains as above, and its range goes to no other owner before every such process has unmapped it or has ended. Each hold is named after its client (`mmap:<host>:<pid>:<id>`) and records the process: host, boot ID, PID, start time and pid namespace. The reaper drops the hold of a process it sees gone, `--hold-grace` (5 s by default) after it first saw that, which it can tell only for a process that reports the RM's own hostname, boot ID and pid namespace. A process on another host does not, and neither does a container unless it shares both the host's pid namespace and its hostname: `--pid=host` together with `--uts=host` or `--network=host` on Docker, `hostPID` and `hostNetwork` on Kubernetes. The hold of any other process that ended without unmapping stays until an operator drops it with `maru-rm-ctl drop-holds HOLDER --confirm`; `maru-rm-ctl allocations` lists the holders. A client that cannot reach the RM to drop a hold, or whose RM could not save the drop, tries again later and when it closes. A `cxl` Handler also maps the regions of other instances to read them, and keeps those mappings until it closes: a region freed in the meantime stays out of use for as long as any Handler that mapped it runs. A mapping whose exported buffers keep it from closing keeps its hold until the process exits. A mapping that a forked child inherits is not covered: its hold is the parent's, and ends with the parent. The child cannot map further regions with the inherited client and has to create its own. A client of this version maps without a hold, with a warning, when the RM predates `MAP_HOLD`. It asks again when it maps a region, at most every 60 s, so once the RM is restarted with this version the client holds what it maps from then on, and the regions it mapped without a hold as well. A client that maps nothing after the RM's upgrade stays unprotected until its process is restarted.
+**Mapped regions.** A `cxl` Handler can still access a region after MaruServer returns it. `MaruShmClient.mmap()` takes a durable `MAP_HOLD` before opening the device. Each client in a process has its own holder name (`mmap:<host>:<pid>:<id>`). `munmap()`, `free()` and `close()` drop the hold after the mapping closes. If exported buffers prevent closure, the hold stays until process exit. A Handler keeps mappings it opened to read other instances' regions until it closes. A forked child inherits the mapping, but its protection ends when the parent's hold ends. A child needs its own client for new mappings.
+
+A map hold records the host, boot ID, PID, process start time and PID namespace. On the same boot, the reaper drops a local process's hold after confirming exit and observing `--hold-grace` (default 5 s). A container must share the RM's hostname and PID namespace for this check. The RM also recognizes holds from an earlier local boot. For a process the RM cannot check, use the holder name from `maru-rm-ctl allocations` with `drop-holds` once the process is gone. A client retries an unconfirmed drop when it communicates with the RM again and when it closes.
+
+With an RM that predates `MAP_HOLD`, the client logs a warning and maps without a hold. When opening a new mapping, it checks for support at most once every 60 s. Once an upgraded RM accepts a map hold, the client also requests holds for its existing unprotected mappings. A client that only reuses cached mappings stays unprotected until it opens a new mapping or restarts.
 
 ---
 
@@ -206,9 +211,7 @@ maru-resource-manager --host 127.0.0.1 --port 9850 \
                       --log-level debug
 ```
 
-> **Security note:** The default bind address is `127.0.0.1` (local-only). When binding to
-> `0.0.0.0` for multi-node deployments, auth tokens and device paths are transmitted in
-> plaintext. Use an encrypted tunnel (WireGuard, SSH tunnel, IPsec) to protect the traffic.
+> **Security note:** The default bind address is `127.0.0.1` (local-only). When binding to `0.0.0.0` for multi-node deployments, auth tokens and device paths are transmitted in plaintext. Use an encrypted tunnel (WireGuard, SSH tunnel, IPsec) to protect the traffic.
 
 ### RM address propagation
 

@@ -9,103 +9,37 @@
   <a href="https://opensource.org/licenses/Apache-2.0"><img src="https://img.shields.io/badge/License-Apache_2.0-green.svg" alt="License"></a>
 </p>
 
-**Maru** is a high-performance **KV cache storage engine built on shared memory pools**, designed for LLM inference scenarios where multiple instances need to share a KV cache with minimal latency. Maru supports two kinds of pool. A **CXL memory pool** is CXL memory that nodes attached to CXL reach through a CXL switch. An **RDMA memory pool** is the CXL memory of memory nodes, which GPU nodes without CXL reach over an RDMA network.
+**Maru** stores reusable KV cache in shared memory for LLM inference. The native vLLM connector supports the node backend (selected by `maru_node`). Each GPU node serves one store in DRAM, local CXL or remote memory. The directly mapped `cxl` backend also supports LMCache and SGLang.
 
-Maru stores reusable KV in a shared pool. With the `cxl` backend, CXL-attached nodes map that pool directly, avoiding KV payload transfers between compute nodes over an RDMA or IP network. GPU loads and stores still copy bytes between GPU memory and CXL. With `remote_cxl`, GPU nodes reach a memory node's CXL over one-sided RDMA through a worker-side CPU DRAM staging buffer. The memory node's NIC transfers the payload; MaruServer and the remote CXL agent handle metadata and region setup rather than relaying KV bytes.
-
-Node A stores the KV it computes in a shared KV cache, and nodes B and C load it instead of recomputing. The shared KV cache lives in either kind of pool: nodes use the `cxl` backend for a CXL memory pool and the `remote_cxl` backend for an RDMA memory pool, and each node shares KV with the other nodes that use the same pool through the same backend.
-
-The native vLLM connector also offers worker-private `cpu` and `mixed` caches.
-Those modes do not provide cross-worker sharing in the current implementation.
-See the [backend guide](https://xcena-dev.github.io/maru/source/integration/vllm.html)
-to choose the storage path before following the default CXL quick start.
-
-<p align="center">
-  <img src="docs/source/image/maru_shared_kv_cache.png" alt="Node A stores the KV of request 1 in a shared KV cache, and nodes B and C load that KV for requests 2 and 3. The shared KV cache holds a CXL memory pool, CXL memory behind a CXL switch, and an RDMA memory pool, CXL memory in memory pool nodes reached over an RDMA network">
-</p>
-
-| [**Documentation**](https://xcena-dev.github.io/maru/) |
-
-## Why Maru?
-
-- **Shared KV Storage** — Instances reuse KV stored in a common pool instead of recomputing the cached prefix. Each instance still loads the KV it needs into its own GPU cache.
-
-- **Two Access Paths** — CXL-attached workers map the pool directly (`cxl`). Workers without CXL use GPU ↔ CPU staging copies and staging ↔ CXL RDMA transfers (`remote_cxl`). Neither path relays the payload through MaruServer.
-
-- **Shared Pool Capacity** — Instances on a pool can reuse one stored KV object. Per-worker GPU caches and transfer buffers remain separate from that shared storage.
-
-- **Measured Performance** — The published [LMCache benchmark](https://xcena-dev.github.io/maru/source/performance/lmcache.html) compares the `cxl` backend with LMCache P2P in a single-node setup. Latency, scaling and energy results depend on the backend, transport and workload; those measurements do not establish `remote_cxl` performance or an advantage over RDMA-based systems.
-
-- **GPU Nodes without CXL** — With the `remote_cxl` storage backend, vLLM workers on GPU nodes without CXL keep their KV in an RDMA memory pool, the CXL memory of memory nodes. A remote CXL agent on each memory node maps regions and registers them with the node's NIC, and workers read and write them with one-sided RDMA. An RDMA memory pool can span several memory nodes that share the same CXL memory, and a worker can use several RDMA memory pools. See the [remote CXL example](examples/vllm/remote_cxl/README.md).
-
-## Overview
-
-| KV access | `cxl` | `remote_cxl` |
+| Backend | Storage and GPU access | Services |
 |---|---|---|
-| Worker access to the pool | Direct CXL mapping on a CXL-attached node | One-sided RDMA to CXL on a memory node |
-| GPU payload path | GPU ↔ mapped CXL region | GPU ↔ worker CPU DRAM staging ↔ RDMA ↔ CXL region |
-| Meaning of zero-copy | A CPU reader can view mapped KV without another host copy; GPU transfers still copy bytes | Retrieved bytes occupy a staging slot after an RDMA READ; this is not an end-to-end zero-copy path |
-| Metadata traffic | MaruServer RPC | MaruServer RPC plus remote CXL agent mapping and registration |
+| node, `dram` | Node-owned DRAM, mapped by local workers | MaruServer (`maru-server --backend node`) and GPU StorageService (`maru-storage --role gpu`) |
+| node, `local_cxl` | Node-owned CXL, mapped by local workers | MaruServer, GPU StorageService and Resource Manager |
+| node, `remote` | GPU ↔ worker staging ↔ RDMA ↔ memory-node DRAM or CXL | MaruServer, GPU StorageService and memory StorageService (`maru-storage --role memory`). Local CXL needs a Resource Manager on the memory host. |
+| `cxl` | GPU ↔ directly mapped shared CXL | MaruServer (`maru-server --backend cxl`) and Resource Manager |
 
-These are the storage access paths. Connector packing, CUDA registration and fallback copies can add temporary buffers; neither backend eliminates GPU data movement.
-
-The diagram shows two example pools and their worker access paths. Workers share KV with other workers using the same pool and backend. Each control-plane box groups the pool's metadata and allocation services; it does not represent one process or one physical node. RM means Resource Manager.
+KV payloads bypass metadata services. Remote workers issue RDMA READ and WRITE directly through their own registered staging. Memory nodes own the remote pages and publish keys only after COMMIT. Reads do not create cached copies on GPU nodes.
 
 ```mermaid
-flowchart TB
-    subgraph Direct["cxl"]
-        direction LR
-        CW["GPU worker<br/>MaruHandler<br/>CXL attached"]
-        CC["Control plane<br/>MaruServer + RM"]
-        CM[("CXL pool")]
-        CW <-.->|"metadata RPC"| CC
-        CC -.->|"alloc/free"| CM
-        CW <==>|"GPU copy"| CM
-    end
-
-    subgraph Remote["remote_cxl"]
-        direction LR
-        RW["GPU worker<br/>MaruHandler<br/>no local CXL"]
-        ST["CPU DRAM staging<br/>(on worker)"]
-        RC["Control plane<br/>MaruServer + RM"]
-        AG["Remote CXL agent<br/>(memory node)"]
-        RM[("RDMA pool<br/>CXL on memory node")]
-        RW <-.->|"metadata RPC"| RC
-        RW <-.->|"map/release"| AG
-        RW <==>|"GPU copy"| ST
-        ST <==>|"RDMA READ/WRITE"| RM
-        RC -.->|"alloc/free"| RM
-        AG -.->|"map + NIC register"| RM
-    end
-
-    Direct ~~~ Remote
-    style Direct fill:#eff6ff,stroke:#3b82f6
-    style Remote fill:#f0fdf4,stroke:#22c55e
-    style AG fill:#fff7ed,stroke:#f97316
-    style RM fill:#fff7ed,stroke:#f97316
+flowchart LR
+    W["vLLM worker"] <-.-> C["MaruServer"]
+    W <-.-> G["GPU StorageService"]
+    G <-.-> M["maru-storage --role memory"]
+    M <-.-> C
+    W <==>|"GPU copy"| S["worker staging"]
+    S <==>|"RDMA READ / WRITE"| P[("memory-node store")]
+    M -.->|"map, register, fence"| P
 ```
 
-> **Control Plane** (dashed arrows) — KV metadata operations and region allocation.
->
-> **Data Plane** (thick solid arrows) — `cxl` copies KV between GPU memory and mapped CXL. `remote_cxl` copies it between GPU memory and worker CPU staging, then transfers it between staging and memory-node CXL over RDMA. Payload arrows bypass the control plane and remote CXL agent.
+Compatible engines reuse keys within the selected store and namespace. GPU-local stores skip new writes when full; memory nodes use a shared LRU. GPU copies and RDMA staging still move bytes. Node components use the same release, and their Catalog is separate from the `cxl` registry.
 
-GPU nodes without CXL use the `remote_cxl` storage backend. Their KV stays in an RDMA memory pool, the CXL memory of memory nodes: a remote CXL agent on each memory node maps the regions a worker asks for and registers them with the node's NIC, and the worker reads and writes them with one-sided RDMA (NIXL/UCX). The agent is needed because one-sided RDMA reaches only memory that a process on the memory node has mapped and registered with its NIC, and a worker without CXL cannot map the region itself. Only control messages go to maru-server and the remote CXL agent. See [Remote CXL](https://xcena-dev.github.io/maru/source/design_doc/architecture_overview.html#remote-cxl-cxl-memory-of-other-nodes-over-rdma) in the architecture overview.
+See [Node StorageService](docs/source/design_doc/node_storage_service.md) for store configuration, capacity and recovery.
 
 ## Quick Start
 
 ### System Components
 
-Maru consists of two server components and a client library. A deployment with GPU nodes without CXL adds a remote CXL agent on each memory node:
-
-| Component | Role | Package |
-|-----------|------|---------|
-| **Resource Manager** | Manages the CXL memory of a memory pool | `maru-resource-manager` (C++) |
-| **Metadata Server** | Manages KV metadata | `maru-server` (Python) |
-| **MaruHandler** | Client library embedded in LLM instances | `maru` Python package |
-| **Remote CXL Agent** | On memory nodes: maps CXL regions for LLM instances on nodes without CXL and registers them with the NIC (`remote_cxl` backend) | `maru-remote-cxl-agent` (needs NIXL) |
-
-All components run on the same machine in a single-node setup. For multi-node deployment, see the [installation guide](https://xcena-dev.github.io/maru/source/getting_started/installation.html#multi-node-configuration).
-
+Follow the [Quick Start](docs/source/getting_started/quick_start.md) to share KV cache between two vLLM engines on one GPU node using DRAM. See [Deployments](docs/source/getting_started/deployments/index.md) for shared CXL and RDMA setups. The `cxl` example below uses a Resource Manager, MaruServer and a CXL-attached client.
 
 ### Prerequisites
 
@@ -114,9 +48,7 @@ All components run on the same machine in a single-node setup. For multi-node de
 - gcc: 13.3.0+, cmake: 3.28.3+
 - [uv](https://docs.astral.sh/uv/) (recommended; `install.sh` falls back to pip)
 - CXL DAX device (`/dev/dax*`) or emulation environment, on the nodes that hold the pool and the nodes that read it over CXL
-- For the `remote_cxl` backend:
-  - An RDMA NIC (RoCE or InfiniBand) on every worker and memory node; the maru-server node must reach the remote CXL agents on the memory nodes' RDMA network addresses
-  - A compatible NIXL/Torch/CUDA stack before `./install.sh`; use the [NIXL stack instructions](docs/source/getting_started/installation.md#nixl-stack), including constraints for the provided vLLM 0.22.1 example
+- For node remote storage: an RDMA NIC and compatible NIXL/UCX runtime on GPU workers and memory nodes; see the [NIXL stack instructions](docs/source/getting_started/installation.md#nixl-stack)
 
 ```bash
 sudo apt-get update
@@ -168,9 +100,11 @@ sudo maru-resource-manager --log-level debug
 sudo maru-resource-manager --host <ip> --port <port> --log-level debug
 ```
 
-> If you change the RM port, pass the same address to `maru-server`: `maru-server --rm-address 127.0.0.1:9851`
+> If you change the RM port, pass the same address to MaruServer: `maru-server --rm-address 127.0.0.1:9851`
 
-### 2. Start the Metadata Server
+<a id="2-start-the-metadata-server"></a>
+
+### 2. Start MaruServer
 
 ```bash
 # Default (127.0.0.1:5555, connects to resource manager at 127.0.0.1:9850)
@@ -223,7 +157,7 @@ maru_pool_size: 4
 
 For details on LMCache integration, see the [documentation](https://xcena-dev.github.io/maru/source/integration/lmcache.html).
 
-LMCache integration uses a CXL memory pool (`cxl` backend); GPU nodes without CXL use the vLLM connector with `maru_storage_backend: "remote_cxl"`.
+LMCache uses directly mapped `cxl`. GPU nodes without CXL use the native vLLM connector with `maru_node` and a `dram` or `remote` store.
 
 ## vLLM Integration
 
@@ -238,16 +172,11 @@ vllm serve <model> --kv-transfer-config '{
 }'
 ```
 
-On GPU nodes without CXL, set `"maru_storage_backend": "remote_cxl"` to keep the KV in the CXL memory of memory nodes; the [remote CXL example](examples/vllm/remote_cxl/README.md) lists the settings it needs. For details, see the [vLLM guide](https://xcena-dev.github.io/maru/source/integration/vllm.html).
-
+For node-owned stores, configure `maru_node`, `maru_engine_id`, `maru_cache_namespace` and `kv_load_failure_policy="recompute"` as shown in the [vLLM guide](docs/source/integration/vllm.md#node-backend).
 
 ## Plugins
 
-Maru core is vendor-neutral. Hardware- or vendor-specific behaviour lives in
-separate packages that register a `maru.handler_plugins` entry point;
-`MaruHandler` discovers them at construction time and calls their hooks —
-loading is soft-fail, so a missing or broken plugin never breaks KV-cache
-operation. Select plugins at runtime with `MARU_PLUGINS` (unset → load all).
+Maru core is vendor-neutral. Hardware- or vendor-specific behaviour lives in separate packages that register a `maru.handler_plugins` entry point; `MaruHandler` discovers them at construction time and calls their hooks — loading is soft-fail, so a missing or broken plugin never breaks KV-cache operation. Select plugins at runtime with `MARU_PLUGINS` (unset → load all).
 
 ```python
 # In the plugin package's pyproject.toml
@@ -255,16 +184,11 @@ operation. Select plugins at runtime with `MARU_PLUGINS` (unset → load all).
 my_plugin = "my_pkg.plugin:MyPlugin"
 ```
 
-A plugin implements any subset of `MaruHandlerPlugin` (`on_init`,
-`on_batch_retrieve`, `on_close`, `contribute_stats`). See
-[`maru_handler/plugin.py`](maru_handler/plugin.py) for the interface.
+A plugin implements any subset of `MaruHandlerPlugin` (`on_init`, `on_batch_retrieve`, `on_close`, `contribute_stats`). See [`maru_handler/plugin.py`](maru_handler/plugin.py) for the interface.
 
 ## Tools
 
-`marutop` — a single command (installed with the package) for monitoring and
-device admin. With no arguments it shows a unified `top`-style view combining
-physical DAX pools and per-instance usage; subcommands select a focused view or
-the device admin tool:
+`marutop` — a single command (installed with the package) for monitoring and device admin. With no arguments it shows a unified `top`-style view combining physical DAX pools and per-instance usage; subcommands select a focused view or the device admin tool:
 
 ```bash
 marutop                    # unified live view: DEVICES (pool) + INSTANCES
@@ -274,8 +198,7 @@ marutop stats              # per-operation latency/throughput dashboard
 marutop device init /dev/dax0.0   # DAX device UUID header: init | show | clear
 ```
 
-See [`tools/README.md`](tools/README.md) for full options. (The older
-`python -m tools.pool_monitor` invocations still work via thin shims.)
+See [`tools/README.md`](tools/README.md) for full options. (The older `python -m tools.pool_monitor` invocations still work via thin shims.)
 
 ## License
 

@@ -1,130 +1,66 @@
 # Prefetch Hints (Read and Write)
 
-Maru can notify an independently installed plugin of the memory ranges a
-request will read or write. These messages are advisory: enabling them does
-not change the KV keys, allocation ownership, lookup results or transfer
-path. Maru defines the message interface; the plugin owns its preparation
-policy and any work it performs outside Maru.
+Hints tell an installed extension which ranges a request may read or write. They are advice: keys, payload contents, ownership and the transfer path stay the same. A hint does not pin an object or prove that a later read will hit.
 
-## Who owns what
+## Delivery
+
+On the node backend (selected by `maru_node`), MaruServer (`maru-server --backend node`) looks up key locations in the Catalog. The GPU StorageService (`maru-storage --role gpu`) forwards remote hints to the memory StorageService (`maru-storage --role memory`).
 
 ```mermaid
 flowchart LR
-  S["vLLM scheduler"] --> H["Maru hint queue"]
-  W["vLLM worker"] -->|"read promote"| H
-  H -->|"locate leading stored keys"| M["maru-server"]
-  H -->|"cxl"| P["handler plugins"]
-  H -->|"remote_cxl"| A["remote CXL agent"]
-  A --> E["region extension"]
-  W ==>|"CXL mapping or RDMA transfer"| K[("KV memory")]
+    S["vLLM scheduler"] --> Q["hint queue"]
+    W["vLLM worker"] -->|"promote"| Q
+    Q -.->|"locate stored keys"| C["Catalog or cxl registry"]
+    Q -->|"cxl"| P["handler plugin"]
+    Q -->|"remote maru_node"| G["GPU StorageService"]
+    G --> M["memory node"] --> E["region extension"]
+    W ==>|"mapped copy or direct RDMA"| K[("KV storage")]
 ```
 
-*Figure 1. Hint delivery and KV transfers. Thin arrows carry control
-messages; the thick arrow carries KV bytes. Handler plugins and region
-extensions are separate packages selected by the operator.*
-
-- The scheduler identifies a request's leading stored chunks.
-- The worker announces when the hinted load starts.
-- On `cxl`, `MaruHandler` delivers messages to handler plugins that
-  implement `on_memory_hint` and advertise the corresponding
-  `hint_actions`.
-- On `remote_cxl`, the remote CXL agent validates each range against its
-  mapped regions and capabilities before calling its region extension.
-  The extension is selected with `--region-extension`.
-- Plugins own their implementation and dependencies. Maru does not require
-  a particular plugin, product or service.
-
-## One request
-
-```mermaid
-sequenceDiagram
-  participant S as Scheduler handler
-  participant H as Hint queue
-  participant P as Plugin or region extension
-  participant W as Worker handler
-  S->>H: hint_read(request, keys)
-  H->>H: locate leading stored ranges
-  H-->>P: read_hint(request, ranges)
-  W->>H: promote_read(request)
-  H-->>P: read_promote(request)
-  Note over W: normal KV load
-  S->>H: end_read_hint(request)
-  H-->>P: read_hint_end(request)
-```
-
-*Figure 2. Request lifecycle. Scheduler and worker handlers can use separate
-connections; a receiver must correlate messages by request ID and tolerate
-a promote arriving before its hint.*
+On `cxl`, `MaruHandler` calls plugins implementing `on_memory_hint` and advertising the corresponding `hint_actions`. The memory StorageService checks pool identity, registration, generation and page bounds before calling the extension. Workers announce the start of hinted loads through the same service path.
 
 | Action | Meaning | Payload |
 |---|---|---|
-| `read_hint` | The request may soon read these ranges, in order | Request ID and ranges |
-| `read_promote` | The worker is starting that request's load | Request ID |
-| `read_hint_end` | The load ended, or the request finished first | Request ID |
-| `write_hint` | A store is about to write its allocated ranges; remote only | Ranges |
-| `write_wait` | Bounded preparation wait before a remote write | Ranges and wait limit |
+| `read_hint` | Request may read these ranges in order | Request ID and ranges |
+| `read_promote` | Worker starts that request's load | Request ID |
+| `read_hint_end` | Load ended or request finished | Request ID |
+| `write_hint` | Reserved pages are about to be written | Ranges |
+| `write_wait` | Bounded preparation before replying to reservation | Ranges and wait limit |
 
-A range is `{"handle": {"region_id", "offset", "length"}, "offset", "length"}`.
-Its inner offset and length identify bytes within the handle. The handle's
-offset identifies the mapping offset, not a device-specific address.
-See {doc}`../api_reference/plugins` for the local hook contract.
+The extension receives `{"handle": {"region_id", "offset", "length", ...}, "offset", "length"}` ranges. Inner offsets are relative to the handle. Scheduler and worker messages can arrive on separate connections, so extensions must tolerate a promote arriving before its hint.
 
-## Scheduling and failure handling
+## Configuration and failure handling
 
-With `maru_read_hints` and `maru_async_load`, the scheduler hints at its
-first lookup of a request. `maru_read_hint_on_arrival` can send the hint
-earlier, through an optional wrapper around a vLLM internal method. If that
-method is incompatible, Maru warns and retains hints at lookup time.
+`maru_read_hints=true` enables scheduler hints with deferred loading. `maru_read_hint_on_arrival=true` requests an earlier advisory hint through a vLLM hook; an incompatible hook logs a warning and keeps lookup-time hints. Hints are queued outside the load path. A full hint queue drops advisory work; stale or rejected hints do not change the load result.
 
-The caller queues a message without waiting for plugin work. One hint
-thread locates keys and delivers messages. The queue accepts up to 1024
-waiting hints; additional hints are dropped with a warning, while end
-messages are retained. A process tracks at most 4096 open hinted requests
-and ends the oldest when that limit is exceeded.
+Memory nodes advertise accepted actions. A `local_cxl` memory node loads its extension from the `maru.region_extensions` entry-point group:
 
-A hint does not hold a read lease or establish that a later lookup will
-succeed. Receivers must tolerate stale ranges, missing end messages and
-messages arriving in a different order across connections. Plugin callbacks
-should return promptly and expire request state independently. Callback
-exceptions are logged and isolated from other plugins and KV transfers.
+```json
+{
+  "name": "my_extension",
+  "config": "",
+  "generation_poll_s": 0.1,
+  "generation_grace_s": 2.0,
+  "hint_requests_max": 4096
+}
+```
 
-On `cxl`, enabling hints without an accepting plugin logs a warning and
-sends no hints. Closing the handler drains its hint thread, sends
-`read_hint_end` for every request still open, and then calls the plugins'
-`on_close`, also on a vLLM scheduler's metadata-only handler. On `remote_cxl`, agents advertise accepted actions and only those
-actions are sent. `write_wait` is bounded by `write_wait_ms` (default 50 ms,
-0 disables waiting), plus the reply timeout if the agent does not answer;
-the write proceeds after the wait.
+Place this object under the memory-node configuration's `region_extension`. The opaque `config` string is passed to the factory with the run epoch. Both intervals and the integer request limit must be positive. The factory must implement `validate_access`, `mapped`, `hint`, `retire` and `close`. Optional hooks are `memory_generation` and `connection_closed`; `hint_actions` advertises supported actions.
 
-## Memory resets
+GPU `remote.write_hints` defaults to `false`. With it enabled, reservation sends a supported `write_hint` or `write_wait` before the worker's WRITE. `write_wait_ms` defaults to `50` and accepts integers from `0` to `10000`; `0` disables preparation waits. Reservation proceeds after the bounded wait even if preparation is incomplete. Read hints do not enable write hints implicitly.
 
-The remote agent can combine an extension-provided memory generation with
-the node's boot identity. A generation change invalidates old registrations
-and mappings, so owners and readers apply their existing reboot handling.
-When a generation becomes unknown beyond the configured grace period,
-the agent invalidates mappings and refuses new maps until it knows the
-generation again.
+Hint callback errors are logged and do not fail KV transfers. Mapping and generation checks protect access and can refuse service. Hooks must be thread-safe; ordinary hints, generation and retirement answer promptly from local state. Only `write_wait` may wait for preparation, up to its timeout. A hint never authorizes reuse of an in-use page.
 
-The polling interval is `--memory-generation-poll-s` (default 0.1 seconds)
-and the grace period is `--memory-generation-grace-s` (default 2 seconds).
-Generation checks also run on hello, map and sweep operations. The extension
-must report changes consistently; this interface is not proof that an
-external device or service detects every loss.
+## Region lifecycle and memory resets
+
+`validate_access` runs before mapping a CXL region. `mapped` runs after NIC registration, with `fresh=true` for a new allocation and `false` for an adopted region. `retire` follows registration revocation and precedes release to the Resource Manager; a refusal retains the region. `connection_closed` clears connection-specific hint state, and `close` ends the extension's run.
+
+The memory node combines its boot identity with the extension's `memory_generation()`. Generation checks run periodically and on control and mapping operations. A changed generation revokes old registrations and starts a fresh run without adopting the old contents. If generation stays unknown beyond `generation_grace_s`, access is refused and old locations are invalidated. Startup with an unknown generation fails. Time passing does not authorize page reuse without revocation.
 
 (read-hint-scope)=
+
 ## Scope
 
-Read hints, read promotes and read-hint ends are available on `remote_cxl`
-and `cxl`. Write hints and memory-generation handling remain
-`remote_cxl` only. Installing a handler plugin does not add either feature
-to `cxl`.
+Read hints and promote are available to `cxl` handler plugins and remote memory-node extensions. Node-local `dram` and `local_cxl` have no read-hint receiver. Write hints and memory-generation handling belong to memory-node extensions; installing a handler plugin does not add them to `cxl`.
 
-In vLLM, a scheduler hint names the stored objects the workers load: each
-tensor-parallel slice of a chunk, each layer's object in layerwise format,
-and each KV cache group's object that the hit needs. A chunk's objects come
-before the next chunk's, so a hint sent on arrival stops at the first chunk
-with an object missing. The scheduler builds these keys on its hint thread.
-
-Message transport is implemented in `maru_handler/hints.py`. Remote range
-validation and extension contracts are in `maru_remote/region_map.py` and
-`maru_remote_cxl_agent/extension.py`.
+Scheduler hints identify every stored object needed by a prefix: TP slices, layerwise objects on `cxl`, and each required KV group. Hints stop at missing objects and cannot establish read availability. See {doc}`../api_reference/plugins` for handler plugins and {doc}`node_storage_service` for configuration and lifetimes.
