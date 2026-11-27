@@ -43,7 +43,7 @@ def test_local_attach_keeps_layerwise_and_overlap_modes():
     )
 
 
-def test_node_worker_uses_the_vllm_instance_and_its_staging_settings(monkeypatch):
+def test_node_worker_uses_the_vllm_instance(monkeypatch):
     made = []
 
     def handler(config):
@@ -53,21 +53,28 @@ def test_node_worker_uses_the_vllm_instance_and_its_staging_settings(monkeypatch
     monkeypatch.setattr(maru, "MaruHandler", handler)
     config = node_vllm_config(2)
     config.instance_id = "vllm-instance"
-    extra = connector._node_engine_config(
-        node_extra(
-            maru_rdma_staging_size="64M",
-            maru_rdma_device="test-device",
-            maru_rdma_timeout_s=0.1,
-            maru_async_load=True,
-        ),
-        config,
-    )
+    extra = connector._node_engine_config(node_extra(maru_async_load=True), config)
     for rank in (0, 1):
         connector._create_node_handler({**extra, "_maru_tp_rank": rank}, False, False)
     assert made[0].instance_id == made[1].instance_id == config.instance_id
-    assert all(c.rdma_staging_size == 64 << 20 for c in made)
-    assert all(c.rdma_device == "test-device" and c.rdma_timeout_s == 0.1 for c in made)
     assert made[0].tp_rank != made[1].tp_rank
+    # ATTACH supplies the RDMA settings from the GPU node config
+    assert all(c.rdma_staging_size is None and c.rdma_device == "" for c in made)
+
+
+@pytest.mark.parametrize(
+    "key,owner",
+    [
+        ("maru_rdma_device", "remote.rdma_device"),
+        ("maru_rdma_staging_size", "remote.staging_size"),
+        ("maru_rdma_timeout_s", "remote.timeout_s"),
+    ],
+)
+def test_node_worker_refuses_rdma_settings_the_node_owns(monkeypatch, key, owner):
+    monkeypatch.setattr(maru, "MaruHandler", lambda _: pytest.fail("created"))
+    extra = connector._node_engine_config(node_extra(), node_vllm_config(1))
+    with pytest.raises(ValueError, match=owner):
+        connector._create_node_handler({**extra, key: "1"}, False, False)
 
 
 def test_node_slot_admission_never_retries_or_sleeps(monkeypatch):

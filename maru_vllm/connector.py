@@ -800,6 +800,9 @@ _NODE_KEYS_ELSEWHERE = {
     "maru_storage_backend": "maru_node selects the StorageService path",
     "maru_pin_pools": "node pools are always page-locked",
     "maru_eager_map": "it is not used on the maru_node path",
+    "maru_rdma_device": "set remote.rdma_device in the GPU node config",
+    "maru_rdma_staging_size": "set remote.staging_size in the GPU node config",
+    "maru_rdma_timeout_s": "set remote.timeout_s in the GPU node config",
 }
 
 
@@ -1416,11 +1419,6 @@ def _create_node_handler(
         credit_wait_s=float(extra_config.get("maru_credit_wait_ms", 0)) / 1000,
         lookup_timeout_ms=int(extra_config.get("maru_lookup_timeout_ms", 100)),
         instance_id=extra_config.get("_maru_vllm_instance") or None,
-        rdma_device=extra_config.get("maru_rdma_device", ""),
-        rdma_timeout_s=float(extra_config.get("maru_rdma_timeout_s", 30)),
-        rdma_staging_size=_parse_size(extra_config["maru_rdma_staging_size"])
-        if "maru_rdma_staging_size" in extra_config
-        else None,
         rdma_load_reserve=_NODE_ASYNC_LOAD_RESERVE
         if _get_knob(extra_config, "maru_async_load")
         else 0,
