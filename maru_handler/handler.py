@@ -977,10 +977,10 @@ class MaruHandler:
         Returns:
             True if connected and server responded to heartbeat
         """
+        if self._cpu is not None:
+            return self._cpu.healthcheck()
         if not self._connected or self._closing.is_set():
             return False
-        if self._config.maru_node:
-            return self._cpu.healthcheck()
 
         try:
             return self._rpc.heartbeat()
@@ -1156,47 +1156,46 @@ class MaruHandler:
     ) -> list[bool]:
         """Store multiple pre-written allocations in the selected backend.
 
-        The cxl path registers metadata over mapped pages. Storage-session
-        clients implement their own commit and read rules; remote storage
-        completes staging-to-CXL RDMA WRITEs before publishing keys.
-
         Data must already be written to each page via ``handle.buf``.
-        The cxl path uses a batch RPC for metadata registration.
 
         Args:
             keys: List of chunk key strings
             handles: Backend-specific allocations from alloc()
 
         Returns:
-            One bool per key. True means the key is registered in the pool
-            after this call: either this call registered it, or it already
-            existed (in the local map, on the server, or registered by
-            another client while this call ran). The page of a key that
-            already existed or lost the register race is freed. False
-            means the register RPC failed, in which case every page is
-            freed, or that the server's response had no result for the
-            key. The server may still have registered that key's page, so
-            the page is retained (allocated, untracked) until the handler
-            closes.
+            One bool per key.
+
+            cxl: True means the key is registered in the pool after this
+            call: either this call registered it, or it already existed (in
+            the local map, on the server, or registered by another client
+            while this call ran). The page of a key that already existed or
+            lost the register race is freed. False means the register RPC
+            failed, in which case every page is freed, or that the server's
+            response had no result for the key. The server may still have
+            registered that key's page, so the page is retained (allocated,
+            untracked) until the handler closes.
+
+            maru_node: True means the StorageService committed the key, or
+            the key already existed. False means the node refused the item,
+            or it was not published within ``store_timeout_s``. A timed-out
+            item stays tracked and can still become visible later.
 
         Raises:
             RuntimeError: If the handler is metadata-only, not connected, or
                 closing.
-            ValueError: If keys and handles differ in length, or (CPU path)
-                a key or handle is invalid.
-            StorageUnavailableError: (CPU path) If the cache session is
-                unavailable.
+            ValueError: If keys and handles differ in length, or
+                (maru_node) a key or handle is invalid.
+            StorageUnavailableError: (maru_node) If the StorageService
+                connection is unavailable.
 
         Note:
-            Handle ownership passes to this call. On the CXL path every
-            exception above is raised before any handle is consumed, so the
-            caller still owns every handle and must free them. After a
-            normal return the caller must not free any handle: each page
-            was registered, freed, or retained here. On the CPU path a batch
-            larger than MAX_STORAGE_BATCH is committed in chunks, so a later
-            chunk can raise after earlier chunks were committed. Freeing
-            those earlier handles again either does nothing or raises
-            ValueError, and never releases committed data.
+            Handle ownership passes to this call. Every exception above is
+            raised before any handle is consumed, so the caller still owns
+            every handle and must free them. After a normal return the
+            caller must not write to, free, or reuse any handle. On cxl each
+            page was registered, freed, or retained here. On maru_node the
+            node owns every page, whatever the result; ``free()`` of such a
+            handle does nothing.
         """
         if self._config.metadata_only:
             raise RuntimeError("A metadata-only handler cannot access stored buffers")

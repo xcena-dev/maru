@@ -1207,8 +1207,7 @@ class MaruClient:
                 if not self._sends:
                     return
                 task = self._sends.popleft()
-            if self._stopped.is_set():
-                return
+            # After stop() each task still runs and answers without sending
             try:
                 task()
             except Exception:

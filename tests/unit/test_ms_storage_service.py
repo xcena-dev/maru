@@ -2058,6 +2058,31 @@ def test_store_async_answers_once_when_its_batches_end_together(monkeypatch):
         assert len(answers) == 1
 
 
+def test_stop_answers_a_store_queued_behind_the_sender(nodes, handlers, monkeypatch):
+    """A store still queued at stop() is answered False and stays frozen."""
+    h = handlers(nodes())
+    client = h._cpu
+    wait_credit(h, 2)
+    a, b = h.alloc(PAGE), h.alloc(PAGE)
+    send = client._send_write_done
+    entered, gate = threading.Event(), threading.Event()
+
+    def blocked(keys, handles, future):
+        if keys == ["k1"]:
+            entered.set()
+            gate.wait(10)
+        send(keys, handles, future)
+
+    monkeypatch.setattr(client, "_send_write_done", blocked)
+    first = h.store_async(["k1"], [a])
+    assert entered.wait(5)
+    queued = h.store_async(["k2"], [b])
+    h.stop()
+    gate.set()
+    assert first.result(5) == [False] and queued.result(5) == [False]
+    assert b.state == "submitted" and b in client._handles
+
+
 def test_the_credit_cache_keeps_its_byte_total_exact():
     import random
 
@@ -2227,6 +2252,7 @@ class TestBackgroundConnect:
                 handler.batch_retrieve(["k"])
             nodes()
             assert handler.wait_connected(10.0)
+            assert handler.healthcheck()
             wait_credit(handler)
             assert put(handler, "late")
         finally:
